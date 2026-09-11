@@ -162,11 +162,12 @@ fn adaptive_profile_control_flow() {
     let read = main.blocks[0]
         .instructions
         .iter()
-        .find_map(|i| match &i.kind {
-            InstKind::Call(c) if c.callee_name() == Some("__quantum__qis__read_result__body") => {
-                Some(i)
-            }
-            _ => None,
+        .find(|instruction| {
+            matches!(
+                &instruction.kind,
+                InstKind::Call(call)
+                    if call.callee_name() == Some("__quantum__qis__read_result__body")
+            )
         })
         .expect("a read_result call");
     assert_eq!(read.result.as_deref(), Some("0"));

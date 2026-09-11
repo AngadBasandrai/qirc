@@ -345,9 +345,8 @@ impl<'a> Parser<'a> {
             self.parse_value()
         };
 
-        while self.eat(TokenKind::Comma) {
+        if self.eat(TokenKind::Comma) {
             self.skip_to_next_line();
-            break;
         }
 
         Some(GlobalVar {

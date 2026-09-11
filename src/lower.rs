@@ -32,6 +32,14 @@ enum Binding {
     Slot(SlotId),
 }
 
+#[derive(Clone, Copy)]
+struct GateShape {
+    kind: GateKind,
+    controls: usize,
+    targets: usize,
+    params: usize,
+}
+
 struct Lowerer<'a> {
     module: &'a ast::Module,
     diagnostics: Vec<Diagnostic>,
@@ -344,24 +352,22 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::InstKind::Cast { op, operand, to } => {
-                if let Some(qubit) = self.try_resolve_qubit_value(&operand.value) {
-                    if to.pointee_name() == Some("Qubit") {
-                        if let Some(name) = inst.result.as_deref() {
-                            self.env.insert(name.to_string(), Binding::Qubit(qubit));
-                        }
-                        return;
+                if let Some(qubit) = self.try_resolve_qubit_value(&operand.value)
+                    && to.pointee_name() == Some("Qubit")
+                {
+                    if let Some(name) = inst.result.as_deref() {
+                        self.env.insert(name.to_string(), Binding::Qubit(qubit));
                     }
+                    return;
                 }
 
-                if let Some(name) = inst.result.as_deref() {
-                    if let ast::Value::Local(src) = &operand.value {
-                        if let Some(binding) = self.env.get(src).cloned() {
-                            if !matches!(binding, Binding::Value(_)) {
-                                self.env.insert(name.to_string(), binding);
-                                return;
-                            }
-                        }
-                    }
+                if let Some(name) = inst.result.as_deref()
+                    && let ast::Value::Local(src) = &operand.value
+                    && let Some(binding) = self.env.get(src).cloned()
+                    && !matches!(binding, Binding::Value(_))
+                {
+                    self.env.insert(name.to_string(), binding);
+                    return;
                 }
 
                 let Some(value) = self.operand(&operand.value, span) else {
@@ -423,13 +429,12 @@ impl<'a> Lowerer<'a> {
                     self.assign(inst.result.as_deref(), Expr::Load(slot), span);
                     return;
                 }
-                if let ast::Value::Global(global) = &ptr.value {
-                    if let Some(bytes) = self.global_bytes(global) {
-                        if let Some(name) = inst.result.as_deref() {
-                            self.env.insert(name.to_string(), Binding::Bytes(bytes));
-                            return;
-                        }
-                    }
+                if let ast::Value::Global(global) = &ptr.value
+                    && let Some(bytes) = self.global_bytes(global)
+                    && let Some(name) = inst.result.as_deref()
+                {
+                    self.env.insert(name.to_string(), Binding::Bytes(bytes));
+                    return;
                 }
                 self.propagate_binding(inst.result.as_deref(), &ptr.value);
             }
@@ -468,10 +473,10 @@ impl<'a> Lowerer<'a> {
 
     fn propagate_binding(&mut self, result: Option<&str>, source: &ast::Value) {
         let Some(name) = result else { return };
-        if let ast::Value::Local(src) = source {
-            if let Some(binding) = self.env.get(src).cloned() {
-                self.env.insert(name.to_string(), binding);
-            }
+        if let ast::Value::Local(src) = source
+            && let Some(binding) = self.env.get(src).cloned()
+        {
+            self.env.insert(name.to_string(), binding);
         }
     }
 
@@ -605,7 +610,17 @@ impl<'a> Lowerer<'a> {
                 controls,
                 targets,
                 params,
-            } => self.lower_gate(call, kind, controls, targets, params, functor, span),
+            } => self.lower_gate(
+                call,
+                GateShape {
+                    kind,
+                    controls,
+                    targets,
+                    params,
+                },
+                functor,
+                span,
+            ),
 
             Intrinsic::Measure { with_result_arg } => {
                 let Some(qubit) = self.qubit_arg(call, 0, span) else {
@@ -627,13 +642,8 @@ impl<'a> Lowerer<'a> {
                 self.note_result(result_id);
 
                 if let Some(name) = result {
-                    if with_result_arg {
-                        self.env
-                            .insert(name.to_string(), Binding::Result(result_id));
-                    } else {
-                        self.env
-                            .insert(name.to_string(), Binding::Result(result_id));
-                    }
+                    self.env
+                        .insert(name.to_string(), Binding::Result(result_id));
                 }
 
                 self.ops.push(Op::Measure {
@@ -784,10 +794,10 @@ impl<'a> Lowerer<'a> {
             }
 
             Intrinsic::Ignored => {
-                if let (Some(name), Some(arg)) = (result, call.args.first()) {
-                    if let Some(binding) = self.binding_for(&arg.value) {
-                        self.env.insert(name.to_string(), binding);
-                    }
+                if let (Some(name), Some(arg)) = (result, call.args.first())
+                    && let Some(binding) = self.binding_for(&arg.value)
+                {
+                    self.env.insert(name.to_string(), binding);
                 }
             }
         }
@@ -864,17 +874,13 @@ impl<'a> Lowerer<'a> {
         self.assign(result, expr, span);
     }
 
-    fn lower_gate(
-        &mut self,
-        call: &ast::Call,
-        kind: GateKind,
-        controls: usize,
-        targets: usize,
-        params: usize,
-        functor: Functor,
-        span: Span,
-    ) {
-        let mut kind = kind;
+    fn lower_gate(&mut self, call: &ast::Call, shape: GateShape, functor: Functor, span: Span) {
+        let GateShape {
+            mut kind,
+            controls,
+            targets,
+            params,
+        } = shape;
 
         if functor.is_adjoint() {
             match kind.adjoint() {
@@ -1145,10 +1151,9 @@ fn attribute_count(attrs: &[&ast::Attribute], keys: &[&str]) -> u32 {
             .iter()
             .find(|a| a.key() == *key)
             .and_then(|a| a.value())
+            && let Ok(parsed) = value.parse::<u32>()
         {
-            if let Ok(parsed) = value.parse::<u32>() {
-                return parsed;
-            }
+            return parsed;
         }
     }
     0

@@ -97,12 +97,12 @@ pub fn optimise(program: &mut Program, level: u8) -> OptStats {
 }
 
 fn run_round(program: &mut Program, level: u8) -> Vec<(&'static str, usize)> {
-    let mut results = Vec::new();
-
-    results.push(("drop-identity", drop_identity_gates(program)));
-    results.push(("cancel-inverses", cancel_inverses(program)));
-    results.push(("merge-rotations", merge_rotations(program)));
-    results.push(("fold-constants", fold_constants(program)));
+    let mut results = vec![
+        ("drop-identity", drop_identity_gates(program)),
+        ("cancel-inverses", cancel_inverses(program)),
+        ("merge-rotations", merge_rotations(program)),
+        ("fold-constants", fold_constants(program)),
+    ];
 
     if level >= 2 {
         results.push(("peephole", peephole(program)));
@@ -517,10 +517,10 @@ fn try_fold(expr: &Expr, known: &HashMap<ValueId, Const>) -> Option<Const> {
 
 fn substitute_known(program: &mut Program, known: &HashMap<ValueId, Const>) {
     let replace = |operand: &mut Operand| {
-        if let Operand::Value(id) = operand {
-            if let Some(value) = known.get(id) {
-                *operand = Operand::Const(*value);
-            }
+        if let Operand::Value(id) = operand
+            && let Some(value) = known.get(id)
+        {
+            *operand = Operand::Const(*value);
         }
     };
 

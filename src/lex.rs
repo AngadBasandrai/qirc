@@ -733,7 +733,7 @@ line */ ret"
 
     #[test]
     fn semicolons_inside_strings_are_data() {
-        let src = "@s = constant [4 x i8] c\";x\00\"";
+        let src = "@s = constant [4 x i8] c\";x\\00\"";
         let toks = texts(src);
         assert!(toks.iter().any(|t| t.contains(';')), "got {toks:?}");
     }

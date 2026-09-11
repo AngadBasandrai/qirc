@@ -146,15 +146,11 @@ fn check_wires(program: &Program, out: &mut Vec<Diagnostic>) {
                     );
                 }
             }
-            Op::Reset { qubit, span } => {
-                if qubit.0 >= program.num_qubits {
-                    out.push(
-                        Diagnostic::error(format!("resetting undeclared qubit q{}", qubit.0))
-                            .with_code("QIR0302")
-                            .primary(*span, "out of range"),
-                    );
-                }
-            }
+            Op::Reset { qubit, span } if qubit.0 >= program.num_qubits => out.push(
+                Diagnostic::error(format!("resetting undeclared qubit q{}", qubit.0))
+                    .with_code("QIR0302")
+                    .primary(*span, "out of range"),
+            ),
             _ => {}
         }
     }
@@ -202,14 +198,13 @@ fn check_measurement_use(program: &Program, out: &mut Vec<Diagnostic>) {
             span,
             ..
         } = op
+            && !written.contains(result)
         {
-            if !written.contains(result) {
-                out.push(
-                    Diagnostic::error(format!("r{} is read before it is measured", result.0))
-                        .with_code("QIR0308")
-                        .primary(*span, "no measurement writes this result"),
-                );
-            }
+            out.push(
+                Diagnostic::error(format!("r{} is read before it is measured", result.0))
+                    .with_code("QIR0308")
+                    .primary(*span, "no measurement writes this result"),
+            );
         }
 
         if let Op::RecordOutput {
@@ -217,16 +212,15 @@ fn check_measurement_use(program: &Program, out: &mut Vec<Diagnostic>) {
             span,
             ..
         } = op
+            && !written.contains(result)
         {
-            if !written.contains(result) {
-                out.push(
-                    Diagnostic::warning(format!(
-                        "r{} is recorded as output but never measured",
-                        result.0
-                    ))
-                    .primary(*span, "this will always record zero"),
-                );
-            }
+            out.push(
+                Diagnostic::warning(format!(
+                    "r{} is recorded as output but never measured",
+                    result.0
+                ))
+                .primary(*span, "this will always record zero"),
+            );
         }
     }
 }

@@ -47,10 +47,8 @@ pub fn emit_qasm3(program: &Program) -> String {
             }
         }
 
-        if branching {
-            if let Term::CondBr { .. } = block.term {
-                let _ = writeln!(out, "// conditional branch elided");
-            }
+        if branching && let Term::CondBr { .. } = block.term {
+            let _ = writeln!(out, "// conditional branch elided");
         }
     }
 
@@ -145,14 +143,11 @@ pub fn zyz_angles(m: &Matrix2) -> (f64, f64, f64) {
     }
 
     if a.norm() < 1e-12 {
-        return (std::f64::consts::PI, (c / b).arg(), 0.0);
+        return (std::f64::consts::PI, (c / (-b)).arg(), 0.0);
     }
 
-    let phi_plus_lambda = (d / a).arg();
-    let phi_minus_lambda = (c / (-b)).arg();
-
-    let phi = (phi_plus_lambda + phi_minus_lambda) / 2.0;
-    let lambda = (phi_plus_lambda - phi_minus_lambda) / 2.0;
+    let phi = (c / a).arg();
+    let lambda = ((-b) / a).arg();
 
     (theta, phi, lambda)
 }
@@ -279,11 +274,7 @@ impl<'a> QirEmitter<'a> {
 
     fn emit_op(&mut self, op: &Op, body: &mut String) {
         match op {
-            Op::Gate(gate) => {
-                let (name, params, args) = self.gate_call(gate);
-                let _ = writeln!(body, "  call void @{name}({args})");
-                self.declare(&format!("void @{name}"), &params);
-            }
+            Op::Gate(gate) => self.emit_gate(gate, body),
 
             Op::Measure { qubit, result, .. } => {
                 let _ = writeln!(
@@ -347,6 +338,38 @@ impl<'a> QirEmitter<'a> {
 
             Op::Message { .. } => {}
         }
+    }
+
+    fn emit_gate(&mut self, gate: &Gate, body: &mut String) {
+        if let GateKind::Unitary(matrix) = gate.kind {
+            debug_assert!(gate.controls.is_empty());
+            debug_assert_eq!(gate.targets.len(), 1);
+
+            let (theta, phi, lambda) = zyz_angles(&Matrix2::from_ir(matrix));
+            for (kind, angle) in [
+                (GateKind::Rz, lambda),
+                (GateKind::Ry, theta),
+                (GateKind::Rz, phi),
+            ] {
+                let rotation = Gate {
+                    kind,
+                    controls: gate.controls.clone(),
+                    targets: gate.targets.clone(),
+                    params: vec![Operand::Const(Const::Float(angle))],
+                    span: gate.span,
+                };
+                self.emit_native_gate(&rotation, body);
+            }
+            return;
+        }
+
+        self.emit_native_gate(gate, body);
+    }
+
+    fn emit_native_gate(&mut self, gate: &Gate, body: &mut String) {
+        let (name, params, args) = self.gate_call(gate);
+        let _ = writeln!(body, "  call void @{name}({args})");
+        self.declare(&format!("void @{name}"), &params);
     }
 
     fn emit_assign(&mut self, dest: ValueId, expr: &Expr, body: &mut String) {
@@ -537,6 +560,9 @@ impl<'a> QirEmitter<'a> {
             (GateKind::X, 2) => "__quantum__qis__ccx__body",
             (GateKind::Z, 2) => "__quantum__qis__ccz__body",
             (GateKind::Swap, 1) => "__quantum__qis__cswap__body",
+            (GateKind::Unitary(_), _) => {
+                unreachable!("fused unitaries must be synthesized before QIR emission")
+            }
             _ => "__quantum__qis__unitary__body",
         };
 
@@ -544,8 +570,9 @@ impl<'a> QirEmitter<'a> {
         let mut types = Vec::new();
 
         for param in &gate.params {
-            let value = param.constant().map(|c| c.as_f64()).unwrap_or(0.0);
-            args.push(format!("double {}", format_double(value)));
+            let (value, ty) = self.operand(param);
+            debug_assert_eq!(ty, "double", "QIS rotation parameters must be doubles");
+            args.push(format!("double {value}"));
             types.push("double".to_string());
         }
 
@@ -769,10 +796,10 @@ fn gate_symbol(gate: &Gate) -> String {
         other => {
             let name = other.name();
             let mut symbol = name.to_uppercase();
-            if other.param_count() > 0 {
-                if let Some(angle) = gate.constant_angle() {
-                    symbol = format!("{}({:.2})", name.to_uppercase(), angle);
-                }
+            if other.param_count() > 0
+                && let Some(angle) = gate.constant_angle()
+            {
+                symbol = format!("{}({:.2})", name.to_uppercase(), angle);
             }
             symbol
         }
@@ -789,4 +816,52 @@ fn center(text: &str, width: usize, filler: &str) -> String {
     let right = total - left;
 
     format!("{}{}{}", filler.repeat(left), text, filler.repeat(right))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_zyz_equivalent(original: Matrix2) {
+        let (theta, phi, lambda) = zyz_angles(&original);
+        let reconstructed = Matrix2::rz(phi)
+            .multiply(Matrix2::ry(theta))
+            .multiply(Matrix2::rz(lambda));
+        let pairs = [
+            (original.a, reconstructed.a),
+            (original.b, reconstructed.b),
+            (original.c, reconstructed.c),
+            (original.d, reconstructed.d),
+        ];
+        let (expected, actual) = pairs
+            .iter()
+            .find(|(_, actual)| actual.norm() > 1e-12)
+            .expect("a unitary has a nonzero matrix element");
+        let phase = expected / actual;
+
+        for (expected, actual) in pairs {
+            assert!(
+                (expected - phase * actual).norm() < 1e-12,
+                "ZYZ reconstruction differs: {original:?} vs {reconstructed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zyz_decomposition_preserves_representative_unitaries() {
+        for matrix in [
+            Matrix2::identity(),
+            Matrix2::x(),
+            Matrix2::y(),
+            Matrix2::z(),
+            Matrix2::h(),
+            Matrix2::sx(),
+            Matrix2::rz(0.73)
+                .multiply(Matrix2::ry(-1.21))
+                .multiply(Matrix2::rz(2.44)),
+            Matrix2::rx(0.91).multiply(Matrix2::phase(-0.37)),
+        ] {
+            assert_zyz_equivalent(matrix);
+        }
+    }
 }

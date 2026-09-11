@@ -38,13 +38,15 @@ pub fn needs_per_shot_simulation(program: &Program) -> bool {
         return true;
     }
 
-    program.ops().any(|op| match op {
-        Op::Reset { .. } => true,
-        Op::Assign {
-            expr: Expr::ReadResult(_),
-            ..
-        } => true,
-        _ => false,
+    program.ops().any(|op| {
+        matches!(
+            op,
+            Op::Reset { .. }
+                | Op::Assign {
+                    expr: Expr::ReadResult(_),
+                    ..
+                }
+        )
     })
 }
 
@@ -84,10 +86,10 @@ fn execute_sampled(program: &Program, config: ExecConfig) -> ExecOutcome {
             match op {
                 Op::Gate(gate) => apply_gate(&mut state, gate, &values),
                 Op::Store { slot, value, .. } => {
-                    if let Some(v) = resolve(value, &values) {
-                        if let Some(cell) = slots.get_mut(slot.index()) {
-                            *cell = v;
-                        }
+                    if let Some(v) = resolve(value, &values)
+                        && let Some(cell) = slots.get_mut(slot.index())
+                    {
+                        *cell = v;
                     }
                 }
                 Op::Assign { dest, expr, .. } => {
@@ -229,10 +231,10 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
                 Op::Message { text, .. } => messages.push(text.clone()),
 
                 Op::Store { slot, value, .. } => {
-                    if let Some(v) = resolve(value, &values) {
-                        if let Some(cell) = slots.get_mut(slot.index()) {
-                            *cell = v;
-                        }
+                    if let Some(v) = resolve(value, &values)
+                        && let Some(cell) = slots.get_mut(slot.index())
+                    {
+                        *cell = v;
                     }
                 }
 
@@ -509,10 +511,10 @@ fn render_output(
         OutputKind::Double => "DOUBLE".into(),
     };
 
-    if let Some(label) = label {
-        if !label.is_empty() {
-            text.push_str(&format!(" {label:?}"));
-        }
+    if let Some(label) = label
+        && !label.is_empty()
+    {
+        text.push_str(&format!(" {label:?}"));
     }
 
     text

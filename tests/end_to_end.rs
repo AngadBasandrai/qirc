@@ -3,6 +3,7 @@ use qirc::diag::Severity;
 use qirc::driver::{self, Emit};
 use qirc::ir::*;
 use qirc::simulator::exec::{self, ExecConfig};
+use qirc::simulator::state::State;
 
 const BELL: &str = include_str!("corpus/base_profile_bell.ll");
 const TELEPORT: &str = include_str!("corpus/adaptive_teleport.ll");
@@ -42,6 +43,28 @@ declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
 attributes #0 = { \"entry_point\" \"qir_profiles\"=\"unrestricted\" \"required_num_qubits\"=\"3\" \"required_num_results\"=\"0\" }
 ";
 
+const DYNAMIC_ROTATION: &str = "\
+%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
+  %bit = call i1 @__quantum__qis__read_result__body(%Result* inttoptr (i64 0 to %Result*))
+  %theta = select i1 %bit, double 1.25, double -0.75
+  call void @__quantum__qis__ry__body(double %theta, %Qubit* inttoptr (i64 0 to %Qubit*))
+  ret void
+}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+declare i1 @__quantum__qis__read_result__body(%Result*)
+declare void @__quantum__qis__ry__body(double, %Qubit*)
+
+attributes #0 = { \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"required_num_qubits\"=\"1\" \"required_num_results\"=\"1\" }
+";
+
 fn compile_clean(source: &str, level: u8) -> Program {
     let compilation = driver::compile(source, level);
     let errors: Vec<String> = compilation
@@ -54,7 +77,7 @@ fn compile_clean(source: &str, level: u8) -> Program {
     compilation.program
 }
 
-fn final_probabilities(program: &Program) -> Vec<f64> {
+fn final_state(program: &Program) -> State {
     let outcome = exec::execute(
         program,
         ExecConfig {
@@ -63,7 +86,30 @@ fn final_probabilities(program: &Program) -> Vec<f64> {
             keep_state: true,
         },
     );
-    outcome.final_state.expect("a final state").probabilities()
+    outcome.final_state.expect("a final state")
+}
+
+fn final_probabilities(program: &Program) -> Vec<f64> {
+    final_state(program).probabilities()
+}
+
+fn assert_states_equivalent(left: &State, right: &State) {
+    assert_eq!(left.len(), right.len());
+
+    let pivot = (0..left.len())
+        .find(|&index| right.amplitude(index).norm() > 1e-12)
+        .expect("a normalized state has a nonzero amplitude");
+    let phase = left.amplitude(pivot) / right.amplitude(pivot);
+
+    for index in 0..left.len() {
+        let difference = left.amplitude(index) - phase * right.amplitude(index);
+        assert!(
+            difference.norm() < 1e-9,
+            "states differ at basis state {index}: {} vs {}",
+            left.amplitude(index),
+            right.amplitude(index)
+        );
+    }
 }
 
 #[test]
@@ -99,18 +145,11 @@ fn bell_pair_shots_are_perfectly_correlated() {
 
 #[test]
 fn optimisation_preserves_the_state_vector() {
-    let baseline = final_probabilities(&compile_clean(REDUNDANT, 0));
+    let baseline = final_state(&compile_clean(REDUNDANT, 0));
 
     for level in 1..=3u8 {
-        let optimised = final_probabilities(&compile_clean(REDUNDANT, level));
-        assert_eq!(baseline.len(), optimised.len());
-
-        for (index, (a, b)) in baseline.iter().zip(&optimised).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-9,
-                "-O{level} changed the physics at basis state {index}: {a} vs {b}"
-            );
-        }
+        let optimised = final_state(&compile_clean(REDUNDANT, level));
+        assert_states_equivalent(&baseline, &optimised);
     }
 }
 
@@ -185,6 +224,82 @@ fn qir_round_trips_through_its_own_frontend() {
             .collect();
 
         assert_eq!(before, after, "gate sequence changed across a round trip");
+    }
+}
+
+#[test]
+fn fused_unitaries_are_synthesized_for_qir_round_trips() {
+    let optimised = compile_clean(PYQIR, 3);
+    assert!(
+        optimised
+            .gates()
+            .any(|gate| matches!(gate.kind, GateKind::Unitary(_))),
+        "the fixture should exercise O3 fusion"
+    );
+
+    let emitted = codegen::emit_qir(&optimised);
+    assert!(!emitted.contains("__quantum__qis__unitary__body"));
+    assert!(emitted.contains("__quantum__qis__ry__body"));
+    assert!(emitted.contains("__quantum__qis__rz__body"));
+
+    let reparsed = compile_clean(&emitted, 0);
+    let before = exec::execute(
+        &optimised,
+        ExecConfig {
+            shots: 0,
+            seed: 7,
+            keep_state: true,
+        },
+    );
+    let after = exec::execute(
+        &reparsed,
+        ExecConfig {
+            shots: 0,
+            seed: 7,
+            keep_state: true,
+        },
+    );
+
+    assert_states_equivalent(
+        before.final_state.as_ref().expect("the original state"),
+        after.final_state.as_ref().expect("the round-tripped state"),
+    );
+}
+
+#[test]
+fn dynamic_rotation_parameters_survive_qir_round_trips() {
+    for level in 0..=3 {
+        let original = compile_clean(DYNAMIC_ROTATION, level);
+        let emitted = codegen::emit_qir(&original);
+
+        assert!(
+            emitted.contains("@__quantum__qis__ry__body(double %v"),
+            "-O{level} must preserve the computed SSA angle:\n{emitted}"
+        );
+
+        let reparsed = compile_clean(&emitted, 0);
+        let before = exec::execute(
+            &original,
+            ExecConfig {
+                shots: 40,
+                seed: 91,
+                keep_state: true,
+            },
+        );
+        let after = exec::execute(
+            &reparsed,
+            ExecConfig {
+                shots: 40,
+                seed: 91,
+                keep_state: true,
+            },
+        );
+
+        assert_eq!(before.counts, after.counts, "-O{level} changed outcomes");
+        assert_states_equivalent(
+            before.final_state.as_ref().expect("the original state"),
+            after.final_state.as_ref().expect("the round-tripped state"),
+        );
     }
 }
 
