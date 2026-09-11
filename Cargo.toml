@@ -3,4 +3,18 @@ name = "qirc"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "qirc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qirc"
+path = "src/main.rs"
+
 [dependencies]
+num-complex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
