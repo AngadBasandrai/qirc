@@ -1,8 +1,6 @@
 ; ModuleID = 'syntax_stress'
 source_filename = "syntax_stress.ll"
 
-; Every construct here is legal LLVM IR that a QIR frontend must survive.
-
 %Qubit = type opaque
 %Result = type opaque
 %"quoted type" = type { i64, [4 x double], <2 x i64>, { i8, i8 } }

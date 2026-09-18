@@ -156,10 +156,6 @@ impl Matrix2 {
         self.approx_eq(&Matrix2::identity(), epsilon)
     }
 
-    pub fn is_diagonal(&self, epsilon: f64) -> bool {
-        self.b.norm() < epsilon && self.c.norm() < epsilon
-    }
-
     pub fn to_ir(self) -> ir::Matrix2 {
         ir::Matrix2 {
             a: (self.a.re, self.a.im),
@@ -216,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn every_named_gate_is_unitary() {
+    fn unitary() {
         for m in [
             Matrix2::identity(),
             Matrix2::x(),
@@ -239,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn daggers_invert_their_partners() {
+    fn daggers() {
         assert!(
             Matrix2::s()
                 .multiply(Matrix2::s_dagger())
@@ -258,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn s_squared_is_z_and_t_squared_is_s() {
+    fn s_and_t_powers() {
         assert!(
             Matrix2::s()
                 .multiply(Matrix2::s())
@@ -272,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn sx_squared_is_x() {
+    fn sx_squared() {
         assert!(
             Matrix2::sx()
                 .multiply(Matrix2::sx())
@@ -281,14 +277,14 @@ mod tests {
     }
 
     #[test]
-    fn hadamard_conjugates_x_into_z() {
+    fn hxh() {
         let h = Matrix2::h();
         let result = h.multiply(Matrix2::x()).multiply(h);
         assert!(result.approx_eq(&Matrix2::z(), 1e-12));
     }
 
     #[test]
-    fn rotations_compose_by_adding_angles() {
+    fn rotation_composition() {
         let merged = Matrix2::rz(0.3).multiply(Matrix2::rz(0.4));
         assert!(merged.approx_eq(&Matrix2::rz(0.7), 1e-12));
 
@@ -297,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_round_trip_preserves_the_matrix() {
+    fn ir_roundtrip() {
         let original = Matrix2::rx(0.9);
         let restored = Matrix2::from_ir(original.to_ir());
         assert!(original.approx_eq(&restored, 1e-15));

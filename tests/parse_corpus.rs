@@ -34,14 +34,14 @@ fn parse_clean(name: &str, src: &str) -> Module {
 }
 
 #[test]
-fn whole_corpus_parses_without_diagnostics() {
+fn corpus_clean() {
     for (name, src) in CORPUS {
         parse_clean(name, src);
     }
 }
 
 #[test]
-fn no_instruction_is_left_unsupported() {
+fn corpus_supported() {
     for (name, src) in CORPUS {
         let module = parse_clean(name, src);
         for function in &module.functions {
@@ -60,7 +60,7 @@ fn no_instruction_is_left_unsupported() {
 }
 
 #[test]
-fn base_profile_bell_structure() {
+fn bell() {
     let module = parse_clean("bell", BELL);
 
     assert_eq!(module.source_filename.as_deref(), Some("BellPair"));
@@ -91,7 +91,7 @@ fn base_profile_bell_structure() {
 }
 
 #[test]
-fn inttoptr_constexpr_yields_the_qubit_id() {
+fn inttoptr_qubit() {
     let module = parse_clean("bell", BELL);
     let main = module.entry_point().unwrap();
 
@@ -116,7 +116,7 @@ fn inttoptr_constexpr_yields_the_qubit_id() {
 }
 
 #[test]
-fn module_flags_metadata_is_recovered() {
+fn module_flags() {
     let module = parse_clean("bell", BELL);
 
     let flags = module
@@ -133,7 +133,7 @@ fn module_flags_metadata_is_recovered() {
 }
 
 #[test]
-fn adaptive_profile_control_flow() {
+fn teleport() {
     let module = parse_clean("teleport", TELEPORT);
     let main = module.entry_point().unwrap();
 
@@ -174,7 +174,7 @@ fn adaptive_profile_control_flow() {
 }
 
 #[test]
-fn rotation_angle_survives_as_a_double() {
+fn rotation_angle() {
     let module = parse_clean("teleport", TELEPORT);
     let main = module.entry_point().unwrap();
 
@@ -190,7 +190,7 @@ fn rotation_angle_survives_as_a_double() {
 }
 
 #[test]
-fn pyqir_null_qubit_and_hex_angle() {
+fn pyqir() {
     let module = parse_clean("pyqir", PYQIR);
     let main = module.entry_point().unwrap();
 
@@ -224,7 +224,7 @@ fn pyqir_null_qubit_and_hex_angle() {
 }
 
 #[test]
-fn writeonly_param_attribute_does_not_eat_the_value() {
+fn param_attrs() {
     let module = parse_clean("bell", BELL);
     let mz = module
         .declarations
@@ -237,7 +237,7 @@ fn writeonly_param_attribute_does_not_eat_the_value() {
 }
 
 #[test]
-fn dynamic_module_phi_loop_and_helper_function() {
+fn dynamic() {
     let module = parse_clean("dynamic", DYNAMIC);
 
     assert_eq!(module.functions.len(), 2);
@@ -264,7 +264,7 @@ fn dynamic_module_phi_loop_and_helper_function() {
 }
 
 #[test]
-fn switch_and_every_opcode_in_the_stress_file() {
+fn stress() {
     let module = parse_clean("stress", STRESS);
     let stress = module.function("stress").expect("the stress function");
 
@@ -302,7 +302,7 @@ fn switch_and_every_opcode_in_the_stress_file() {
 }
 
 #[test]
-fn unnamed_entry_block_gets_a_number() {
+fn unnamed_block() {
     let module = parse_clean("stress", STRESS);
     let noop = module.function("noop").expect("noop");
     assert_eq!(noop.blocks.len(), 1);
@@ -311,7 +311,7 @@ fn unnamed_entry_block_gets_a_number() {
 }
 
 #[test]
-fn packed_and_vector_types_parse() {
+fn packed_and_vector() {
     let module = parse_clean("stress", STRESS);
 
     let quoted = module
@@ -346,7 +346,7 @@ fn packed_and_vector_types_parse() {
 }
 
 #[test]
-fn global_initializers_and_escapes() {
+fn globals() {
     let module = parse_clean("stress", STRESS);
 
     let s = module.global("g.str").expect("g.str");
@@ -369,10 +369,10 @@ fn global_initializers_and_escapes() {
 }
 
 #[test]
-fn every_reported_error_has_a_usable_span() {
+fn error_spans() {
     let broken = "define void @main() {\nentry:\n  call void @f(%Nope)\n  ret void\n}\n";
     let (_, diagnostics) = parse_module(broken);
-    assert!(!diagnostics.is_empty(), "expected the parser to complain");
+    assert!(!diagnostics.is_empty());
 
     let file = SourceFile::new("broken.ll", broken);
     for d in &diagnostics {

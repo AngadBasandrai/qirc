@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - run: cargo check --all-targets
+
+  emitted-qir:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: emitted QIR is valid LLVM IR
+        run: |
+          for file in tests/corpus/base_profile_bell.ll tests/corpus/adaptive_teleport.ll \
+                      tests/corpus/pyqir_simple.ll tests/corpus/qsharp_loop.ll \
+                      tests/corpus/unrestricted_dynamic.ll examples/small.ll; do
+            for level in 0 1 2 3; do
+              ./target/release/qirc "$file" --emit qir -O$level -o out.ll
+              clang -x ir -S -emit-llvm -o /dev/null out.ll
+            done
+          done

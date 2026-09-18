@@ -189,46 +189,12 @@ fn resolve_rt(base: &str) -> Option<Intrinsic> {
     })
 }
 
-pub fn known_gate_names() -> Vec<&'static str> {
-    vec![
-        "i",
-        "x",
-        "y",
-        "z",
-        "h",
-        "s",
-        "t",
-        "sx",
-        "cnot",
-        "cx",
-        "cy",
-        "cz",
-        "ch",
-        "ccx",
-        "ccz",
-        "swap",
-        "cswap",
-        "rx",
-        "ry",
-        "rz",
-        "r1",
-        "crx",
-        "cry",
-        "crz",
-        "cr1",
-        "m",
-        "mz",
-        "reset",
-        "read_result",
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn strips_functor_suffixes() {
+    fn functor_suffixes() {
         let (ns, base, functor) = split_mangled("__quantum__qis__h__body").unwrap();
         assert_eq!(ns, "qis");
         assert_eq!(base, "h");
@@ -248,14 +214,14 @@ mod tests {
     }
 
     #[test]
-    fn bare_names_without_a_functor_still_resolve() {
+    fn bare_names() {
         let (_, base, functor) = split_mangled("__quantum__qis__cnot").unwrap();
         assert_eq!(base, "cnot");
         assert_eq!(functor, Functor::Body);
     }
 
     #[test]
-    fn multi_underscore_gate_names_are_not_truncated() {
+    fn underscored_names() {
         let (_, base, _) = split_mangled("__quantum__qis__read_result__body").unwrap();
         assert_eq!(base, "read_result");
 
@@ -267,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn controlled_aliases_carry_their_control_count() {
+    fn controlled_aliases() {
         let cnot = resolve("__quantum__qis__cnot__body").unwrap();
         assert_eq!(
             cnot.intrinsic,
@@ -303,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn measurement_variants() {
+    fn measure_variants() {
         assert_eq!(
             resolve("__quantum__qis__mz__body").unwrap().intrinsic,
             Intrinsic::Measure {
@@ -319,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_bookkeeping_is_ignored_not_rejected() {
+    fn runtime_bookkeeping() {
         for name in [
             "__quantum__rt__string_update_reference_count",
             "__quantum__rt__array_update_alias_count",
@@ -335,14 +301,14 @@ mod tests {
     }
 
     #[test]
-    fn unknown_names_are_rejected() {
+    fn unknown_names() {
         assert!(resolve("__quantum__qis__nope__body").is_none());
         assert!(resolve("@printf").is_none());
         assert!(resolve("Program__Rotate__body").is_none());
     }
 
     #[test]
-    fn adjoint_pairs_round_trip() {
+    fn adjoints() {
         assert_eq!(GateKind::S.adjoint(), Some(GateKind::SDag));
         assert_eq!(GateKind::SDag.adjoint(), Some(GateKind::S));
         assert_eq!(GateKind::T.adjoint(), Some(GateKind::TDag));

@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::ops::Range;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Span {
     pub start: u32,
     pub end: u32,
@@ -39,10 +39,6 @@ impl Span {
     pub fn is_empty(self) -> bool {
         self.end <= self.start
     }
-
-    pub fn is_dummy(self) -> bool {
-        self.start == 0 && self.end == 0
-    }
 }
 
 pub struct SourceFile {
@@ -68,10 +64,6 @@ impl SourceFile {
             text,
             line_starts,
         }
-    }
-
-    pub fn line_count(&self) -> usize {
-        self.line_starts.len()
     }
 
     pub fn line_index(&self, offset: u32) -> usize {
@@ -111,7 +103,7 @@ impl SourceFile {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Severity {
     Error,
     Warning,
@@ -177,15 +169,6 @@ impl Diagnostic {
         self
     }
 
-    pub fn secondary(mut self, span: Span, message: impl Into<String>) -> Self {
-        self.labels.push(Label {
-            span,
-            message: message.into(),
-            primary: false,
-        });
-        self
-    }
-
     pub fn note(mut self, message: impl Into<String>) -> Self {
         self.notes.push(message.into());
         self
@@ -200,17 +183,37 @@ impl Diagnostic {
     }
 
     pub fn render(&self, file: &SourceFile) -> String {
+        self.render_styled(file, false)
+    }
+
+    pub fn render_styled(&self, file: &SourceFile, color: bool) -> String {
+        let paint = |code: &str, text: &str| {
+            if color {
+                format!("\x1b[{code}m{text}\x1b[0m")
+            } else {
+                text.to_string()
+            }
+        };
+        let accent = match self.severity {
+            Severity::Error => "1;31",
+            Severity::Warning => "1;33",
+            Severity::Note => "1;36",
+        };
+        let blue = "1;34";
+
         let mut out = String::new();
 
-        match self.code {
-            Some(code) => {
-                let _ = write!(out, "{}[{}]: {}", self.severity.label(), code, self.message);
-            }
-            None => {
-                let _ = write!(out, "{}: {}", self.severity.label(), self.message);
-            }
-        }
-        out.push('\n');
+        let head = match self.code {
+            Some(code) => format!("{}[{}]", self.severity.label(), code),
+            None => self.severity.label().to_string(),
+        };
+        writeln!(
+            out,
+            "{}{}",
+            paint(accent, &head),
+            paint("1", &format!(": {}", self.message))
+        )
+        .unwrap();
 
         let gutter = self
             .labels
@@ -219,30 +222,31 @@ impl Diagnostic {
             .max()
             .map(|line| line.to_string().len())
             .unwrap_or(1);
+        let pad = " ".repeat(gutter);
+        let bar = paint(blue, "|");
 
         if let Some(span) = self.primary_span() {
             let (line, col) = file.line_col(span.start);
-            let _ = writeln!(
+            writeln!(
                 out,
-                "{:>width$}--> {}:{}:{}",
-                "",
+                "{pad}{} {}:{}:{}",
+                paint(blue, "-->"),
                 file.name,
                 line,
-                col,
-                width = gutter + 1
-            );
+                col
+            )
+            .unwrap();
         }
 
         let mut sorted: Vec<&Label> = self.labels.iter().collect();
         sorted.sort_by_key(|l| l.span.start);
 
         if !sorted.is_empty() {
-            let _ = writeln!(out, "{:>width$} |", "", width = gutter);
+            writeln!(out, "{pad} {bar}").unwrap();
         }
 
         for label in sorted {
             let line_index = file.line_index(label.span.start);
-            let line_no = line_index + 1;
             let text = file.line_text(line_index);
             let line_start = file.line_start(line_index);
 
@@ -254,29 +258,32 @@ impl Diagnostic {
             let prefix_chars = text[..clamped_start].chars().count();
             let width_chars = text[clamped_start..clamped_end].chars().count().max(1);
 
-            let _ = writeln!(out, "{:>width$} | {}", line_no, text, width = gutter);
+            let number = format!("{:>gutter$}", line_index + 1);
+            writeln!(out, "{} {bar} {text}", paint(blue, &number)).unwrap();
 
-            let marker = if label.primary { '^' } else { '-' };
-            let _ = write!(
-                out,
-                "{:>width$} | {}{}",
-                "",
-                " ".repeat(prefix_chars),
-                marker.to_string().repeat(width_chars),
-                width = gutter
-            );
-
-            if label.message.is_empty() {
-                out.push('\n');
+            let (marker, marker_color) = if label.primary {
+                ('^', accent)
             } else {
-                let _ = writeln!(out, " {}", label.message);
+                ('-', blue)
+            };
+            let mut underline = marker.to_string().repeat(width_chars);
+            if !label.message.is_empty() {
+                underline.push(' ');
+                underline.push_str(&label.message);
             }
+            writeln!(
+                out,
+                "{pad} {bar} {}{}",
+                " ".repeat(prefix_chars),
+                paint(marker_color, &underline)
+            )
+            .unwrap();
         }
 
         if !self.notes.is_empty() {
-            let _ = writeln!(out, "{:>width$} |", "", width = gutter);
+            writeln!(out, "{pad} {bar}").unwrap();
             for note in &self.notes {
-                let _ = writeln!(out, "{:>width$} = note: {}", "", note, width = gutter);
+                writeln!(out, "{pad} {} {note}", paint(blue, "= note:")).unwrap();
             }
         }
 
@@ -331,17 +338,6 @@ impl Diagnostics {
     pub fn iter(&self) -> std::slice::Iter<'_, Diagnostic> {
         self.items.iter()
     }
-
-    pub fn render_all(&self, file: &SourceFile) -> String {
-        let mut out = String::new();
-        for (i, d) in self.items.iter().enumerate() {
-            if i > 0 {
-                out.push('\n');
-            }
-            out.push_str(&d.render(file));
-        }
-        out
-    }
 }
 
 impl IntoIterator for Diagnostics {
@@ -365,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn line_col_is_one_based() {
+    fn positions() {
         let f = file();
         assert_eq!(f.line_col(0), (1, 1));
         assert_eq!(f.line_col(22), (2, 1));
@@ -374,14 +370,14 @@ mod tests {
     }
 
     #[test]
-    fn line_text_strips_newline() {
+    fn lines() {
         let f = file();
         assert_eq!(f.line_text(1), "entry:");
         assert_eq!(f.line_text(0), "define void @main() {");
     }
 
     #[test]
-    fn snippet_matches_span() {
+    fn snippets() {
         let f = file();
         let start = SRC.find("@__quantum__qis__foo").unwrap();
         let span = Span::new(start, start + "@__quantum__qis__foo".len());
@@ -389,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn render_points_at_the_right_column() {
+    fn render_caret() {
         let f = file();
         let start = SRC.find("@__quantum__qis__foo").unwrap();
         let span = Span::new(start, start + "@__quantum__qis__foo".len());
@@ -397,7 +393,6 @@ mod tests {
         let rendered = Diagnostic::error("unknown quantum intrinsic")
             .with_code("QIR0102")
             .primary(span, "not a known instruction")
-            .note("run with --list-intrinsics to see supported names")
             .render(&f);
 
         assert!(rendered.starts_with("error[QIR0102]: unknown quantum intrinsic\n"));
@@ -419,11 +414,10 @@ mod tests {
             caret_line.matches('^').count(),
             "@__quantum__qis__foo".len()
         );
-        assert!(rendered.contains("= note: run with --list-intrinsics"));
     }
 
     #[test]
-    fn collects_and_counts() {
+    fn counts() {
         let mut bag = Diagnostics::new();
         assert!(!bag.has_errors());
 

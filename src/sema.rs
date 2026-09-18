@@ -9,7 +9,7 @@ pub fn validate(program: &Program) -> Vec<Diagnostic> {
     check_profile(program, &mut diagnostics);
     check_wires(program, &mut diagnostics);
     check_control_flow(program, &mut diagnostics);
-    check_measurement_use(program, &mut diagnostics);
+    check_results(program, &mut diagnostics);
 
     diagnostics
 }
@@ -31,7 +31,7 @@ fn check_profile(program: &Program, out: &mut Vec<Diagnostic>) {
             Diagnostic::error("the Base Profile forbids branching")
                 .with_code("QIR0300")
                 .primary(span, "this program has more than one basic block")
-                .note("recompile for the Adaptive Profile, or remove the measurement feedback"),
+                .note("branching needs the Adaptive Profile"),
         );
     }
 
@@ -48,8 +48,7 @@ fn check_profile(program: &Program, out: &mut Vec<Diagnostic>) {
                     .primary(
                         *span,
                         format!("r{} is read back into the program", result.0),
-                    )
-                    .note("only the Adaptive Profile can branch on a measurement"),
+                    ),
             );
         }
 
@@ -183,7 +182,7 @@ fn check_control_flow(program: &Program, out: &mut Vec<Diagnostic>) {
     }
 }
 
-fn check_measurement_use(program: &Program, out: &mut Vec<Diagnostic>) {
+fn check_results(program: &Program, out: &mut Vec<Diagnostic>) {
     let mut written: HashSet<ResultId> = HashSet::new();
 
     for op in program.ops() {

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use crate::ir::*;
 use crate::simulator::matrix::{Matrix2, matrix_for};
@@ -17,6 +18,7 @@ pub struct OptStats {
     pub ops_after: usize,
     pub applied: Vec<(&'static str, usize)>,
     pub rounds: usize,
+    pub violations: Vec<String>,
 }
 
 impl OptStats {
@@ -29,8 +31,8 @@ impl OptStats {
     }
 }
 
-impl std::fmt::Display for OptStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for OptStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
             "gates {} -> {}, depth {} -> {}, ops {} -> {} ({} rounds)",
@@ -52,6 +54,10 @@ impl std::fmt::Display for OptStats {
 }
 
 pub fn optimise(program: &mut Program, level: u8) -> OptStats {
+    optimise_verified(program, level, false)
+}
+
+pub fn optimise_verified(program: &mut Program, level: u8, verify_each: bool) -> OptStats {
     let mut stats = OptStats {
         gates_before: program.gate_count(),
         depth_before: program.depth(),
@@ -72,7 +78,7 @@ pub fn optimise(program: &mut Program, level: u8) -> OptStats {
     for round in 0..rounds {
         let mut changed = 0usize;
 
-        for (name, hits) in run_round(program, level) {
+        for (name, hits) in run_round(program, level, verify_each, &mut stats.violations) {
             if hits > 0 {
                 *totals.entry(name).or_insert(0) += hits;
                 changed += hits;
@@ -96,25 +102,54 @@ pub fn optimise(program: &mut Program, level: u8) -> OptStats {
     stats
 }
 
-fn run_round(program: &mut Program, level: u8) -> Vec<(&'static str, usize)> {
-    let mut results = vec![
-        ("drop-identity", drop_identity_gates(program)),
-        ("cancel-inverses", cancel_inverses(program)),
-        ("merge-rotations", merge_rotations(program)),
-        ("fold-constants", fold_constants(program)),
+type Pass = fn(&mut Program) -> usize;
+
+fn run_pass(
+    program: &mut Program,
+    name: &'static str,
+    pass: Pass,
+    verify_each: bool,
+    violations: &mut Vec<String>,
+) -> (&'static str, usize) {
+    let hits = pass(program);
+
+    if verify_each {
+        for found in crate::verify::verify(program) {
+            violations.push(format!("after {name}: {found}"));
+        }
+    }
+
+    (name, hits)
+}
+
+fn run_round(
+    program: &mut Program,
+    level: u8,
+    verify_each: bool,
+    violations: &mut Vec<String>,
+) -> Vec<(&'static str, usize)> {
+    let mut schedule: Vec<(&'static str, Pass)> = vec![
+        ("drop-identity", drop_identity_gates),
+        ("cancel-inverses", cancel_inverses),
+        ("merge-rotations", merge_rotations),
+        ("fold-constants", fold_constants),
     ];
 
     if level >= 2 {
-        results.push(("peephole", peephole(program)));
-        results.push(("simplify-cfg", simplify_cfg(program)));
+        schedule.push(("peephole", peephole));
+        schedule.push(("simplify-cfg", simplify_cfg));
     }
 
     if level >= 3 {
-        results.push(("fuse-single-qubit", fuse_single_qubit(program)));
+        schedule.push(("fuse-single-qubit", fuse_single_qubit));
     }
 
-    results.push(("dead-code", eliminate_dead_code(program)));
-    results
+    schedule.push(("dead-code", eliminate_dead_code));
+
+    schedule
+        .into_iter()
+        .map(|(name, pass)| run_pass(program, name, pass, verify_each, violations))
+        .collect()
 }
 
 fn op_wires(op: &Op) -> Vec<QubitId> {
@@ -449,70 +484,10 @@ fn fold_constants(program: &mut Program) -> usize {
 }
 
 fn try_fold(expr: &Expr, known: &HashMap<ValueId, Const>) -> Option<Const> {
-    let lookup = |operand: &Operand| -> Option<Const> {
-        match operand {
-            Operand::Const(c) => Some(*c),
-            Operand::Value(id) => known.get(id).copied(),
-        }
-    };
-
-    match expr {
-        Expr::Copy(operand) => lookup(operand),
-        Expr::Binary { op, lhs, rhs } => {
-            let (a, b) = (lookup(lhs)?, lookup(rhs)?);
-            if op.is_float() {
-                let (x, y) = (a.as_f64(), b.as_f64());
-                Some(Const::Float(match op {
-                    BinOp::FAdd => x + y,
-                    BinOp::FSub => x - y,
-                    BinOp::FMul => x * y,
-                    BinOp::FDiv => x / y,
-                    _ => return None,
-                }))
-            } else {
-                let (x, y) = (a.as_i64(), b.as_i64());
-                Some(Const::Int(match op {
-                    BinOp::Add => x.wrapping_add(y),
-                    BinOp::Sub => x.wrapping_sub(y),
-                    BinOp::Mul => x.wrapping_mul(y),
-                    BinOp::And => x & y,
-                    BinOp::Or => x | y,
-                    BinOp::Xor => x ^ y,
-                    _ => return None,
-                }))
-            }
-        }
-        Expr::ICmp { pred, lhs, rhs } => {
-            let (a, b) = (lookup(lhs)?.as_i64(), lookup(rhs)?.as_i64());
-            Some(Const::Bool(match pred {
-                IntPredicate::Eq => a == b,
-                IntPredicate::Ne => a != b,
-                IntPredicate::Slt => a < b,
-                IntPredicate::Sle => a <= b,
-                IntPredicate::Sgt => a > b,
-                IntPredicate::Sge => a >= b,
-                _ => return None,
-            }))
-        }
-        Expr::Select {
-            cond,
-            if_true,
-            if_false,
-        } => {
-            let taken = lookup(cond)?.truthy();
-            lookup(if taken { if_true } else { if_false })
-        }
-        Expr::Cast { op, operand } => {
-            let value = lookup(operand)?;
-            Some(match op {
-                CastOp::SIToFP | CastOp::UIToFP => Const::Float(value.as_f64()),
-                CastOp::FPToSI | CastOp::FPToUI => Const::Int(value.as_f64() as i64),
-                CastOp::ZExt | CastOp::SExt | CastOp::Trunc => Const::Int(value.as_i64()),
-                _ => return None,
-            })
-        }
-        _ => None,
-    }
+    expr.fold(|operand| match operand {
+        Operand::Const(c) => Some(*c),
+        Operand::Value(id) => known.get(id).copied(),
+    })
 }
 
 fn substitute_known(program: &mut Program, known: &HashMap<ValueId, Const>) {
@@ -526,10 +501,14 @@ fn substitute_known(program: &mut Program, known: &HashMap<ValueId, Const>) {
 
     for block in &mut program.blocks {
         for op in &mut block.ops {
-            if let Op::Gate(gate) = op {
-                for param in &mut gate.params {
-                    replace(param);
+            match op {
+                Op::Gate(gate) => {
+                    for param in &mut gate.params {
+                        replace(param);
+                    }
                 }
+                Op::Store { value, .. } => replace(value),
+                _ => {}
             }
         }
 
@@ -557,6 +536,11 @@ fn eliminate_dead_code(program: &mut Program) -> usize {
                 }
                 Op::Assign { expr, .. } => {
                     for id in expr_uses(expr) {
+                        live.insert(id);
+                    }
+                }
+                Op::Store { value, .. } => {
+                    if let Some(id) = value.value() {
                         live.insert(id);
                     }
                 }

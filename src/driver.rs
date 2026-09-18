@@ -1,3 +1,4 @@
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -7,9 +8,12 @@ use crate::ir::Program;
 use crate::lower;
 use crate::opt::{self, OptStats};
 use crate::parse::parse_module;
+use crate::route::{self, Coupling, RouteStats};
 use crate::sema;
 use crate::simulator::exec::{self, ExecConfig};
 use crate::simulator::simd;
+use crate::simulator::state;
+use crate::transpile::{self, Basis, TranspileStats};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Emit {
@@ -37,6 +41,54 @@ impl Emit {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Color {
+    Auto,
+    Always,
+    Never,
+}
+
+impl Color {
+    fn enabled(self) -> bool {
+        match self {
+            Color::Always => {
+                enable_ansi();
+                true
+            }
+            Color::Never => false,
+            Color::Auto => {
+                std::env::var_os("NO_COLOR").is_none()
+                    && io::stderr().is_terminal()
+                    && enable_ansi()
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn enable_ansi() -> bool {
+    use std::os::windows::io::AsRawHandle;
+
+    unsafe extern "system" {
+        fn GetConsoleMode(handle: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
+    }
+
+    const VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    let handle = io::stderr().as_raw_handle();
+    let mut mode = 0u32;
+
+    unsafe {
+        GetConsoleMode(handle, &mut mode) != 0
+            && SetConsoleMode(handle, mode | VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_ansi() -> bool {
+    true
+}
+
 pub struct Options {
     pub input: PathBuf,
     pub emit: Emit,
@@ -46,6 +98,10 @@ pub struct Options {
     pub show_state: bool,
     pub verbose: bool,
     pub output: Option<PathBuf>,
+    pub verify_each: bool,
+    pub basis: Option<Basis>,
+    pub coupling: Option<Coupling>,
+    pub color: Color,
 }
 
 impl Default for Options {
@@ -59,6 +115,10 @@ impl Default for Options {
             show_state: true,
             verbose: false,
             output: None,
+            verify_each: false,
+            basis: None,
+            coupling: None,
+            color: Color::Auto,
         }
     }
 }
@@ -76,6 +136,11 @@ options:
   --seed <n>        seed the random number generator
   --no-state        do not print the final state vector
   -o <path>         write emitted output to a file
+  --color <when>    auto | always | never                              (default: auto)
+  --basis <name>    decompose into a target gate set: rz-sx-cx | rz-ry-cz
+  --coupling <map>  route onto hardware: line:N | ring:N | grid:RxC | full:N
+                    or an explicit edge list such as 0-1,1-2,2-3
+  --verify-each     run the IR verifier after lowering and after every pass
   -v, --verbose     report pipeline statistics
   -h, --help        show this message
 ";
@@ -130,6 +195,44 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
                 index += 2;
             }
 
+            "--basis" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--basis needs a name".to_string())?;
+                options.basis =
+                    Some(Basis::parse(value).ok_or_else(|| format!("unknown basis `{value}`"))?);
+                index += 2;
+            }
+
+            "--coupling" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--coupling needs a map".to_string())?;
+                options.coupling = Some(
+                    Coupling::parse(value)
+                        .ok_or_else(|| format!("unknown coupling map `{value}`"))?,
+                );
+                index += 2;
+            }
+
+            "--color" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--color needs auto, always or never".to_string())?;
+                options.color = match value.as_str() {
+                    "auto" => Color::Auto,
+                    "always" => Color::Always,
+                    "never" => Color::Never,
+                    _ => return Err(format!("unknown color setting `{value}`")),
+                };
+                index += 2;
+            }
+
+            "--verify-each" => {
+                options.verify_each = true;
+                index += 1;
+            }
+
             "--no-state" => {
                 options.show_state = false;
                 index += 1;
@@ -166,9 +269,17 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
     Ok(options)
 }
 
+#[derive(Default)]
+pub struct Target {
+    pub basis: Option<Basis>,
+    pub coupling: Option<Coupling>,
+}
+
 pub struct Compilation {
     pub program: Program,
     pub stats: OptStats,
+    pub transpiled: Option<TranspileStats>,
+    pub routed: Option<RouteStats>,
     pub diagnostics: Vec<Diagnostic>,
     pub parse_time: std::time::Duration,
     pub lower_time: std::time::Duration,
@@ -176,6 +287,14 @@ pub struct Compilation {
 }
 
 pub fn compile(source: &str, opt_level: u8) -> Compilation {
+    compile_verified(source, opt_level, false)
+}
+
+pub fn compile_verified(source: &str, opt_level: u8, verify_each: bool) -> Compilation {
+    compile_for(source, opt_level, verify_each, &Target::default())
+}
+
+pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Target) -> Compilation {
     let mut diagnostics = Vec::new();
 
     let started = Instant::now();
@@ -191,13 +310,47 @@ pub fn compile(source: &str, opt_level: u8) -> Compilation {
     let mut program = lowered.program;
     diagnostics.extend(sema::validate(&program));
 
+    let mut lowering_violations = Vec::new();
+    let lowered_cleanly = !diagnostics.iter().any(|d| d.severity == Severity::Error);
+    if verify_each && lowered_cleanly {
+        for found in crate::verify::verify(&program) {
+            lowering_violations.push(format!("after lowering: {found}"));
+        }
+    }
+
     let started = Instant::now();
-    let stats = opt::optimise(&mut program, opt_level);
+    let mut stats = opt::optimise_verified(&mut program, opt_level, verify_each && lowered_cleanly);
     let opt_time = started.elapsed();
+
+    lowering_violations.append(&mut stats.violations);
+    stats.violations = lowering_violations;
+
+    let transpiled = target
+        .basis
+        .map(|basis| transpile::transpile(&mut program, basis));
+
+    let mut routed = None;
+    if let Some(coupling) = &target.coupling {
+        match route::route(&mut program, coupling) {
+            Ok(stats) => routed = Some(stats),
+            Err(message) => diagnostics.push(
+                Diagnostic::error(format!("cannot route this program: {message}"))
+                    .with_code("QIR0400"),
+            ),
+        }
+    }
+
+    if verify_each && (transpiled.is_some() || routed.is_some()) {
+        for found in crate::verify::verify(&program) {
+            stats.violations.push(format!("after targeting: {found}"));
+        }
+    }
 
     Compilation {
         program,
         stats,
+        transpiled,
+        routed,
         diagnostics,
         parse_time,
         lower_time,
@@ -216,15 +369,36 @@ pub fn run(options: Options) -> i32 {
 
     let name = options.input.display().to_string();
     let file = SourceFile::new(name.clone(), source.clone());
-    let compilation = compile(&source, options.opt_level);
+    let compilation = compile_for(
+        &source,
+        options.opt_level,
+        options.verify_each,
+        &Target {
+            basis: options.basis,
+            coupling: options.coupling.clone(),
+        },
+    );
 
+    for violation in &compilation.stats.violations {
+        eprintln!("internal error: verifier: {violation}");
+    }
+
+    let color = options.color.enabled();
     let mut errors = 0;
     for diagnostic in &compilation.diagnostics {
-        eprint!("{}", diagnostic.render(&file));
+        eprint!("{}", diagnostic.render_styled(&file, color));
         eprintln!();
         if diagnostic.severity == Severity::Error {
             errors += 1;
         }
+    }
+
+    if !compilation.stats.violations.is_empty() {
+        eprintln!(
+            "error: aborting after {} verifier violation(s)",
+            compilation.stats.violations.len()
+        );
+        return 1;
     }
 
     if errors > 0 {
@@ -243,6 +417,12 @@ pub fn run(options: Options) -> i32 {
             compilation.parse_time, compilation.lower_time, compilation.opt_time
         );
         eprint!("{}", compilation.stats);
+        if let Some(stats) = &compilation.transpiled {
+            eprintln!("{stats}");
+        }
+        if let Some(stats) = &compilation.routed {
+            eprintln!("{stats}");
+        }
     }
 
     let emitted = match options.emit {
@@ -282,11 +462,28 @@ pub fn run(options: Options) -> i32 {
 fn execute(options: &Options, compilation: &Compilation) -> i32 {
     let program = &compilation.program;
 
+    let qubits = program.num_qubits as usize;
+    if qubits > state::MAX_QUBITS {
+        eprintln!(
+            "error: this program needs {qubits} qubits, but the simulator supports at most {}",
+            state::MAX_QUBITS
+        );
+        match state::memory_required(qubits) {
+            Some(bytes) => eprintln!(
+                "note: a {qubits} qubit state vector would need {:.1} GiB of memory",
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            ),
+            None => eprintln!("note: a {qubits} qubit state vector does not fit in memory"),
+        }
+        eprintln!("note: use --emit qir, qasm3, json or circuit to compile without simulating");
+        return 1;
+    }
+
     let seed = options.seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x5EED)
+            .unwrap_or(1)
     });
 
     println!("source:  {}", options.input.display());
@@ -323,12 +520,17 @@ fn execute(options: &Options, compilation: &Compilation) -> i32 {
     );
     let elapsed = started.elapsed();
 
+    if outcome.aborted {
+        eprintln!("error: execution did not terminate within the step limit");
+        return 1;
+    }
+
     if let Some(state) = &outcome.final_state {
         println!();
         if outcome.sampled {
             print!("{state}");
         } else {
-            println!("final state of the last shot (measurement has collapsed it):");
+            println!("state after the last shot:");
             print!("{state}");
         }
 

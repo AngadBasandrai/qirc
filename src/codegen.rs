@@ -11,10 +11,10 @@ pub fn emit_qasm3(program: &Program) -> String {
     out.push_str("include \"stdgates.inc\";\n\n");
 
     if program.num_qubits > 0 {
-        let _ = writeln!(out, "qubit[{}] q;", program.num_qubits);
+        writeln!(out, "qubit[{}] q;", program.num_qubits).unwrap();
     }
     if program.num_results > 0 {
-        let _ = writeln!(out, "bit[{}] c;", program.num_results);
+        writeln!(out, "bit[{}] c;", program.num_results).unwrap();
     }
     out.push('\n');
 
@@ -22,23 +22,31 @@ pub fn emit_qasm3(program: &Program) -> String {
 
     for block in &program.blocks {
         if branching {
-            let _ = writeln!(out, "// block {}", block.label);
+            writeln!(out, "// block {}", block.label).unwrap();
         }
 
         for op in &block.ops {
             match op {
                 Op::Gate(gate) => {
                     if let Some(line) = qasm_gate(gate) {
-                        let _ = writeln!(out, "{line}");
+                        writeln!(out, "{line}").unwrap();
+                    } else if gate.is_parameterised() && gate.constant_angle().is_none() {
+                        writeln!(
+                            out,
+                            "// omitted {} on {}: angle is only known at run time",
+                            gate.kind.name(),
+                            qasm_wires(gate)
+                        )
+                        .unwrap();
                     } else {
-                        let _ = writeln!(out, "// unsupported gate {}", gate.kind.name());
+                        writeln!(out, "// unsupported gate {}", gate.kind.name()).unwrap();
                     }
                 }
                 Op::Measure { qubit, result, .. } => {
-                    let _ = writeln!(out, "c[{}] = measure q[{}];", result.0, qubit.0);
+                    writeln!(out, "c[{}] = measure q[{}];", result.0, qubit.0).unwrap();
                 }
                 Op::Reset { qubit, .. } => {
-                    let _ = writeln!(out, "reset q[{}];", qubit.0);
+                    writeln!(out, "reset q[{}];", qubit.0).unwrap();
                 }
                 Op::Assign { .. }
                 | Op::RecordOutput { .. }
@@ -48,7 +56,7 @@ pub fn emit_qasm3(program: &Program) -> String {
         }
 
         if branching && let Term::CondBr { .. } = block.term {
-            let _ = writeln!(out, "// conditional branch elided");
+            writeln!(out, "// conditional branch elided").unwrap();
         }
     }
 
@@ -108,14 +116,10 @@ fn qasm_gate(gate: &Gate) -> Option<String> {
         return Some(format!("{name} {wires};"));
     }
 
-    let params: Vec<String> = gate
-        .params
-        .iter()
-        .map(|p| match p.constant() {
-            Some(c) => format!("{}", c.as_f64()),
-            None => "0.0".into(),
-        })
-        .collect();
+    let mut params = Vec::with_capacity(gate.params.len());
+    for parameter in &gate.params {
+        params.push(format!("{}", parameter.constant()?.as_f64()));
+    }
 
     Some(format!("{name}({}) {wires};", params.join(", ")))
 }
@@ -198,8 +202,8 @@ impl<'a> QirEmitter<'a> {
     fn emit(mut self) -> String {
         let program = self.program;
 
-        let _ = writeln!(self.out, "; ModuleID = '{}'", program.name);
-        let _ = writeln!(self.out, "source_filename = \"{}\"", program.name);
+        writeln!(self.out, "; ModuleID = '{}'", program.name).unwrap();
+        writeln!(self.out, "source_filename = \"{}\"", program.name).unwrap();
         self.out.push('\n');
         self.out
             .push_str("%Result = type opaque\n%Qubit = type opaque\n\n");
@@ -216,10 +220,10 @@ impl<'a> QirEmitter<'a> {
         let mut body = String::new();
         for (index, block) in program.blocks.iter().enumerate() {
             if index == 0 {
-                let _ = writeln!(body, "{}:", block.label);
+                writeln!(body, "{}:", block.label).unwrap();
                 for slot in 0..program.num_slots {
                     let ty = self.slot_types.get(&SlotId(slot)).copied().unwrap_or("i64");
-                    let _ = writeln!(body, "  %slot{slot} = alloca {ty}");
+                    writeln!(body, "  %slot{slot} = alloca {ty}").unwrap();
                 }
                 for op in &block.ops {
                     self.emit_op(op, &mut body);
@@ -230,22 +234,22 @@ impl<'a> QirEmitter<'a> {
             }
         }
 
-        let _ = writeln!(self.out, "define void @{}() #0 {{", program.name);
+        writeln!(self.out, "define void @{}() #0 {{", program.name).unwrap();
         self.out.push_str(&body);
         self.out.push_str("}\n\n");
 
         for (name, params) in &self.declarations {
-            let _ = writeln!(self.out, "declare {name}({params})");
+            writeln!(self.out, "declare {name}({params})").unwrap();
         }
 
         self.out.push('\n');
-        let _ = writeln!(
+        writeln!(
             self.out,
             "attributes #0 = {{ \"entry_point\" \"output_labeling_schema\" \"qir_profiles\"=\"{}\" \"required_num_qubits\"=\"{}\" \"required_num_results\"=\"{}\" }}",
             program.profile.name(),
             program.num_qubits,
             program.num_results
-        );
+        ).unwrap();
 
         self.out.push('\n');
         self.out
@@ -263,7 +267,7 @@ impl<'a> QirEmitter<'a> {
     }
 
     fn emit_block(&mut self, block: &Block, body: &mut String) {
-        let _ = writeln!(body, "{}:", block.label);
+        writeln!(body, "{}:", block.label).unwrap();
 
         for op in &block.ops {
             self.emit_op(op, body);
@@ -277,12 +281,13 @@ impl<'a> QirEmitter<'a> {
             Op::Gate(gate) => self.emit_gate(gate, body),
 
             Op::Measure { qubit, result, .. } => {
-                let _ = writeln!(
+                writeln!(
                     body,
                     "  call void @__quantum__qis__mz__body({}, {})",
                     qubit_ref(*qubit),
                     result_ref(*result)
-                );
+                )
+                .unwrap();
                 self.declare(
                     "void @__quantum__qis__mz__body",
                     "%Qubit*, %Result* writeonly",
@@ -290,11 +295,12 @@ impl<'a> QirEmitter<'a> {
             }
 
             Op::Reset { qubit, .. } => {
-                let _ = writeln!(
+                writeln!(
                     body,
                     "  call void @__quantum__qis__reset__body({})",
                     qubit_ref(*qubit)
-                );
+                )
+                .unwrap();
                 self.declare("void @__quantum__qis__reset__body", "%Qubit*");
             }
 
@@ -315,15 +321,17 @@ impl<'a> QirEmitter<'a> {
 
                 match result {
                     Some(r) => {
-                        let _ = writeln!(body, "  call void @{name}({}, i8* null)", result_ref(*r));
+                        writeln!(body, "  call void @{name}({}, i8* null)", result_ref(*r))
+                            .unwrap();
                         self.declare(&format!("void @{name}"), "%Result*, i8*");
                     }
                     None => {
-                        let _ = writeln!(
+                        writeln!(
                             body,
                             "  call void @{name}(i64 {}, i8* null)",
                             count.unwrap_or(0)
-                        );
+                        )
+                        .unwrap();
                         self.declare(&format!("void @{name}"), "i64, i8*");
                     }
                 }
@@ -333,7 +341,7 @@ impl<'a> QirEmitter<'a> {
 
             Op::Store { slot, value, .. } => {
                 let (rendered, ty) = self.operand(value);
-                let _ = writeln!(body, "  store {ty} {rendered}, ptr %slot{}", slot.0);
+                writeln!(body, "  store {ty} {rendered}, ptr %slot{}", slot.0).unwrap();
             }
 
             Op::Message { .. } => {}
@@ -368,7 +376,7 @@ impl<'a> QirEmitter<'a> {
 
     fn emit_native_gate(&mut self, gate: &Gate, body: &mut String) {
         let (name, params, args) = self.gate_call(gate);
-        let _ = writeln!(body, "  call void @{name}({args})");
+        writeln!(body, "  call void @{name}({args})").unwrap();
         self.declare(&format!("void @{name}"), &params);
     }
 
@@ -388,16 +396,17 @@ impl<'a> QirEmitter<'a> {
 
             Expr::Load(slot) => {
                 let ty = self.slot_types.get(slot).copied().unwrap_or("i64");
-                let _ = writeln!(body, "  {name} = load {ty}, ptr %slot{}", slot.0);
+                writeln!(body, "  {name} = load {ty}, ptr %slot{}", slot.0).unwrap();
                 self.values.insert(dest, (name, ty));
             }
 
             Expr::ReadResult(result) => {
-                let _ = writeln!(
+                writeln!(
                     body,
                     "  {name} = call i1 @__quantum__qis__read_result__body({})",
                     result_ref(*result)
-                );
+                )
+                .unwrap();
                 self.declare("i1 @__quantum__qis__read_result__body", "%Result*");
                 self.values.insert(dest, (name, "i1"));
             }
@@ -406,21 +415,21 @@ impl<'a> QirEmitter<'a> {
                 let (a, ty) = self.operand(lhs);
                 let (b, _) = self.operand(rhs);
                 let ty = if op.is_float() { "double" } else { ty };
-                let _ = writeln!(body, "  {name} = {} {ty} {a}, {b}", op.keyword());
+                writeln!(body, "  {name} = {} {ty} {a}, {b}", op.keyword()).unwrap();
                 self.values.insert(dest, (name, ty));
             }
 
             Expr::ICmp { pred, lhs, rhs } => {
                 let (a, ty) = self.operand(lhs);
                 let (b, _) = self.operand(rhs);
-                let _ = writeln!(body, "  {name} = icmp {} {ty} {a}, {b}", pred.keyword());
+                writeln!(body, "  {name} = icmp {} {ty} {a}, {b}", pred.keyword()).unwrap();
                 self.values.insert(dest, (name, "i1"));
             }
 
             Expr::FCmp { pred, lhs, rhs } => {
                 let (a, _) = self.operand(lhs);
                 let (b, _) = self.operand(rhs);
-                let _ = writeln!(body, "  {name} = fcmp {} double {a}, {b}", pred.keyword());
+                writeln!(body, "  {name} = fcmp {} double {a}, {b}", pred.keyword()).unwrap();
                 self.values.insert(dest, (name, "i1"));
             }
 
@@ -432,7 +441,7 @@ impl<'a> QirEmitter<'a> {
                 let (c, _) = self.operand(cond);
                 let (a, ty) = self.operand(if_true);
                 let (b, _) = self.operand(if_false);
-                let _ = writeln!(body, "  {name} = select i1 {c}, {ty} {a}, {ty} {b}");
+                writeln!(body, "  {name} = select i1 {c}, {ty} {a}, {ty} {b}").unwrap();
                 self.values.insert(dest, (name, ty));
             }
 
@@ -444,7 +453,7 @@ impl<'a> QirEmitter<'a> {
                     CastOp::Trunc => "i1",
                     _ => from,
                 };
-                let _ = writeln!(body, "  {name} = {} {from} {value} to {to}", op.keyword());
+                writeln!(body, "  {name} = {} {from} {value} to {to}", op.keyword()).unwrap();
                 self.values.insert(dest, (name, to));
             }
 
@@ -466,7 +475,7 @@ impl<'a> QirEmitter<'a> {
                     .unwrap_or_else(|| "i64".into());
                 let parts: Vec<String> = rendered.into_iter().map(|(text, _)| text).collect();
 
-                let _ = writeln!(body, "  {name} = phi {ty} {}", parts.join(", "));
+                writeln!(body, "  {name} = phi {ty} {}", parts.join(", ")).unwrap();
                 let leaked: &'static str = if ty == "i1" {
                     "i1"
                 } else if ty == "double" {
@@ -482,13 +491,13 @@ impl<'a> QirEmitter<'a> {
     fn emit_terminator(&mut self, term: &Term, body: &mut String) {
         match term {
             Term::Ret(_) => {
-                let _ = writeln!(body, "  ret void");
+                writeln!(body, "  ret void").unwrap();
             }
             Term::Unreachable => {
-                let _ = writeln!(body, "  unreachable");
+                writeln!(body, "  unreachable").unwrap();
             }
             Term::Br(target) => {
-                let _ = writeln!(body, "  br label %{}", self.program.block(*target).label);
+                writeln!(body, "  br label %{}", self.program.block(*target).label).unwrap();
             }
             Term::CondBr {
                 cond,
@@ -501,12 +510,13 @@ impl<'a> QirEmitter<'a> {
                 } else {
                     format!("icmp ne {ty} {value}, 0")
                 };
-                let _ = writeln!(
+                writeln!(
                     body,
                     "  br i1 {condition}, label %{}, label %{}",
                     self.program.block(*if_true).label,
                     self.program.block(*if_false).label
-                );
+                )
+                .unwrap();
             }
             Term::Switch {
                 scrutinee,
@@ -514,19 +524,21 @@ impl<'a> QirEmitter<'a> {
                 default,
             } => {
                 let (value, ty) = self.operand(scrutinee);
-                let _ = writeln!(
+                writeln!(
                     body,
                     "  switch {ty} {value}, label %{} [",
                     self.program.block(*default).label
-                );
+                )
+                .unwrap();
                 for (key, target) in cases {
-                    let _ = writeln!(
+                    writeln!(
                         body,
                         "    {ty} {key}, label %{}",
                         self.program.block(*target).label
-                    );
+                    )
+                    .unwrap();
                 }
-                let _ = writeln!(body, "  ]");
+                writeln!(body, "  ]").unwrap();
             }
         }
     }
@@ -601,17 +613,17 @@ pub fn emit_json(program: &Program) -> String {
     let mut out = String::new();
 
     out.push_str("{\n");
-    let _ = writeln!(out, "  \"name\": {:?},", program.name);
-    let _ = writeln!(out, "  \"profile\": {:?},", program.profile.name());
-    let _ = writeln!(out, "  \"qubits\": {},", program.num_qubits);
-    let _ = writeln!(out, "  \"results\": {},", program.num_results);
-    let _ = writeln!(out, "  \"depth\": {},", program.depth());
-    let _ = writeln!(out, "  \"gateCount\": {},", program.gate_count());
+    writeln!(out, "  \"name\": {:?},", program.name).unwrap();
+    writeln!(out, "  \"profile\": {:?},", program.profile.name()).unwrap();
+    writeln!(out, "  \"qubits\": {},", program.num_qubits).unwrap();
+    writeln!(out, "  \"results\": {},", program.num_results).unwrap();
+    writeln!(out, "  \"depth\": {},", program.depth()).unwrap();
+    writeln!(out, "  \"gateCount\": {},", program.gate_count()).unwrap();
     out.push_str("  \"blocks\": [\n");
 
     for (index, block) in program.blocks.iter().enumerate() {
         out.push_str("    {\n");
-        let _ = writeln!(out, "      \"label\": {:?},", block.label);
+        writeln!(out, "      \"label\": {:?},", block.label).unwrap();
         out.push_str("      \"ops\": [\n");
 
         let lines: Vec<String> = block.ops.iter().filter_map(json_op).collect();
@@ -621,11 +633,12 @@ pub fn emit_json(program: &Program) -> String {
         }
 
         out.push_str("      ],\n");
-        let _ = writeln!(
+        writeln!(
             out,
             "      \"terminator\": {:?}",
             json_term(program, &block.term)
-        );
+        )
+        .unwrap();
         out.push_str("    }");
         if index + 1 < program.blocks.len() {
             out.push(',');
@@ -822,7 +835,7 @@ fn center(text: &str, width: usize, filler: &str) -> String {
 mod tests {
     use super::*;
 
-    fn assert_zyz_equivalent(original: Matrix2) {
+    fn assert_zyz_eq(original: Matrix2) {
         let (theta, phi, lambda) = zyz_angles(&original);
         let reconstructed = Matrix2::rz(phi)
             .multiply(Matrix2::ry(theta))
@@ -848,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn zyz_decomposition_preserves_representative_unitaries() {
+    fn zyz_roundtrip() {
         for matrix in [
             Matrix2::identity(),
             Matrix2::x(),
@@ -861,7 +874,7 @@ mod tests {
                 .multiply(Matrix2::rz(2.44)),
             Matrix2::rx(0.91).multiply(Matrix2::phase(-0.37)),
         ] {
-            assert_zyz_equivalent(matrix);
+            assert_zyz_eq(matrix);
         }
     }
 }

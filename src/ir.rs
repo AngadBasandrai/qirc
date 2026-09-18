@@ -1,18 +1,20 @@
 use crate::diag::Span;
+use std::collections::HashMap;
+use std::fmt;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BlockId(pub u32);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ValueId(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct QubitId(pub u32);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ResultId(pub u32);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SlotId(pub u32);
 
 impl SlotId {
@@ -125,6 +127,132 @@ impl Operand {
 }
 
 pub use crate::ast::{BinOp, CastOp, FloatPredicate, IntPredicate};
+
+impl BinOp {
+    pub fn apply(self, a: Const, b: Const) -> Const {
+        if self.is_float() {
+            let (x, y) = (a.as_f64(), b.as_f64());
+            return Const::Float(match self {
+                BinOp::FAdd => x + y,
+                BinOp::FSub => x - y,
+                BinOp::FMul => x * y,
+                BinOp::FDiv => x / y,
+                _ => x % y,
+            });
+        }
+
+        let (x, y) = (a.as_i64(), b.as_i64());
+        let value = match self {
+            BinOp::Add => x.wrapping_add(y),
+            BinOp::Sub => x.wrapping_sub(y),
+            BinOp::Mul => x.wrapping_mul(y),
+            BinOp::SDiv if y != 0 => x.wrapping_div(y),
+            BinOp::UDiv if y != 0 => ((x as u64) / (y as u64)) as i64,
+            BinOp::SRem if y != 0 => x.wrapping_rem(y),
+            BinOp::URem if y != 0 => ((x as u64) % (y as u64)) as i64,
+            BinOp::Shl => x.wrapping_shl(y as u32),
+            BinOp::LShr => (x as u64).wrapping_shr(y as u32) as i64,
+            BinOp::AShr => x.wrapping_shr(y as u32),
+            BinOp::And => x & y,
+            BinOp::Or => x | y,
+            BinOp::Xor => x ^ y,
+            _ => 0,
+        };
+
+        match (a, b) {
+            (Const::Bool(_), Const::Bool(_)) => Const::Bool(value != 0),
+            _ => Const::Int(value),
+        }
+    }
+}
+
+impl IntPredicate {
+    pub fn test(self, a: i64, b: i64) -> bool {
+        let (ua, ub) = (a as u64, b as u64);
+        match self {
+            IntPredicate::Eq => a == b,
+            IntPredicate::Ne => a != b,
+            IntPredicate::Sgt => a > b,
+            IntPredicate::Sge => a >= b,
+            IntPredicate::Slt => a < b,
+            IntPredicate::Sle => a <= b,
+            IntPredicate::Ugt => ua > ub,
+            IntPredicate::Uge => ua >= ub,
+            IntPredicate::Ult => ua < ub,
+            IntPredicate::Ule => ua <= ub,
+        }
+    }
+}
+
+impl FloatPredicate {
+    pub fn test(self, a: f64, b: f64) -> bool {
+        let ordered = !a.is_nan() && !b.is_nan();
+        match self {
+            FloatPredicate::False => false,
+            FloatPredicate::True => true,
+            FloatPredicate::Ord => ordered,
+            FloatPredicate::Uno => !ordered,
+            FloatPredicate::Oeq => ordered && a == b,
+            FloatPredicate::One => ordered && a != b,
+            FloatPredicate::Ogt => ordered && a > b,
+            FloatPredicate::Oge => ordered && a >= b,
+            FloatPredicate::Olt => ordered && a < b,
+            FloatPredicate::Ole => ordered && a <= b,
+            FloatPredicate::Ueq => !ordered || a == b,
+            FloatPredicate::Une => !ordered || a != b,
+            FloatPredicate::Ugt => !ordered || a > b,
+            FloatPredicate::Uge => !ordered || a >= b,
+            FloatPredicate::Ult => !ordered || a < b,
+            FloatPredicate::Ule => !ordered || a <= b,
+        }
+    }
+}
+
+impl CastOp {
+    pub fn apply(self, value: Const) -> Const {
+        match self {
+            CastOp::SIToFP | CastOp::UIToFP | CastOp::FPExt | CastOp::FPTrunc => {
+                Const::Float(value.as_f64())
+            }
+            CastOp::FPToSI | CastOp::FPToUI => Const::Int(value.as_f64() as i64),
+            CastOp::ZExt | CastOp::SExt => Const::Int(value.as_i64()),
+            CastOp::Trunc => match value {
+                Const::Bool(_) => value,
+                _ => Const::Int(value.as_i64()),
+            },
+            _ => value,
+        }
+    }
+}
+
+impl Expr {
+    pub fn fold(&self, mut get: impl FnMut(&Operand) -> Option<Const>) -> Option<Const> {
+        match self {
+            Expr::Const(c) => Some(*c),
+            Expr::Copy(o) => get(o),
+            Expr::Binary { op, lhs, rhs } => Some(op.apply(get(lhs)?, get(rhs)?)),
+            Expr::ICmp { pred, lhs, rhs } => Some(Const::Bool(
+                pred.test(get(lhs)?.as_i64(), get(rhs)?.as_i64()),
+            )),
+            Expr::FCmp { pred, lhs, rhs } => Some(Const::Bool(
+                pred.test(get(lhs)?.as_f64(), get(rhs)?.as_f64()),
+            )),
+            Expr::Select {
+                cond,
+                if_true,
+                if_false,
+            } => {
+                if get(cond)?.truthy() {
+                    get(if_true)
+                } else {
+                    get(if_false)
+                }
+            }
+            Expr::Cast { op, operand } => Some(op.apply(get(operand)?)),
+            Expr::Phi(_) | Expr::ReadResult(_) | Expr::Load(_) => None,
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Expr {
@@ -256,10 +384,6 @@ pub struct Gate {
 }
 
 impl Gate {
-    pub fn touches(&self, qubit: QubitId) -> bool {
-        self.controls.contains(&qubit) || self.targets.contains(&qubit)
-    }
-
     pub fn wires(&self) -> impl Iterator<Item = QubitId> + '_ {
         self.controls.iter().chain(self.targets.iter()).copied()
     }
@@ -427,10 +551,6 @@ impl Program {
         &self.blocks[id.0 as usize]
     }
 
-    pub fn block_mut(&mut self, id: BlockId) -> &mut Block {
-        &mut self.blocks[id.0 as usize]
-    }
-
     pub fn ops(&self) -> impl Iterator<Item = &Op> {
         self.blocks.iter().flat_map(|b| b.ops.iter())
     }
@@ -454,25 +574,23 @@ impl Program {
     }
 
     pub fn is_straight_line(&self) -> bool {
-        self.blocks.len() == 1
+        self.blocks.len() == 1 && self.blocks[0].term.successors().is_empty()
     }
 
     pub fn depth(&self) -> usize {
-        let mut per_wire = vec![0usize; self.num_qubits as usize];
+        let mut per_wire: HashMap<QubitId, usize> = HashMap::new();
         for gate in self.gates() {
             let level = gate
                 .wires()
-                .map(|q| per_wire.get(q.index()).copied().unwrap_or(0))
+                .map(|q| per_wire.get(&q).copied().unwrap_or(0))
                 .max()
                 .unwrap_or(0)
                 + 1;
             for wire in gate.wires() {
-                if let Some(slot) = per_wire.get_mut(wire.index()) {
-                    *slot = level;
-                }
+                per_wire.insert(wire, level);
             }
         }
-        per_wire.into_iter().max().unwrap_or(0)
+        per_wire.into_values().max().unwrap_or(0)
     }
 
     pub fn predecessors(&self, id: BlockId) -> Vec<BlockId> {
@@ -508,8 +626,8 @@ impl Program {
     }
 }
 
-impl std::fmt::Display for Program {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Program {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
             "program {} [{}] qubits={} results={}",

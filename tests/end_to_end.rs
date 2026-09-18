@@ -1,3 +1,6 @@
+mod common;
+
+use common::compile;
 use qirc::codegen;
 use qirc::diag::Severity;
 use qirc::driver::{self, Emit};
@@ -65,18 +68,6 @@ declare void @__quantum__qis__ry__body(double, %Qubit*)
 attributes #0 = { \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"required_num_qubits\"=\"1\" \"required_num_results\"=\"1\" }
 ";
 
-fn compile_clean(source: &str, level: u8) -> Program {
-    let compilation = driver::compile(source, level);
-    let errors: Vec<String> = compilation
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .map(|d| d.message.clone())
-        .collect();
-    assert!(errors.is_empty(), "compilation failed: {errors:?}");
-    compilation.program
-}
-
 fn final_state(program: &Program) -> State {
     let outcome = exec::execute(
         program,
@@ -93,7 +84,7 @@ fn final_probabilities(program: &Program) -> Vec<f64> {
     final_state(program).probabilities()
 }
 
-fn assert_states_equivalent(left: &State, right: &State) {
+fn assert_same_state(left: &State, right: &State) {
     assert_eq!(left.len(), right.len());
 
     let pivot = (0..left.len())
@@ -113,8 +104,8 @@ fn assert_states_equivalent(left: &State, right: &State) {
 }
 
 #[test]
-fn bell_pair_has_the_right_amplitudes() {
-    let program = compile_clean(BELL, 1);
+fn bell_amplitudes() {
+    let program = compile(BELL, 1);
     let probabilities = final_probabilities(&program);
 
     assert!((probabilities[0b00] - 0.5).abs() < 1e-12);
@@ -124,8 +115,8 @@ fn bell_pair_has_the_right_amplitudes() {
 }
 
 #[test]
-fn bell_pair_shots_are_perfectly_correlated() {
-    let program = compile_clean(BELL, 1);
+fn bell_shots() {
+    let program = compile(BELL, 1);
     let outcome = exec::execute(
         &program,
         ExecConfig {
@@ -135,7 +126,7 @@ fn bell_pair_shots_are_perfectly_correlated() {
         },
     );
 
-    assert_eq!(outcome.counts.keys().len(), 2, "only 00 and 11 may appear");
+    assert_eq!(outcome.counts.keys().len(), 2);
     assert!(outcome.counts.contains_key("00"));
     assert!(outcome.counts.contains_key("11"));
 
@@ -144,34 +135,31 @@ fn bell_pair_shots_are_perfectly_correlated() {
 }
 
 #[test]
-fn optimisation_preserves_the_state_vector() {
-    let baseline = final_state(&compile_clean(REDUNDANT, 0));
+fn opt_preserves_state() {
+    let baseline = final_state(&compile(REDUNDANT, 0));
 
     for level in 1..=3u8 {
-        let optimised = final_state(&compile_clean(REDUNDANT, level));
-        assert_states_equivalent(&baseline, &optimised);
+        let optimised = final_state(&compile(REDUNDANT, level));
+        assert_same_state(&baseline, &optimised);
     }
 }
 
 #[test]
-fn optimisation_actually_removes_gates() {
+fn opt_removes_gates() {
     let unoptimised = driver::compile(REDUNDANT, 0);
     let optimised = driver::compile(REDUNDANT, 2);
 
     assert_eq!(unoptimised.program.gate_count(), 13);
-    assert!(
-        optimised.program.gate_count() < unoptimised.program.gate_count(),
-        "optimisation removed nothing"
-    );
+    assert!(optimised.program.gate_count() < unoptimised.program.gate_count());
     assert!(optimised.stats.gates_removed() >= 5);
 }
 
 #[test]
-fn every_optimisation_level_keeps_the_measurement_distribution() {
+fn opt_levels_teleport() {
     let mut distributions = Vec::new();
 
     for level in 0..=3u8 {
-        let program = compile_clean(TELEPORT, level);
+        let program = compile(TELEPORT, level);
         let outcome = exec::execute(
             &program,
             ExecConfig {
@@ -202,11 +190,11 @@ fn every_optimisation_level_keeps_the_measurement_distribution() {
 }
 
 #[test]
-fn qir_round_trips_through_its_own_frontend() {
+fn qir_roundtrip() {
     for source in [BELL, PYQIR] {
-        let original = compile_clean(source, 0);
+        let original = compile(source, 0);
         let emitted = codegen::emit_qir(&original);
-        let reparsed = compile_clean(&emitted, 0);
+        let reparsed = compile(&emitted, 0);
 
         assert_eq!(original.num_qubits, reparsed.num_qubits);
         assert_eq!(original.num_results, reparsed.num_results);
@@ -223,18 +211,17 @@ fn qir_round_trips_through_its_own_frontend() {
             .map(|g| (g.kind, g.controls.clone(), g.targets.clone()))
             .collect();
 
-        assert_eq!(before, after, "gate sequence changed across a round trip");
+        assert_eq!(before, after);
     }
 }
 
 #[test]
-fn fused_unitaries_are_synthesized_for_qir_round_trips() {
-    let optimised = compile_clean(PYQIR, 3);
+fn qir_roundtrip_fused() {
+    let optimised = compile(PYQIR, 3);
     assert!(
         optimised
             .gates()
-            .any(|gate| matches!(gate.kind, GateKind::Unitary(_))),
-        "the fixture should exercise O3 fusion"
+            .any(|gate| matches!(gate.kind, GateKind::Unitary(_)))
     );
 
     let emitted = codegen::emit_qir(&optimised);
@@ -242,7 +229,7 @@ fn fused_unitaries_are_synthesized_for_qir_round_trips() {
     assert!(emitted.contains("__quantum__qis__ry__body"));
     assert!(emitted.contains("__quantum__qis__rz__body"));
 
-    let reparsed = compile_clean(&emitted, 0);
+    let reparsed = compile(&emitted, 0);
     let before = exec::execute(
         &optimised,
         ExecConfig {
@@ -260,16 +247,16 @@ fn fused_unitaries_are_synthesized_for_qir_round_trips() {
         },
     );
 
-    assert_states_equivalent(
+    assert_same_state(
         before.final_state.as_ref().expect("the original state"),
         after.final_state.as_ref().expect("the round-tripped state"),
     );
 }
 
 #[test]
-fn dynamic_rotation_parameters_survive_qir_round_trips() {
+fn qir_roundtrip_dynamic_angle() {
     for level in 0..=3 {
-        let original = compile_clean(DYNAMIC_ROTATION, level);
+        let original = compile(DYNAMIC_ROTATION, level);
         let emitted = codegen::emit_qir(&original);
 
         assert!(
@@ -277,7 +264,7 @@ fn dynamic_rotation_parameters_survive_qir_round_trips() {
             "-O{level} must preserve the computed SSA angle:\n{emitted}"
         );
 
-        let reparsed = compile_clean(&emitted, 0);
+        let reparsed = compile(&emitted, 0);
         let before = exec::execute(
             &original,
             ExecConfig {
@@ -296,7 +283,7 @@ fn dynamic_rotation_parameters_survive_qir_round_trips() {
         );
 
         assert_eq!(before.counts, after.counts, "-O{level} changed outcomes");
-        assert_states_equivalent(
+        assert_same_state(
             before.final_state.as_ref().expect("the original state"),
             after.final_state.as_ref().expect("the round-tripped state"),
         );
@@ -304,10 +291,10 @@ fn dynamic_rotation_parameters_survive_qir_round_trips() {
 }
 
 #[test]
-fn round_tripped_program_simulates_identically() {
-    let original = compile_clean(PYQIR, 0);
+fn qir_roundtrip_simulates() {
+    let original = compile(PYQIR, 0);
     let emitted = codegen::emit_qir(&original);
-    let reparsed = compile_clean(&emitted, 0);
+    let reparsed = compile(&emitted, 0);
 
     let before = final_probabilities(&original);
     let after = final_probabilities(&reparsed);
@@ -321,8 +308,8 @@ fn round_tripped_program_simulates_identically() {
 }
 
 #[test]
-fn qasm3_output_is_well_formed() {
-    let program = compile_clean(PYQIR, 0);
+fn qasm3_output() {
+    let program = compile(PYQIR, 0);
     let qasm = codegen::emit_qasm3(&program);
 
     assert!(qasm.starts_with("OPENQASM 3.0;"));
@@ -337,8 +324,8 @@ fn qasm3_output_is_well_formed() {
 }
 
 #[test]
-fn json_output_reports_the_circuit() {
-    let program = compile_clean(BELL, 0);
+fn json_output() {
+    let program = compile(BELL, 0);
     let json = codegen::emit_json(&program);
 
     assert!(json.contains("\"qubits\": 2"));
@@ -350,8 +337,8 @@ fn json_output_reports_the_circuit() {
 }
 
 #[test]
-fn circuit_diagram_shows_every_wire() {
-    let program = compile_clean(BELL, 0);
+fn circuit_diagram() {
+    let program = compile(BELL, 0);
     let diagram = codegen::emit_circuit(&program);
 
     let lines: Vec<&str> = diagram.lines().collect();
@@ -359,13 +346,13 @@ fn circuit_diagram_shows_every_wire() {
     assert!(lines[0].starts_with("q0:"));
     assert!(lines[1].starts_with("q1:"));
     assert!(lines[0].contains('H'));
-    assert!(lines[0].contains('*'), "the control should be marked");
-    assert!(lines[1].contains('+'), "the target should be marked");
+    assert!(lines[0].contains('*'));
+    assert!(lines[1].contains('+'));
     assert!(lines[0].contains('M'));
 }
 
 #[test]
-fn base_profile_rejects_measurement_feedback() {
+fn base_profile_feedback() {
     let source = TELEPORT.replace("adaptive_profile", "base_profile");
     let compilation = driver::compile(&source, 0);
 
@@ -383,7 +370,7 @@ fn base_profile_rejects_measurement_feedback() {
 }
 
 #[test]
-fn reading_an_unmeasured_result_is_an_error() {
+fn read_before_measure() {
     let source = "\
 %Qubit = type opaque
 %Result = type opaque
@@ -405,13 +392,12 @@ attributes #0 = { \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"requir
         compilation
             .diagnostics
             .iter()
-            .any(|d| d.code == Some("QIR0308")),
-        "expected QIR0308 for reading an unmeasured result"
+            .any(|d| d.code == Some("QIR0308"))
     );
 }
 
 #[test]
-fn a_gate_may_not_touch_the_same_qubit_twice() {
+fn repeated_qubit() {
     let source = "\
 %Qubit = type opaque
 define void @main() #0 {
@@ -428,13 +414,12 @@ attributes #0 = { \"entry_point\" \"required_num_qubits\"=\"1\" }
         compilation
             .diagnostics
             .iter()
-            .any(|d| d.code == Some("QIR0303")),
-        "expected QIR0303 for a repeated wire"
+            .any(|d| d.code == Some("QIR0303"))
     );
 }
 
 #[test]
-fn cli_parses_its_options() {
+fn cli_args() {
     let args: Vec<String> = [
         "in.ll", "--emit", "qasm3", "-O2", "--shots", "500", "--seed", "9",
     ]
@@ -451,7 +436,7 @@ fn cli_parses_its_options() {
 }
 
 #[test]
-fn cli_rejects_nonsense() {
+fn cli_bad_args() {
     assert!(driver::parse_args(&["--emit".into(), "wat".into()]).is_err());
     assert!(driver::parse_args(&["a.ll".into(), "b.ll".into()]).is_err());
     assert!(driver::parse_args(&["-O9".into(), "a.ll".into()]).is_err());
@@ -460,8 +445,8 @@ fn cli_rejects_nonsense() {
 }
 
 #[test]
-fn deterministic_seeds_give_deterministic_runs() {
-    let program = compile_clean(TELEPORT, 1);
+fn seeded_runs() {
+    let program = compile(TELEPORT, 1);
 
     let first = exec::execute(
         &program,
@@ -484,29 +469,23 @@ fn deterministic_seeds_give_deterministic_runs() {
 }
 
 #[test]
-fn straight_line_programs_use_the_sampling_fast_path() {
-    let bell = compile_clean(BELL, 1);
-    assert!(!exec::needs_per_shot_simulation(&bell));
+fn fast_path() {
+    let bell = compile(BELL, 1);
+    assert!(!exec::needs_per_shot(&bell));
 
-    let teleport = compile_clean(TELEPORT, 1);
-    assert!(exec::needs_per_shot_simulation(&teleport));
+    let teleport = compile(TELEPORT, 1);
+    assert!(exec::needs_per_shot(&teleport));
 }
 
 #[test]
-fn branching_programs_round_trip_with_their_control_flow() {
-    let original = compile_clean(TELEPORT, 0);
+fn qir_roundtrip_branches() {
+    let original = compile(TELEPORT, 0);
     let emitted = codegen::emit_qir(&original);
 
-    assert!(
-        emitted.contains("read_result"),
-        "the emitted module must define its branch condition"
-    );
-    assert!(
-        emitted.contains("br i1 %v"),
-        "expected a real conditional branch"
-    );
+    assert!(emitted.contains("read_result"));
+    assert!(emitted.contains("br i1 %v"));
 
-    let reparsed = compile_clean(&emitted, 0);
+    let reparsed = compile(&emitted, 0);
     assert_eq!(reparsed.blocks.len(), original.blocks.len());
     assert_eq!(reparsed.gate_count(), original.gate_count());
     assert_eq!(reparsed.profile, Profile::Adaptive);
@@ -528,34 +507,33 @@ fn branching_programs_round_trip_with_their_control_flow() {
             keep_state: false,
         },
     );
-    assert_eq!(
-        before.counts, after.counts,
-        "round trip changed the statistics"
-    );
+    assert_eq!(before.counts, after.counts);
 }
 
 #[test]
-fn emitted_doubles_are_bit_exact() {
-    let original = compile_clean(TELEPORT, 0);
+fn exact_doubles() {
+    let original = compile(TELEPORT, 0);
     let emitted = codegen::emit_qir(&original);
-    let reparsed = compile_clean(&emitted, 0);
+    let reparsed = compile(&emitted, 0);
 
     let before = original.gates().find(|g| g.kind == GateKind::Ry).unwrap();
     let after = reparsed.gates().find(|g| g.kind == GateKind::Ry).unwrap();
 
     assert_eq!(
         before.constant_angle().unwrap().to_bits(),
-        after.constant_angle().unwrap().to_bits(),
-        "the rotation angle lost precision across a round trip"
+        after.constant_angle().unwrap().to_bits()
     );
 }
 
 #[test]
-fn switch_terminators_survive_emission() {
+fn qir_roundtrip_switch() {
     let source = "%Qubit = type opaque
+%Result = type opaque
 define void @main() #0 {
 entry:
-  %0 = add i64 1, 0
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
+  %bit = call i1 @__quantum__qis__read_result__body(%Result* inttoptr (i64 0 to %Result*))
+  %0 = zext i1 %bit to i64
   switch i64 %0, label %other [
     i64 0, label %zero
     i64 1, label %one
@@ -571,10 +549,12 @@ other:
 }
 declare void @__quantum__qis__x__body(%Qubit*)
 declare void @__quantum__qis__h__body(%Qubit*)
-attributes #0 = { \"entry_point\" \"qir_profiles\"=\"unrestricted\" \"required_num_qubits\"=\"1\" }
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+declare i1 @__quantum__qis__read_result__body(%Result*)
+attributes #0 = { \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"required_num_qubits\"=\"1\" \"required_num_results\"=\"1\" }
 ";
 
-    let program = compile_clean(source, 0);
+    let program = compile(source, 0);
     let emitted = codegen::emit_qir(&program);
     assert!(
         emitted.contains("switch i64"),
@@ -582,12 +562,12 @@ attributes #0 = { \"entry_point\" \"qir_profiles\"=\"unrestricted\" \"required_n
 {emitted}"
     );
 
-    let reparsed = compile_clean(&emitted, 0);
+    let reparsed = compile(&emitted, 0);
     let has_switch = reparsed
         .blocks
         .iter()
         .any(|b| matches!(b.term, Term::Switch { .. }));
-    assert!(has_switch, "switch did not survive the round trip");
+    assert!(has_switch);
 }
 
 const MUTABLE_CLASSICAL: &str = "%Qubit = type opaque
@@ -624,16 +604,24 @@ attributes #0 = { \"entry_point\" \"qir_profiles\"=\"unrestricted\" \"required_n
 ";
 
 #[test]
-fn alloca_load_store_become_memory_slots() {
-    let program = compile_clean(MUTABLE_CLASSICAL, 0);
+fn flattens_classical_control() {
+    let program = compile(MUTABLE_CLASSICAL, 0);
 
-    assert_eq!(program.num_slots, 2, "both allocas should get a slot");
+    assert!(program.is_straight_line());
+    assert_eq!(program.num_slots, 0);
+}
+
+#[test]
+fn memory_slots() {
+    let program = compile(STORED_FEEDBACK, 0);
+
+    assert_eq!(program.num_slots, 1);
 
     let stores = program
         .ops()
         .filter(|op| matches!(op, Op::Store { .. }))
         .count();
-    assert_eq!(stores, 3);
+    assert_eq!(stores, 1);
 
     let loads = program
         .ops()
@@ -647,12 +635,12 @@ fn alloca_load_store_become_memory_slots() {
             )
         })
         .count();
-    assert_eq!(loads, 2);
+    assert_eq!(loads, 1);
 }
 
 #[test]
-fn stores_are_observed_by_later_loads() {
-    let program = compile_clean(MUTABLE_CLASSICAL, 0);
+fn store_then_load() {
+    let program = compile(MUTABLE_CLASSICAL, 0);
     let outcome = exec::execute(
         &program,
         ExecConfig {
@@ -665,15 +653,12 @@ fn stores_are_observed_by_later_loads() {
     assert!(outcome.final_state.is_some());
 
     let state = outcome.final_state.unwrap();
-    assert!(
-        state.qubit_probability(1) > 0.99,
-        "the true branch should have run X on q1, then the store should stop the loop"
-    );
+    assert!(state.qubit_probability(1) > 0.99);
 }
 
 #[test]
-fn memory_slots_survive_a_qir_round_trip() {
-    let original = compile_clean(MUTABLE_CLASSICAL, 0);
+fn qir_roundtrip_slots() {
+    let original = compile(STORED_FEEDBACK, 0);
     let emitted = codegen::emit_qir(&original);
 
     assert!(
@@ -681,10 +666,430 @@ fn memory_slots_survive_a_qir_round_trip() {
         "slots must be declared:
 {emitted}"
     );
-    assert!(emitted.contains("store i1"), "stores must be emitted");
-    assert!(emitted.contains("load i1"), "loads must be emitted");
+    assert!(emitted.contains("store i64"));
+    assert!(emitted.contains("load i64"));
 
-    let reparsed = compile_clean(&emitted, 0);
+    let reparsed = compile(&emitted, 0);
     assert_eq!(reparsed.num_slots, original.num_slots);
     assert_eq!(reparsed.gate_count(), original.gate_count());
+}
+
+const MID_CIRCUIT: &str = "\
+%Qubit = type opaque
+%Result = type opaque
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  ret void
+}
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+attributes #0 = { \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"required_num_qubits\"=\"1\" \"required_num_results\"=\"2\" }
+";
+
+const STORED_FEEDBACK: &str = "\
+%Qubit = type opaque
+%Result = type opaque
+define void @main() #0 {
+entry:
+  %slot = alloca i64
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
+  %bit = call i1 @__quantum__qis__read_result__body(%Result* inttoptr (i64 0 to %Result*))
+  %val = select i1 %bit, i64 1, i64 0
+  store i64 %val, ptr %slot
+  %back = load i64, ptr %slot
+  %c = icmp eq i64 %back, 1
+  br i1 %c, label %flip, label %done
+flip:
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+  br label %done
+done:
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  ret void
+}
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__x__body(%Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+declare i1 @__quantum__qis__read_result__body(%Result*)
+attributes #0 = { \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"required_num_qubits\"=\"2\" \"required_num_results\"=\"2\" }
+";
+
+#[test]
+fn gate_after_measure() {
+    let program = compile(MID_CIRCUIT, 1);
+    assert!(exec::needs_per_shot(&program));
+}
+
+#[test]
+fn mid_circuit_distribution() {
+    let program = compile(MID_CIRCUIT, 1);
+    let outcome = exec::execute(
+        &program,
+        ExecConfig {
+            shots: 8000,
+            seed: 11,
+            keep_state: false,
+        },
+    );
+
+    assert_eq!(outcome.counts.len(), 4);
+    for bits in ["00", "01", "10", "11"] {
+        let share = outcome.counts[bits] as f64 / 8000.0;
+        assert!(
+            (share - 0.25).abs() < 0.03,
+            "{bits} occurred {share} of the time, expected about 0.25"
+        );
+    }
+}
+
+#[test]
+fn final_measure_fast_path() {
+    let program = compile(BELL, 1);
+    assert!(!exec::needs_per_shot(&program));
+}
+
+#[test]
+fn opt_keeps_stored_values() {
+    let baseline = exec::execute(
+        &compile(STORED_FEEDBACK, 0),
+        ExecConfig {
+            shots: 2000,
+            seed: 3,
+            keep_state: false,
+        },
+    );
+
+    assert!(
+        baseline
+            .counts
+            .keys()
+            .all(|bits| bits == "00" || bits == "11"),
+        "the unoptimised program must copy r0 into r1, got {:?}",
+        baseline.counts
+    );
+
+    for level in 1..=3u8 {
+        let optimised = exec::execute(
+            &compile(STORED_FEEDBACK, level),
+            ExecConfig {
+                shots: 2000,
+                seed: 3,
+                keep_state: false,
+            },
+        );
+        assert_eq!(
+            baseline.counts, optimised.counts,
+            "-O{level} changed the observable outcome"
+        );
+    }
+}
+
+#[test]
+fn qasm3_runtime_angle() {
+    let program = compile(DYNAMIC_ROTATION, 0);
+    let qasm = codegen::emit_qasm3(&program);
+
+    assert!(
+        !qasm.contains("ry(0"),
+        "a run time angle must not be emitted as a literal:\n{qasm}"
+    );
+    assert!(
+        qasm.contains("only known at run time"),
+        "the omission must be stated in the output:\n{qasm}"
+    );
+}
+
+#[test]
+fn oversized_register() {
+    let source = "\
+%Qubit = type opaque
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  ret void
+}
+declare void @__quantum__qis__h__body(%Qubit*)
+attributes #0 = { \"entry_point\" \"required_num_qubits\"=\"70\" }
+";
+
+    let program = compile(source, 0);
+    assert_eq!(program.num_qubits, 70);
+    assert!(program.num_qubits as usize > qirc::simulator::state::MAX_QUBITS);
+    assert_eq!(qirc::simulator::state::memory_required(70), None);
+    assert!(qirc::simulator::state::memory_required(20).is_some());
+}
+
+const TARGET_SOURCE: &str = "%Qubit = type opaque
+%Result = type opaque
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__ry__body(double 0.7, %Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__ccx__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__swap__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__t__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  ret void
+}
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__t__body(%Qubit*)
+declare void @__quantum__qis__ry__body(double, %Qubit*)
+declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__ccx__body(%Qubit*, %Qubit*, %Qubit*)
+declare void @__quantum__qis__swap__body(%Qubit*, %Qubit*)
+attributes #0 = { \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"3\" \"required_num_results\"=\"0\" }
+";
+
+fn compile_for_target(source: &str, level: u8, target: driver::Target) -> Program {
+    let compilation = driver::compile_for(source, level, true, &target);
+    let errors: Vec<String> = compilation
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(errors.is_empty(), "compilation failed: {errors:?}");
+    assert!(
+        compilation.stats.violations.is_empty(),
+        "the verifier rejected the targeted program: {:?}",
+        compilation.stats.violations
+    );
+    compilation.program
+}
+
+#[test]
+fn transpile_preserves_state() {
+    for basis in [
+        qirc::transpile::Basis::RzSxCx,
+        qirc::transpile::Basis::RzRyCz,
+    ] {
+        let baseline = final_state(&compile(TARGET_SOURCE, 0));
+        let targeted = final_state(&compile_for_target(
+            TARGET_SOURCE,
+            0,
+            driver::Target {
+                basis: Some(basis),
+                coupling: None,
+            },
+        ));
+        assert_same_state(&baseline, &targeted);
+    }
+}
+
+#[test]
+fn transpile_basis_only() {
+    for basis in [
+        qirc::transpile::Basis::RzSxCx,
+        qirc::transpile::Basis::RzRyCz,
+    ] {
+        let program = compile_for_target(
+            TARGET_SOURCE,
+            0,
+            driver::Target {
+                basis: Some(basis),
+                coupling: None,
+            },
+        );
+
+        for gate in program.gates() {
+            assert!(
+                basis.allows(gate),
+                "{} left {:?} with {} controls behind",
+                basis.name(),
+                gate.kind,
+                gate.controls.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn route_preserves_counts() {
+    let source = "%Qubit = type opaque
+%Result = type opaque
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 3 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 3 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  ret void
+}
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+attributes #0 = { \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"4\" \"required_num_results\"=\"2\" }
+";
+
+    let coupling = qirc::route::Coupling::line(4);
+
+    let plain = exec::execute(
+        &compile(source, 0),
+        ExecConfig {
+            shots: 2000,
+            seed: 77,
+            keep_state: false,
+        },
+    );
+    let routed = exec::execute(
+        &compile_for_target(
+            source,
+            0,
+            driver::Target {
+                basis: None,
+                coupling: Some(coupling.clone()),
+            },
+        ),
+        ExecConfig {
+            shots: 2000,
+            seed: 77,
+            keep_state: false,
+        },
+    );
+
+    assert_eq!(plain.counts, routed.counts);
+    assert!(plain.counts.contains_key("00") && plain.counts.contains_key("11"));
+}
+
+#[test]
+fn route_legal() {
+    let source = "%Qubit = type opaque
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 4 to %Qubit*))
+  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 3 to %Qubit*))
+  ret void
+}
+declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
+attributes #0 = { \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"5\" }
+";
+
+    let coupling = qirc::route::Coupling::line(5);
+    let program = compile_for_target(
+        source,
+        0,
+        driver::Target {
+            basis: None,
+            coupling: Some(coupling.clone()),
+        },
+    );
+
+    assert!(qirc::route::respects(&program, &coupling));
+    assert!(program.gate_count() > 2);
+}
+
+#[test]
+fn transpile_then_route() {
+    let coupling = qirc::route::Coupling::line(3);
+    let program = compile_for_target(
+        TARGET_SOURCE,
+        1,
+        driver::Target {
+            basis: Some(qirc::transpile::Basis::RzSxCx),
+            coupling: Some(coupling.clone()),
+        },
+    );
+
+    assert!(qirc::route::respects(&program, &coupling));
+    for gate in program.gates() {
+        assert!(
+            gate.kind == GateKind::Swap || qirc::transpile::Basis::RzSxCx.allows(gate),
+            "{:?} survived both passes",
+            gate.kind
+        );
+    }
+}
+
+#[test]
+fn qsharp_loop() {
+    let source = include_str!("corpus/qsharp_loop.ll");
+    let program = compile(source, 0);
+
+    assert!(program.is_straight_line());
+    assert_eq!(program.num_qubits, 4);
+    assert_eq!(program.gate_count(), 4);
+    assert_eq!(program.measure_count(), 4);
+
+    let kinds: Vec<GateKind> = program.gates().map(|g| g.kind).collect();
+    assert_eq!(kinds[0], GateKind::H);
+    assert!(kinds[1..].iter().all(|k| *k == GateKind::X));
+
+    let probabilities = final_probabilities(&program);
+    assert!((probabilities[0b0000] - 0.5).abs() < 1e-12);
+    assert!((probabilities[0b1111] - 0.5).abs() < 1e-12);
+}
+
+fn errors_of(source: &str) -> Vec<String> {
+    driver::compile(source, 0)
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message.clone())
+        .collect()
+}
+
+#[test]
+fn qubit_id_overflow() {
+    let source = "%Qubit = type opaque
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 4294967297 to %Qubit*))
+  ret void
+}
+declare void @__quantum__qis__x__body(%Qubit*)
+attributes #0 = { \"entry_point\" \"required_num_qubits\"=\"2\" }
+";
+    let errors = errors_of(source);
+    assert!(
+        errors.iter().any(|e| e.contains("4294967297")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn huge_declared_register() {
+    let source = "%Qubit = type opaque
+define void @main() #0 {
+entry:
+  ret void
+}
+attributes #0 = { \"entry_point\" \"required_num_qubits\"=\"4000000000\" }
+";
+    let compilation = driver::compile(source, 3);
+    assert!(
+        compilation
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some("QIR0202"))
+    );
+    assert_eq!(compilation.program.num_qubits, 0);
+}
+
+#[test]
+fn self_loop() {
+    let source = "%Qubit = type opaque
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  br label %entry
+}
+declare void @__quantum__qis__h__body(%Qubit*)
+attributes #0 = { \"entry_point\" \"required_num_qubits\"=\"1\" }
+";
+    let program = compile(source, 0);
+    assert!(!program.is_straight_line());
+
+    let outcome = exec::execute(
+        &program,
+        ExecConfig {
+            shots: 1,
+            seed: 1,
+            keep_state: false,
+        },
+    );
+    assert!(outcome.aborted);
 }

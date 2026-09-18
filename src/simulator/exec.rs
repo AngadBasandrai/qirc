@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::matrix::{Matrix2, matrix_for};
 use super::state::{Rng, State};
@@ -18,7 +18,7 @@ impl Default for ExecConfig {
     fn default() -> Self {
         Self {
             shots: 0,
-            seed: 0x5EED,
+            seed: 1,
             keep_state: true,
         }
     }
@@ -26,6 +26,7 @@ impl Default for ExecConfig {
 
 pub struct ExecOutcome {
     pub final_state: Option<State>,
+    pub aborted: bool,
     pub counts: BTreeMap<String, u64>,
     pub shots: u64,
     pub messages: Vec<String>,
@@ -33,25 +34,35 @@ pub struct ExecOutcome {
     pub sampled: bool,
 }
 
-pub fn needs_per_shot_simulation(program: &Program) -> bool {
+pub fn needs_per_shot(program: &Program) -> bool {
     if !program.is_straight_line() {
         return true;
     }
 
-    program.ops().any(|op| {
-        matches!(
-            op,
-            Op::Reset { .. }
-                | Op::Assign {
-                    expr: Expr::ReadResult(_),
-                    ..
-                }
-        )
-    })
+    let mut measured: HashSet<QubitId> = HashSet::new();
+
+    for op in program.ops() {
+        match op {
+            Op::Reset { .. } => return true,
+            Op::Assign {
+                expr: Expr::ReadResult(_),
+                ..
+            } => return true,
+            Op::Measure { qubit, .. } => {
+                measured.insert(*qubit);
+            }
+            Op::Gate(gate) if gate.wires().any(|wire| measured.contains(&wire)) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    false
 }
 
 pub fn execute(program: &Program, config: ExecConfig) -> ExecOutcome {
-    if needs_per_shot_simulation(program) {
+    if needs_per_shot(program) {
         execute_per_shot(program, config)
     } else {
         execute_sampled(program, config)
@@ -115,8 +126,9 @@ fn execute_sampled(program: &Program, config: ExecConfig) -> ExecOutcome {
 
     if config.shots > 0 && !plan.is_empty() {
         let mut rng = Rng::new(config.seed);
+        let sampler = state.sampler();
         for _ in 0..config.shots {
-            let index = state.sample_index(&mut rng);
+            let index = sampler.draw(&mut rng);
             let mut results = vec![false; program.num_results as usize];
             for (qubit, result) in &plan {
                 if (result.index()) < results.len() {
@@ -129,6 +141,7 @@ fn execute_sampled(program: &Program, config: ExecConfig) -> ExecOutcome {
 
     ExecOutcome {
         final_state: config.keep_state.then_some(state),
+        aborted: false,
         counts,
         shots: config.shots,
         messages,
@@ -144,10 +157,15 @@ fn execute_per_shot(program: &Program, config: ExecConfig) -> ExecOutcome {
     let mut messages = Vec::new();
     let mut outputs = Vec::new();
     let mut last_state = None;
+    let mut aborted = false;
 
     for shot in 0..shots {
         let mut state = State::new(program.num_qubits as usize);
         let run = run_once(program, &mut state, &mut rng);
+        if run.aborted {
+            aborted = true;
+            break;
+        }
 
         if shot == 0 {
             messages = run.messages;
@@ -163,6 +181,7 @@ fn execute_per_shot(program: &Program, config: ExecConfig) -> ExecOutcome {
 
     ExecOutcome {
         final_state: last_state,
+        aborted,
         counts,
         shots,
         messages,
@@ -172,6 +191,7 @@ fn execute_per_shot(program: &Program, config: ExecConfig) -> ExecOutcome {
 }
 
 struct ShotRun {
+    aborted: bool,
     results: Vec<bool>,
     messages: Vec<String>,
     outputs: Vec<String>,
@@ -184,6 +204,7 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
     let mut messages = Vec::new();
     let mut outputs = Vec::new();
 
+    let mut aborted = false;
     let mut current = program.entry;
     let mut previous: Option<BlockId> = None;
     let mut steps = 0usize;
@@ -191,7 +212,7 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
     loop {
         steps += 1;
         if steps > MAX_STEPS {
-            messages.push("execution aborted: step limit exceeded".into());
+            aborted = true;
             break;
         }
 
@@ -285,6 +306,7 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
     }
 
     ShotRun {
+        aborted,
         results,
         messages,
         outputs,
@@ -329,76 +351,6 @@ fn eval(
     previous: Option<BlockId>,
 ) -> Option<Const> {
     match expr {
-        Expr::Const(c) => Some(*c),
-        Expr::Copy(operand) => resolve(operand, values),
-
-        Expr::Binary { op, lhs, rhs } => {
-            let a = resolve(lhs, values)?;
-            let b = resolve(rhs, values)?;
-            Some(eval_binary(*op, a, b))
-        }
-
-        Expr::ICmp { pred, lhs, rhs } => {
-            let a = resolve(lhs, values)?.as_i64();
-            let b = resolve(rhs, values)?.as_i64();
-            Some(Const::Bool(match pred {
-                IntPredicate::Eq => a == b,
-                IntPredicate::Ne => a != b,
-                IntPredicate::Sgt => a > b,
-                IntPredicate::Sge => a >= b,
-                IntPredicate::Slt => a < b,
-                IntPredicate::Sle => a <= b,
-                IntPredicate::Ugt => (a as u64) > (b as u64),
-                IntPredicate::Uge => (a as u64) >= (b as u64),
-                IntPredicate::Ult => (a as u64) < (b as u64),
-                IntPredicate::Ule => (a as u64) <= (b as u64),
-            }))
-        }
-
-        Expr::FCmp { pred, lhs, rhs } => {
-            let a = resolve(lhs, values)?.as_f64();
-            let b = resolve(rhs, values)?.as_f64();
-            let ordered = !a.is_nan() && !b.is_nan();
-            Some(Const::Bool(match pred {
-                FloatPredicate::False => false,
-                FloatPredicate::True => true,
-                FloatPredicate::Oeq => ordered && a == b,
-                FloatPredicate::Ogt => ordered && a > b,
-                FloatPredicate::Oge => ordered && a >= b,
-                FloatPredicate::Olt => ordered && a < b,
-                FloatPredicate::Ole => ordered && a <= b,
-                FloatPredicate::One => ordered && a != b,
-                FloatPredicate::Ord => ordered,
-                FloatPredicate::Uno => !ordered,
-                FloatPredicate::Ueq => !ordered || a == b,
-                FloatPredicate::Ugt => !ordered || a > b,
-                FloatPredicate::Uge => !ordered || a >= b,
-                FloatPredicate::Ult => !ordered || a < b,
-                FloatPredicate::Ule => !ordered || a <= b,
-                FloatPredicate::Une => !ordered || a != b,
-            }))
-        }
-
-        Expr::Select {
-            cond,
-            if_true,
-            if_false,
-        } => {
-            let taken = resolve(cond, values)?.truthy();
-            resolve(if taken { if_true } else { if_false }, values)
-        }
-
-        Expr::Cast { op, operand } => {
-            let value = resolve(operand, values)?;
-            Some(match op {
-                CastOp::SIToFP | CastOp::UIToFP => Const::Float(value.as_f64()),
-                CastOp::FPToSI | CastOp::FPToUI => Const::Int(value.as_f64() as i64),
-                CastOp::ZExt | CastOp::SExt | CastOp::Trunc => Const::Int(value.as_i64()),
-                CastOp::FPTrunc | CastOp::FPExt => Const::Float(value.as_f64()),
-                _ => value,
-            })
-        }
-
         Expr::Phi(incoming) => {
             let from = previous?;
             let operand = incoming
@@ -413,70 +365,8 @@ fn eval(
         )),
 
         Expr::Load(slot) => slots.get(slot.index()).copied(),
-    }
-}
 
-fn eval_binary(op: BinOp, a: Const, b: Const) -> Const {
-    if op.is_float() {
-        let (x, y) = (a.as_f64(), b.as_f64());
-        return Const::Float(match op {
-            BinOp::FAdd => x + y,
-            BinOp::FSub => x - y,
-            BinOp::FMul => x * y,
-            BinOp::FDiv => x / y,
-            BinOp::FRem => x % y,
-            _ => 0.0,
-        });
-    }
-
-    let (x, y) = (a.as_i64(), b.as_i64());
-
-    let value = match op {
-        BinOp::Add => x.wrapping_add(y),
-        BinOp::Sub => x.wrapping_sub(y),
-        BinOp::Mul => x.wrapping_mul(y),
-        BinOp::SDiv => {
-            if y == 0 {
-                0
-            } else {
-                x.wrapping_div(y)
-            }
-        }
-        BinOp::UDiv => {
-            if y == 0 {
-                0
-            } else {
-                ((x as u64) / (y as u64)) as i64
-            }
-        }
-        BinOp::SRem => {
-            if y == 0 {
-                0
-            } else {
-                x.wrapping_rem(y)
-            }
-        }
-        BinOp::URem => {
-            if y == 0 {
-                0
-            } else {
-                ((x as u64) % (y as u64)) as i64
-            }
-        }
-        BinOp::Shl => x.wrapping_shl(y as u32),
-        BinOp::LShr => ((x as u64).wrapping_shr(y as u32)) as i64,
-        BinOp::AShr => x.wrapping_shr(y as u32),
-        BinOp::And => x & y,
-        BinOp::Or => x | y,
-        BinOp::Xor => x ^ y,
-        _ => 0,
-    };
-
-    match (a, b) {
-        (Const::Bool(_), Const::Bool(_)) if matches!(op, BinOp::And | BinOp::Or | BinOp::Xor) => {
-            Const::Bool(value != 0)
-        }
-        _ => Const::Int(value),
+        other => other.fold(|operand| resolve(operand, values)),
     }
 }
 

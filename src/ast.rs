@@ -33,10 +33,6 @@ pub enum Ty {
 }
 
 impl Ty {
-    pub fn is_void(&self) -> bool {
-        matches!(self, Ty::Void)
-    }
-
     pub fn is_float(&self) -> bool {
         matches!(
             self,
@@ -164,76 +160,52 @@ pub enum ConstExpr {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    UDiv,
-    SDiv,
-    URem,
-    SRem,
-    Shl,
-    LShr,
-    AShr,
-    And,
-    Or,
-    Xor,
-    FAdd,
-    FSub,
-    FMul,
-    FDiv,
-    FRem,
+macro_rules! keywords {
+    ($name:ident { $($variant:ident = $text:literal),* $(,)? }) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum $name {
+            $($variant),*
+        }
+
+        impl $name {
+            pub fn from_keyword(keyword: &str) -> Option<$name> {
+                match keyword {
+                    $($text => Some($name::$variant),)*
+                    _ => None,
+                }
+            }
+
+            pub fn keyword(self) -> &'static str {
+                match self {
+                    $($name::$variant => $text),*
+                }
+            }
+        }
+    };
 }
 
+keywords!(BinOp {
+    Add = "add",
+    Sub = "sub",
+    Mul = "mul",
+    UDiv = "udiv",
+    SDiv = "sdiv",
+    URem = "urem",
+    SRem = "srem",
+    Shl = "shl",
+    LShr = "lshr",
+    AShr = "ashr",
+    And = "and",
+    Or = "or",
+    Xor = "xor",
+    FAdd = "fadd",
+    FSub = "fsub",
+    FMul = "fmul",
+    FDiv = "fdiv",
+    FRem = "frem",
+});
+
 impl BinOp {
-    pub fn from_keyword(keyword: &str) -> Option<BinOp> {
-        Some(match keyword {
-            "add" => BinOp::Add,
-            "sub" => BinOp::Sub,
-            "mul" => BinOp::Mul,
-            "udiv" => BinOp::UDiv,
-            "sdiv" => BinOp::SDiv,
-            "urem" => BinOp::URem,
-            "srem" => BinOp::SRem,
-            "shl" => BinOp::Shl,
-            "lshr" => BinOp::LShr,
-            "ashr" => BinOp::AShr,
-            "and" => BinOp::And,
-            "or" => BinOp::Or,
-            "xor" => BinOp::Xor,
-            "fadd" => BinOp::FAdd,
-            "fsub" => BinOp::FSub,
-            "fmul" => BinOp::FMul,
-            "fdiv" => BinOp::FDiv,
-            "frem" => BinOp::FRem,
-            _ => return None,
-        })
-    }
-
-    pub fn keyword(self) -> &'static str {
-        match self {
-            BinOp::Add => "add",
-            BinOp::Sub => "sub",
-            BinOp::Mul => "mul",
-            BinOp::UDiv => "udiv",
-            BinOp::SDiv => "sdiv",
-            BinOp::URem => "urem",
-            BinOp::SRem => "srem",
-            BinOp::Shl => "shl",
-            BinOp::LShr => "lshr",
-            BinOp::AShr => "ashr",
-            BinOp::And => "and",
-            BinOp::Or => "or",
-            BinOp::Xor => "xor",
-            BinOp::FAdd => "fadd",
-            BinOp::FSub => "fsub",
-            BinOp::FMul => "fmul",
-            BinOp::FDiv => "fdiv",
-            BinOp::FRem => "frem",
-        }
-    }
-
     pub fn is_float(self) -> bool {
         matches!(
             self,
@@ -242,173 +214,53 @@ impl BinOp {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CastOp {
-    Trunc,
-    ZExt,
-    SExt,
-    FPTrunc,
-    FPExt,
-    FPToUI,
-    FPToSI,
-    UIToFP,
-    SIToFP,
-    PtrToInt,
-    IntToPtr,
-    BitCast,
-    AddrSpaceCast,
-}
+keywords!(CastOp {
+    Trunc = "trunc",
+    ZExt = "zext",
+    SExt = "sext",
+    FPTrunc = "fptrunc",
+    FPExt = "fpext",
+    FPToUI = "fptoui",
+    FPToSI = "fptosi",
+    UIToFP = "uitofp",
+    SIToFP = "sitofp",
+    PtrToInt = "ptrtoint",
+    IntToPtr = "inttoptr",
+    BitCast = "bitcast",
+    AddrSpaceCast = "addrspacecast",
+});
 
-impl CastOp {
-    pub fn from_keyword(keyword: &str) -> Option<CastOp> {
-        Some(match keyword {
-            "trunc" => CastOp::Trunc,
-            "zext" => CastOp::ZExt,
-            "sext" => CastOp::SExt,
-            "fptrunc" => CastOp::FPTrunc,
-            "fpext" => CastOp::FPExt,
-            "fptoui" => CastOp::FPToUI,
-            "fptosi" => CastOp::FPToSI,
-            "uitofp" => CastOp::UIToFP,
-            "sitofp" => CastOp::SIToFP,
-            "ptrtoint" => CastOp::PtrToInt,
-            "inttoptr" => CastOp::IntToPtr,
-            "bitcast" => CastOp::BitCast,
-            "addrspacecast" => CastOp::AddrSpaceCast,
-            _ => return None,
-        })
-    }
+keywords!(IntPredicate {
+    Eq = "eq",
+    Ne = "ne",
+    Ugt = "ugt",
+    Uge = "uge",
+    Ult = "ult",
+    Ule = "ule",
+    Sgt = "sgt",
+    Sge = "sge",
+    Slt = "slt",
+    Sle = "sle",
+});
 
-    pub fn keyword(self) -> &'static str {
-        match self {
-            CastOp::Trunc => "trunc",
-            CastOp::ZExt => "zext",
-            CastOp::SExt => "sext",
-            CastOp::FPTrunc => "fptrunc",
-            CastOp::FPExt => "fpext",
-            CastOp::FPToUI => "fptoui",
-            CastOp::FPToSI => "fptosi",
-            CastOp::UIToFP => "uitofp",
-            CastOp::SIToFP => "sitofp",
-            CastOp::PtrToInt => "ptrtoint",
-            CastOp::IntToPtr => "inttoptr",
-            CastOp::BitCast => "bitcast",
-            CastOp::AddrSpaceCast => "addrspacecast",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum IntPredicate {
-    Eq,
-    Ne,
-    Ugt,
-    Uge,
-    Ult,
-    Ule,
-    Sgt,
-    Sge,
-    Slt,
-    Sle,
-}
-
-impl IntPredicate {
-    pub fn from_keyword(keyword: &str) -> Option<IntPredicate> {
-        Some(match keyword {
-            "eq" => IntPredicate::Eq,
-            "ne" => IntPredicate::Ne,
-            "ugt" => IntPredicate::Ugt,
-            "uge" => IntPredicate::Uge,
-            "ult" => IntPredicate::Ult,
-            "ule" => IntPredicate::Ule,
-            "sgt" => IntPredicate::Sgt,
-            "sge" => IntPredicate::Sge,
-            "slt" => IntPredicate::Slt,
-            "sle" => IntPredicate::Sle,
-            _ => return None,
-        })
-    }
-
-    pub fn keyword(self) -> &'static str {
-        match self {
-            IntPredicate::Eq => "eq",
-            IntPredicate::Ne => "ne",
-            IntPredicate::Ugt => "ugt",
-            IntPredicate::Uge => "uge",
-            IntPredicate::Ult => "ult",
-            IntPredicate::Ule => "ule",
-            IntPredicate::Sgt => "sgt",
-            IntPredicate::Sge => "sge",
-            IntPredicate::Slt => "slt",
-            IntPredicate::Sle => "sle",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FloatPredicate {
-    False,
-    Oeq,
-    Ogt,
-    Oge,
-    Olt,
-    Ole,
-    One,
-    Ord,
-    Ueq,
-    Ugt,
-    Uge,
-    Ult,
-    Ule,
-    Une,
-    Uno,
-    True,
-}
-
-impl FloatPredicate {
-    pub fn from_keyword(keyword: &str) -> Option<FloatPredicate> {
-        Some(match keyword {
-            "false" => FloatPredicate::False,
-            "oeq" => FloatPredicate::Oeq,
-            "ogt" => FloatPredicate::Ogt,
-            "oge" => FloatPredicate::Oge,
-            "olt" => FloatPredicate::Olt,
-            "ole" => FloatPredicate::Ole,
-            "one" => FloatPredicate::One,
-            "ord" => FloatPredicate::Ord,
-            "ueq" => FloatPredicate::Ueq,
-            "ugt" => FloatPredicate::Ugt,
-            "uge" => FloatPredicate::Uge,
-            "ult" => FloatPredicate::Ult,
-            "ule" => FloatPredicate::Ule,
-            "une" => FloatPredicate::Une,
-            "uno" => FloatPredicate::Uno,
-            "true" => FloatPredicate::True,
-            _ => return None,
-        })
-    }
-
-    pub fn keyword(self) -> &'static str {
-        match self {
-            FloatPredicate::False => "false",
-            FloatPredicate::Oeq => "oeq",
-            FloatPredicate::Ogt => "ogt",
-            FloatPredicate::Oge => "oge",
-            FloatPredicate::Olt => "olt",
-            FloatPredicate::Ole => "ole",
-            FloatPredicate::One => "one",
-            FloatPredicate::Ord => "ord",
-            FloatPredicate::Ueq => "ueq",
-            FloatPredicate::Ugt => "ugt",
-            FloatPredicate::Uge => "uge",
-            FloatPredicate::Ult => "ult",
-            FloatPredicate::Ule => "ule",
-            FloatPredicate::Une => "une",
-            FloatPredicate::Uno => "uno",
-            FloatPredicate::True => "true",
-        }
-    }
-}
+keywords!(FloatPredicate {
+    False = "false",
+    Oeq = "oeq",
+    Ogt = "ogt",
+    Oge = "oge",
+    Olt = "olt",
+    Ole = "ole",
+    One = "one",
+    Ord = "ord",
+    Ueq = "ueq",
+    Ugt = "ugt",
+    Uge = "uge",
+    Ult = "ult",
+    Ule = "ule",
+    Une = "une",
+    Uno = "uno",
+    True = "true",
+});
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Argument {

@@ -236,38 +236,30 @@ unsafe fn apply_1q_avx2(re: &mut [f64], im: &mut [f64], m: &Matrix2, target: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulator::state::Rng;
     use num_complex::Complex;
 
-    struct Rng(u64);
-
-    impl Rng {
-        fn next_f64(&mut self) -> f64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            (z >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
-        }
+    fn signed(rng: &mut Rng) -> f64 {
+        rng.next_unit() * 2.0 - 1.0
     }
 
     fn random_state(n: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
-        let mut rng = Rng(seed);
+        let mut rng = Rng::new(seed);
         let len = 1usize << n;
         (
-            (0..len).map(|_| rng.next_f64()).collect(),
-            (0..len).map(|_| rng.next_f64()).collect(),
+            (0..len).map(|_| signed(&mut rng)).collect(),
+            (0..len).map(|_| signed(&mut rng)).collect(),
         )
     }
 
     fn random_matrix(seed: u64) -> Matrix2 {
-        let mut rng = Rng(seed);
-        let mut c = || Complex::new(rng.next_f64(), rng.next_f64());
+        let mut rng = Rng::new(seed);
+        let mut c = || Complex::new(signed(&mut rng), signed(&mut rng));
         Matrix2::new(c(), c(), c(), c())
     }
 
     #[test]
-    fn simd_matches_scalar() {
+    fn matches_scalar() {
         for n in 1..=7usize {
             for target in 0..n {
                 let others: Vec<usize> = (0..n).filter(|&c| c != target).collect();
@@ -286,8 +278,8 @@ mod tests {
                 }
 
                 for controls in masks {
-                    let m = random_matrix(0x5EED + target as u64 * 31 + n as u64);
-                    let (mut re, mut im) = random_state(n, 0xC0FFEE + n as u64);
+                    let m = random_matrix(target as u64 * 31 + n as u64);
+                    let (mut re, mut im) = random_state(n, 1000 + n as u64);
                     let (mut ref_re, mut ref_im) = (re.clone(), im.clone());
 
                     apply_1q(&mut re, &mut im, &m, target, controls);
@@ -305,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn a_control_only_touches_matching_amplitudes() {
+    fn control_mask() {
         let n = 5usize;
         let len = 1usize << n;
         let m = Matrix2::x();
@@ -329,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn swap_permutes_amplitudes() {
+    fn swap() {
         let n = 3;
         let (mut re, mut im) = random_state(n, 7);
         let (before_re, before_im) = (re.clone(), im.clone());

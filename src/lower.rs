@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem;
 
 use crate::ast;
 use crate::diag::{Diagnostic, Span};
@@ -11,15 +12,42 @@ pub struct Lowered {
 }
 
 pub fn lower(module: &ast::Module) -> Lowered {
-    let mut lowerer = Lowerer::new(module);
+    let expanded = crate::inline::inline_module(module);
+    let module = &expanded.module;
+
+    let mut flattener = Lowerer::new(module, Mode::Flatten);
+    if let Some(program) = flattener.run_flat() {
+        let mut diagnostics = expanded.diagnostics;
+        diagnostics.extend(flattener.diagnostics);
+        return Lowered {
+            program,
+            diagnostics,
+        };
+    }
+
+    let mut lowerer = Lowerer::new(module, Mode::Cfg);
     let program = lowerer.run();
+
+    let mut diagnostics = expanded.diagnostics;
+    diagnostics.extend(lowerer.diagnostics);
+
     Lowered {
         program,
-        diagnostics: lowerer.diagnostics,
+        diagnostics,
     }
 }
 
+pub const MAX_WIRES: u32 = 1 << 16;
+
 const MAX_INLINE_DEPTH: usize = 32;
+const MAX_FLATTEN_STEPS: usize = 200_000;
+const MAX_FLATTEN_OPS: usize = 2_000_000;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    Cfg,
+    Flatten,
+}
 
 #[derive(Clone, Debug)]
 enum Binding {
@@ -30,6 +58,9 @@ enum Binding {
     ResultConst(bool),
     Bytes(Vec<u8>),
     Slot(SlotId),
+    Cell(usize),
+    GlobalElement { name: String, index: u64 },
+    Id(u32),
 }
 
 #[derive(Clone, Copy)]
@@ -51,12 +82,19 @@ struct Lowerer<'a> {
     max_qubit: u32,
     max_result: u32,
     inline_depth: usize,
+    too_many_wires: bool,
+    forward: HashMap<String, (ValueId, Span)>,
     ops: Vec<Op>,
     next_slot: u32,
+    mode: Mode,
+    cells: Vec<Option<Const>>,
+    previous_label: Option<String>,
+    steps: usize,
+    bailed: bool,
 }
 
 impl<'a> Lowerer<'a> {
-    fn new(module: &'a ast::Module) -> Self {
+    fn new(module: &'a ast::Module, mode: Mode) -> Self {
         Self {
             module,
             diagnostics: Vec::new(),
@@ -68,9 +106,20 @@ impl<'a> Lowerer<'a> {
             max_qubit: 0,
             max_result: 0,
             inline_depth: 0,
+            too_many_wires: false,
+            forward: HashMap::new(),
             ops: Vec::new(),
             next_slot: 0,
+            mode,
+            cells: Vec::new(),
+            previous_label: None,
+            steps: 0,
+            bailed: false,
         }
+    }
+
+    fn flattening(&self) -> bool {
+        self.mode == Mode::Flatten
     }
 
     fn error(&mut self, message: impl Into<String>, span: Span, label: impl Into<String>) {
@@ -94,7 +143,12 @@ impl<'a> Lowerer<'a> {
 
     fn alloc_qubits(&mut self, count: u64) -> QubitId {
         let base = QubitId(self.next_qubit);
-        self.next_qubit += count as u32;
+        let end = u64::from(self.next_qubit) + count;
+        if end > u64::from(MAX_WIRES) {
+            self.too_many_wires = true;
+            return base;
+        }
+        self.next_qubit = end as u32;
         self.max_qubit = self.max_qubit.max(self.next_qubit);
         base
     }
@@ -103,8 +157,210 @@ impl<'a> Lowerer<'a> {
         self.max_qubit = self.max_qubit.max(qubit.0 + 1);
     }
 
+    fn check_wire_limit(&mut self, program: &mut Program) {
+        if self.too_many_wires || self.max_qubit > MAX_WIRES || self.max_result > MAX_WIRES {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "the program uses more than {MAX_WIRES} qubits or results"
+                ))
+                .with_code("QIR0202"),
+            );
+            program.num_qubits = 0;
+            program.num_results = 0;
+        }
+    }
+
     fn note_result(&mut self, result: ResultId) {
         self.max_result = self.max_result.max(result.0 + 1);
+    }
+
+    fn entry_setup(&mut self) -> Option<(&'a ast::Function, Profile)> {
+        let entry = self.module.entry_point()?;
+        let attrs = self.module.attributes_of(&entry.sig);
+
+        let profile = attrs
+            .iter()
+            .find(|a| a.key() == "qir_profiles")
+            .and_then(|a| a.value())
+            .map(Profile::from_attribute)
+            .unwrap_or(Profile::Unrestricted);
+
+        let declared_qubits =
+            attribute_count(&attrs, &["required_num_qubits", "num_required_qubits"]);
+        let declared_results =
+            attribute_count(&attrs, &["required_num_results", "num_required_results"]);
+
+        if declared_qubits > MAX_WIRES || declared_results > MAX_WIRES {
+            self.too_many_wires = true;
+            return Some((entry, profile));
+        }
+
+        self.next_qubit = declared_qubits;
+        self.next_result = declared_results;
+        self.max_qubit = declared_qubits;
+        self.max_result = declared_results;
+
+        Some((entry, profile))
+    }
+
+    fn bind_params(&mut self, entry: &ast::Function) {
+        for param in &entry.sig.params {
+            let Some(name) = &param.name else { continue };
+            match param.ty.pointee_name() {
+                Some("Qubit") => {
+                    let qubit = self.alloc_qubits(1);
+                    self.env.insert(name.clone(), Binding::Qubit(qubit));
+                }
+                Some("Result") => {
+                    let result = ResultId(self.next_result);
+                    self.next_result += 1;
+                    self.max_result = self.max_result.max(self.next_result);
+                    self.env.insert(name.clone(), Binding::Result(result));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn run_flat(&mut self) -> Option<Program> {
+        let (entry, profile) = self.entry_setup()?;
+
+        self.bind_params(entry);
+        self.execute_function(entry);
+
+        if self.bailed {
+            return None;
+        }
+
+        let mut program = Program::new(entry.sig.name.clone(), profile);
+        program.blocks.push(Block {
+            id: BlockId(0),
+            label: "entry".into(),
+            ops: mem::take(&mut self.ops),
+            term: Term::Ret(None),
+            span: entry.span,
+        });
+        program.entry = BlockId(0);
+        program.num_qubits = self.max_qubit;
+        program.num_results = self.max_result;
+        program.next_value = self.next_value;
+        program.num_slots = 0;
+        self.check_wire_limit(&mut program);
+
+        Some(program)
+    }
+
+    fn execute_function(&mut self, function: &'a ast::Function) -> Option<Binding> {
+        let mut current = 0usize;
+        let mut previous: Option<String> = None;
+
+        loop {
+            self.steps += 1;
+            if self.steps > MAX_FLATTEN_STEPS || self.ops.len() > MAX_FLATTEN_OPS {
+                self.bailed = true;
+                return None;
+            }
+            if self.bailed {
+                return None;
+            }
+
+            let Some(block) = function.blocks.get(current) else {
+                self.bailed = true;
+                return None;
+            };
+            self.previous_label = previous.clone();
+
+            for inst in &block.instructions {
+                self.lower_instruction(inst);
+                if self.bailed {
+                    return None;
+                }
+            }
+
+            let next_label = match &block.terminator {
+                ast::Terminator::Ret(value) => {
+                    return value.as_ref().and_then(|tv| self.binding_for(&tv.value));
+                }
+                ast::Terminator::Unreachable => return None,
+                ast::Terminator::Br { target } => target.clone(),
+                ast::Terminator::CondBr {
+                    cond,
+                    if_true,
+                    if_false,
+                } => {
+                    let Some(taken) = self.const_of(&cond.value) else {
+                        self.bailed = true;
+                        return None;
+                    };
+                    if taken.truthy() {
+                        if_true.clone()
+                    } else {
+                        if_false.clone()
+                    }
+                }
+                ast::Terminator::Switch {
+                    scrutinee,
+                    default,
+                    cases,
+                } => {
+                    let Some(value) = self.const_of(&scrutinee.value) else {
+                        self.bailed = true;
+                        return None;
+                    };
+                    let key = value.as_i64();
+                    cases
+                        .iter()
+                        .find(|(candidate, _)| match &candidate.value {
+                            ast::Value::Int(i) => *i as i64 == key,
+                            ast::Value::Bool(b) => i64::from(*b) == key,
+                            _ => false,
+                        })
+                        .map(|(_, label)| label.clone())
+                        .unwrap_or_else(|| default.clone())
+                }
+            };
+
+            previous = Some(block.label.clone());
+            match function.blocks.iter().position(|b| b.label == next_label) {
+                Some(index) => current = index,
+                None => {
+                    self.bailed = true;
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn const_of(&mut self, value: &ast::Value) -> Option<Const> {
+        match value {
+            ast::Value::Int(i) => Some(Const::Int(*i as i64)),
+            ast::Value::Float(f) => Some(Const::Float(*f)),
+            ast::Value::Bool(b) => Some(Const::Bool(*b)),
+            ast::Value::Null | ast::Value::ZeroInit => Some(Const::Int(0)),
+            ast::Value::Local(name) => match self.env.get(name) {
+                Some(Binding::Value(Operand::Const(c))) => Some(*c),
+                Some(Binding::Qubit(q)) => Some(Const::Int(i64::from(q.0))),
+                Some(Binding::Id(id)) => Some(Const::Int(i64::from(*id))),
+                Some(Binding::ResultConst(b)) => Some(Const::Bool(*b)),
+                Some(Binding::Cell(index)) => {
+                    let slot = *index;
+                    self.cells.get(slot).copied().flatten()
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn evaluate(&self, expr: &Expr) -> Option<Const> {
+        expr.fold(|operand| operand.constant())
+    }
+
+    fn global_element(&self, name: &str, index: u64) -> Option<ast::Value> {
+        match self.module.global(name)?.initializer.as_ref()? {
+            ast::Value::Aggregate(items) => items.get(index as usize).map(|tv| tv.value.clone()),
+            _ => None,
+        }
     }
 
     fn run(&mut self) -> Program {
@@ -168,7 +424,7 @@ impl<'a> Lowerer<'a> {
             }
 
             let term = self.lower_terminator(&block.terminator, block.span);
-            let ops = std::mem::take(&mut self.ops);
+            let ops = mem::take(&mut self.ops);
 
             program.blocks.push(Block {
                 id: self.block_ids[&block.label],
@@ -194,6 +450,22 @@ impl<'a> Lowerer<'a> {
         program.num_qubits = self.max_qubit;
         program.num_results = self.max_result;
         program.next_value = self.next_value;
+        self.check_wire_limit(&mut program);
+
+        let mut unresolved: Vec<(String, Span)> = self
+            .forward
+            .drain()
+            .map(|(name, (_, span))| (name, span))
+            .collect();
+        unresolved.sort_by_key(|(_, span)| span.start);
+        for (name, span) in unresolved {
+            self.error(
+                format!("`%{name}` is not defined"),
+                span,
+                "a phi refers to a value that is never assigned",
+            );
+        }
+
         program
     }
 
@@ -352,12 +624,35 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::InstKind::Cast { op, operand, to } => {
-                if let Some(qubit) = self.try_resolve_qubit_value(&operand.value)
+                if let Some(qubit) = self.static_qubit(&operand.value)
                     && to.pointee_name() == Some("Qubit")
                 {
                     if let Some(name) = inst.result.as_deref() {
                         self.env.insert(name.to_string(), Binding::Qubit(qubit));
                     }
+                    return;
+                }
+
+                if *op == ast::CastOp::IntToPtr
+                    && let Some(kind) = to.pointee_name().or(Some("ptr"))
+                    && matches!(kind, "Qubit" | "Result" | "ptr")
+                    && let Some(index) = self.const_of(&operand.value)
+                    && let Some(name) = inst.result.as_deref()
+                {
+                    let Some(id) = wire(i128::from(index.as_i64())) else {
+                        self.error(
+                            format!("index {} is out of range", index.as_i64()),
+                            span,
+                            format!("ids must be below {MAX_WIRES}"),
+                        );
+                        return;
+                    };
+                    let binding = match kind {
+                        "Qubit" => Binding::Qubit(QubitId(id)),
+                        "Result" => Binding::Result(ResultId(id)),
+                        _ => Binding::Id(id),
+                    };
+                    self.env.insert(name.to_string(), binding);
                     return;
                 }
 
@@ -384,6 +679,25 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::InstKind::Phi { incoming, .. } => {
+                if self.flattening() {
+                    let from = self.previous_label.clone();
+                    let chosen = from.and_then(|label| {
+                        incoming
+                            .iter()
+                            .find(|(_, block)| *block == label)
+                            .map(|(value, _)| value.clone())
+                    });
+                    match chosen.and_then(|value| self.binding_for(&value)) {
+                        Some(binding) => {
+                            if let Some(name) = inst.result.as_deref() {
+                                self.env.insert(name.to_string(), binding);
+                            }
+                        }
+                        None => self.bailed = true,
+                    }
+                    return;
+                }
+
                 let mut lowered = Vec::new();
                 for (value, label) in incoming {
                     let Some(block) = self.block_ids.get(label).copied() else {
@@ -394,8 +708,19 @@ impl<'a> Lowerer<'a> {
                         );
                         continue;
                     };
-                    let Some(operand) = self.operand(value, span) else {
-                        continue;
+                    let operand = match value {
+                        ast::Value::Local(name) if !self.env.contains_key(name) => {
+                            let next = ValueId(self.next_value);
+                            let id = self.forward.entry(name.clone()).or_insert((next, span)).0;
+                            if id == next {
+                                self.next_value += 1;
+                            }
+                            Operand::Value(id)
+                        }
+                        _ => match self.operand(value, span) {
+                            Some(operand) => operand,
+                            None => continue,
+                        },
                     };
                     lowered.push((block, operand));
                 }
@@ -403,6 +728,15 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::InstKind::Alloca { .. } => {
+                if self.flattening() {
+                    let cell = self.cells.len();
+                    self.cells.push(None);
+                    if let Some(name) = inst.result.as_deref() {
+                        self.env.insert(name.to_string(), Binding::Cell(cell));
+                    }
+                    return;
+                }
+
                 let slot = SlotId(self.next_slot);
                 self.next_slot += 1;
                 if let Some(name) = inst.result.as_deref() {
@@ -411,6 +745,29 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::InstKind::Store { value, ptr } => {
+                if self.flattening() {
+                    let cell = match &ptr.value {
+                        ast::Value::Local(name) => match self.env.get(name) {
+                            Some(Binding::Cell(index)) => Some(*index),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+
+                    match (cell, self.binding_for(&value.value)) {
+                        (Some(index), Some(Binding::Value(Operand::Const(c)))) => {
+                            self.cells[index] = Some(c);
+                        }
+                        (Some(index), Some(Binding::Qubit(q))) => {
+                            self.cells[index] = Some(Const::Int(i64::from(q.0)));
+                            self.env.insert(format!("cell#{index}"), Binding::Qubit(q));
+                        }
+                        (Some(_), _) => self.bailed = true,
+                        (None, _) => {}
+                    }
+                    return;
+                }
+
                 let Some(slot) = self.resolve_slot(&ptr.value) else {
                     return;
                 };
@@ -425,6 +782,54 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::InstKind::Load { ptr, .. } => {
+                if self.flattening() {
+                    let binding = match &ptr.value {
+                        ast::Value::Local(name) => self.env.get(name).cloned(),
+                        _ => None,
+                    };
+
+                    match binding {
+                        Some(Binding::Cell(index)) => {
+                            if let Some(qubit) = self.env.get(&format!("cell#{index}")).cloned() {
+                                if let Some(name) = inst.result.as_deref() {
+                                    self.env.insert(name.to_string(), qubit);
+                                }
+                                return;
+                            }
+                            match self.cells.get(index).copied().flatten() {
+                                Some(value) => {
+                                    if let Some(name) = inst.result.as_deref() {
+                                        self.env.insert(
+                                            name.to_string(),
+                                            Binding::Value(Operand::Const(value)),
+                                        );
+                                    }
+                                }
+                                None => self.bailed = true,
+                            }
+                            return;
+                        }
+                        Some(Binding::GlobalElement {
+                            name: global,
+                            index,
+                        }) => {
+                            match self.global_element(&global, index) {
+                                Some(element) => match self.binding_for(&element) {
+                                    Some(found) => {
+                                        if let Some(name) = inst.result.as_deref() {
+                                            self.env.insert(name.to_string(), found);
+                                        }
+                                    }
+                                    None => self.bailed = true,
+                                },
+                                None => self.bailed = true,
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 if let Some(slot) = self.resolve_slot(&ptr.value) {
                     self.assign(inst.result.as_deref(), Expr::Load(slot), span);
                     return;
@@ -439,7 +844,15 @@ impl<'a> Lowerer<'a> {
                 self.propagate_binding(inst.result.as_deref(), &ptr.value);
             }
 
-            ast::InstKind::GetElementPtr { ptr, .. } => {
+            ast::InstKind::GetElementPtr { ptr, indices, .. } => {
+                if self.flattening()
+                    && let Some(binding) = self.array_element(&ptr.value, indices)
+                    && let Some(name) = inst.result.as_deref()
+                {
+                    self.env.insert(name.to_string(), binding);
+                    return;
+                }
+
                 self.propagate_binding(inst.result.as_deref(), &ptr.value);
             }
 
@@ -459,6 +872,27 @@ impl<'a> Lowerer<'a> {
                 );
             }
         }
+    }
+
+    fn array_element(&mut self, base: &ast::Value, indices: &[ast::TypedValue]) -> Option<Binding> {
+        let ast::Value::Global(name) = base else {
+            return None;
+        };
+        self.module.global(name)?;
+
+        let last = indices.last()?;
+        let index = match self.const_of(&last.value) {
+            Some(value) => value.as_i64(),
+            None => return None,
+        };
+        if index < 0 {
+            return None;
+        }
+
+        Some(Binding::GlobalElement {
+            name: name.clone(),
+            index: index as u64,
+        })
     }
 
     fn resolve_slot(&self, value: &ast::Value) -> Option<SlotId> {
@@ -481,7 +915,20 @@ impl<'a> Lowerer<'a> {
     }
 
     fn assign(&mut self, result: Option<&str>, expr: Expr, span: Span) {
-        let dest = self.fresh_value();
+        if self.flattening()
+            && let Some(value) = self.evaluate(&expr)
+        {
+            if let Some(name) = result {
+                self.env
+                    .insert(name.to_string(), Binding::Value(Operand::Const(value)));
+            }
+            return;
+        }
+
+        let dest = match result.and_then(|name| self.forward.remove(name)) {
+            Some((id, _)) => id,
+            None => self.fresh_value(),
+        };
         self.ops.push(Op::Assign { dest, expr, span });
         if let Some(name) = result {
             self.env
@@ -541,15 +988,36 @@ impl<'a> Lowerer<'a> {
             return;
         }
 
+        if self.flattening() {
+            let mut scope: HashMap<String, Binding> = HashMap::new();
+            for (param, arg) in function.sig.params.iter().zip(&call.args) {
+                let Some(name) = &param.name else { continue };
+                if let Some(binding) = self.binding_for(&arg.value) {
+                    scope.insert(name.clone(), binding);
+                }
+            }
+
+            let saved_env = mem::replace(&mut self.env, scope);
+            let saved_previous = self.previous_label.take();
+            self.inline_depth += 1;
+
+            let returned = self.execute_function(function);
+
+            self.inline_depth -= 1;
+            self.env = saved_env;
+            self.previous_label = saved_previous;
+
+            if let (Some(name), Some(binding)) = (result, returned) {
+                self.env.insert(name.to_string(), binding);
+            }
+            return;
+        }
+
         if function.blocks.len() != 1 {
             self.error(
-                format!(
-                    "cannot inline `{}`: it has {} basic blocks",
-                    function.sig.name,
-                    function.blocks.len()
-                ),
+                format!("cannot inline recursive call to `{}`", function.sig.name),
                 span,
-                "only straight-line helper functions can be inlined",
+                "recursion is not supported",
             );
             return;
         }
@@ -562,7 +1030,7 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        let saved = std::mem::replace(&mut self.env, scope);
+        let saved = mem::replace(&mut self.env, scope);
         self.inline_depth += 1;
 
         let body = &function.blocks[0];
@@ -584,7 +1052,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn binding_for(&mut self, value: &ast::Value) -> Option<Binding> {
-        if let Some(qubit) = self.try_resolve_qubit_value(value) {
+        if let Some(qubit) = self.static_qubit(value) {
             return Some(Binding::Qubit(qubit));
         }
 
@@ -720,8 +1188,13 @@ impl<'a> Lowerer<'a> {
             }
 
             Intrinsic::QubitAllocateArray => {
-                let count = match call.args.first().map(|a| &a.value) {
-                    Some(ast::Value::Int(n)) if *n >= 0 => *n as u64,
+                let count = match call
+                    .args
+                    .first()
+                    .map(|a| a.value.clone())
+                    .and_then(|value| self.const_of(&value))
+                {
+                    Some(n) if n.as_i64() >= 0 => n.as_i64() as u64,
                     _ => {
                         self.error(
                             "qubit array length must be a compile time constant",
@@ -750,17 +1223,18 @@ impl<'a> Lowerer<'a> {
                     return;
                 };
 
-                let index = match call.args.get(1).map(|a| &a.value) {
-                    Some(ast::Value::Int(i)) => *i as u64,
+                let index = match call
+                    .args
+                    .get(1)
+                    .map(|a| a.value.clone())
+                    .and_then(|value| self.const_of(&value))
+                {
+                    Some(i) if i.as_i64() >= 0 => i.as_i64() as u64,
                     _ => {
                         self.error(
                             "qubit array index must be a compile time constant",
                             span,
                             "this index depends on runtime state",
-                        );
-                        self.diagnostics.last_mut().unwrap().notes.push(
-                            "the simulator resolves qubits statically; unroll the loop or index with a literal"
-                                .into(),
                         );
                         return;
                     }
@@ -809,7 +1283,7 @@ impl<'a> Lowerer<'a> {
 
         let resolve = |this: &mut Self, value: Option<ast::Value>| -> Option<Binding> {
             let value = value?;
-            if let Some(id) = this.try_resolve_result_value(&value) {
+            if let Some(id) = this.static_result(&value) {
                 return Some(Binding::Result(id));
             }
             if let ast::Value::Local(name) = &value {
@@ -970,9 +1444,20 @@ impl<'a> Lowerer<'a> {
             return None;
         };
 
-        if let Some(qubit) = self.try_resolve_qubit_value(&arg.value) {
+        if let Some(qubit) = self.static_qubit(&arg.value) {
             self.note_qubit(qubit);
             return Some(qubit);
+        }
+
+        if let Some(index) = literal_index(&arg.value)
+            && wire(index).is_none()
+        {
+            self.error(
+                format!("qubit index {index} is out of range"),
+                arg.span,
+                format!("qubit ids must be below {MAX_WIRES}"),
+            );
+            return None;
         }
 
         self.error(
@@ -981,13 +1466,9 @@ impl<'a> Lowerer<'a> {
             "expected a static qubit reference",
         );
 
-        let note = if self.inline_depth > 0 {
-            "this argument came from an inlined call whose qubit was not a compile time constant"
-        } else {
-            "qubit references must resolve statically: use inttoptr, null, or a constant array index"
-        };
         if let Some(last) = self.diagnostics.last_mut() {
-            last.notes.push(note.into());
+            last.notes
+                .push("use inttoptr, null, or a constant array index".into());
         }
 
         None
@@ -1003,9 +1484,20 @@ impl<'a> Lowerer<'a> {
             return None;
         };
 
-        if let Some(id) = self.try_resolve_result_value(&arg.value) {
+        if let Some(id) = self.static_result(&arg.value) {
             self.note_result(id);
             return Some(id);
+        }
+
+        if let Some(index) = literal_index(&arg.value)
+            && wire(index).is_none()
+        {
+            self.error(
+                format!("result index {index} is out of range"),
+                arg.span,
+                format!("result ids must be below {MAX_WIRES}"),
+            );
+            return None;
         }
 
         self.error(
@@ -1016,7 +1508,7 @@ impl<'a> Lowerer<'a> {
         None
     }
 
-    fn try_resolve_qubit_value(&self, value: &ast::Value) -> Option<QubitId> {
+    fn static_qubit(&self, value: &ast::Value) -> Option<QubitId> {
         match value {
             ast::Value::Null => Some(QubitId(0)),
             ast::Value::ConstExpr(expr) => match expr.as_ref() {
@@ -1029,7 +1521,7 @@ impl<'a> Lowerer<'a> {
                         return None;
                     }
                     match operand.value {
-                        ast::Value::Int(i) if i >= 0 => Some(QubitId(i as u32)),
+                        ast::Value::Int(i) => wire(i).map(QubitId),
                         _ => None,
                     }
                 }
@@ -1038,13 +1530,14 @@ impl<'a> Lowerer<'a> {
             ast::Value::Local(name) => match self.env.get(name) {
                 Some(Binding::Qubit(q)) => Some(*q),
                 Some(Binding::QubitArray { base, .. }) => Some(*base),
+                Some(Binding::Id(id)) => Some(QubitId(*id)),
                 _ => None,
             },
             _ => None,
         }
     }
 
-    fn try_resolve_result_value(&self, value: &ast::Value) -> Option<ResultId> {
+    fn static_result(&self, value: &ast::Value) -> Option<ResultId> {
         match value {
             ast::Value::Null => Some(ResultId(0)),
             ast::Value::ConstExpr(expr) => match expr.as_ref() {
@@ -1057,7 +1550,7 @@ impl<'a> Lowerer<'a> {
                         return None;
                     }
                     match operand.value {
-                        ast::Value::Int(i) if i >= 0 => Some(ResultId(i as u32)),
+                        ast::Value::Int(i) => wire(i).map(ResultId),
                         _ => None,
                     }
                 }
@@ -1065,6 +1558,7 @@ impl<'a> Lowerer<'a> {
             },
             ast::Value::Local(name) => match self.env.get(name) {
                 Some(Binding::Result(r)) => Some(*r),
+                Some(Binding::Id(id)) => Some(ResultId(*id)),
                 _ => None,
             },
             _ => None,
@@ -1111,6 +1605,9 @@ impl<'a> Lowerer<'a> {
             ast::Value::Local(name) => match self.env.get(name) {
                 Some(Binding::Value(operand)) => Some(*operand),
                 Some(Binding::ResultConst(b)) => Some(Operand::Const(Const::Bool(*b))),
+                Some(Binding::Qubit(q)) if self.flattening() => {
+                    Some(Operand::Const(Const::Int(i64::from(q.0))))
+                }
                 Some(Binding::Result(id)) => {
                     let id = *id;
                     self.note_result(id);
@@ -1134,6 +1631,27 @@ impl<'a> Lowerer<'a> {
             _ => None,
         }
     }
+}
+
+fn literal_index(value: &ast::Value) -> Option<i128> {
+    match value {
+        ast::Value::ConstExpr(expr) => match expr.as_ref() {
+            ast::ConstExpr::Cast {
+                op: ast::CastOp::IntToPtr,
+                operand,
+                ..
+            } => match operand.value {
+                ast::Value::Int(i) => Some(i),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn wire(index: i128) -> Option<u32> {
+    u32::try_from(index).ok().filter(|&i| i < MAX_WIRES)
 }
 
 fn decode_label(bytes: &[u8]) -> String {

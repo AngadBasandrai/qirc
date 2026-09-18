@@ -1,4 +1,5 @@
 use num_complex::Complex;
+use std::fmt;
 
 use super::matrix::{C64, Matrix2};
 use super::simd;
@@ -23,6 +24,26 @@ impl Rng {
     }
 }
 
+pub const MAX_QUBITS: usize = 30;
+
+pub fn memory_required(n: usize) -> Option<u64> {
+    1u64.checked_shl(n as u32)?.checked_mul(16)
+}
+
+pub struct Sampler {
+    cumulative: Vec<f64>,
+}
+
+impl Sampler {
+    pub fn draw(&self, rng: &mut Rng) -> usize {
+        let total = self.cumulative.last().copied().unwrap_or(0.0);
+        let point = rng.next_unit() * total;
+        self.cumulative
+            .partition_point(|&c| c <= point)
+            .min(self.cumulative.len().saturating_sub(1))
+    }
+}
+
 pub struct State {
     n: usize,
     re: Vec<f64>,
@@ -31,6 +52,11 @@ pub struct State {
 
 impl State {
     pub fn new(n: usize) -> Self {
+        assert!(
+            n <= MAX_QUBITS,
+            "cannot build a state vector over {n} qubits: the limit is {MAX_QUBITS}"
+        );
+
         let len = 1usize << n;
         let mut re = vec![0.0; len];
         re[0] = 1.0;
@@ -146,28 +172,18 @@ impl State {
         }
     }
 
-    pub fn sample_index(&self, rng: &mut Rng) -> usize {
-        let probabilities = self.probabilities();
-        let total: f64 = probabilities.iter().sum();
-        let mut threshold = rng.next_unit() * total;
-
-        for (index, p) in probabilities.iter().enumerate() {
-            threshold -= p;
-            if threshold <= 0.0 {
-                return index;
-            }
-        }
-
-        probabilities.len().saturating_sub(1)
-    }
-
-    pub fn sample(&self, shots: u64, seed: u64) -> Vec<u64> {
-        let mut counts = vec![0u64; self.len()];
-        let mut rng = Rng::new(seed);
-        for _ in 0..shots {
-            counts[self.sample_index(&mut rng)] += 1;
-        }
-        counts
+    pub fn sampler(&self) -> Sampler {
+        let mut running = 0.0;
+        let cumulative = self
+            .re
+            .iter()
+            .zip(&self.im)
+            .map(|(r, i)| {
+                running += r * r + i * i;
+                running
+            })
+            .collect();
+        Sampler { cumulative }
     }
 
     pub fn ket(&self, index: usize) -> String {
@@ -175,8 +191,8 @@ impl State {
     }
 }
 
-impl std::fmt::Display for State {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
             "State vector ({} qubits, {} amplitudes):",
@@ -232,7 +248,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn starts_in_the_all_zero_state() {
+    fn initial_state() {
         let state = State::new(3);
         assert_eq!(state.len(), 8);
         assert!((state.amplitude(0).re - 1.0).abs() < 1e-15);
@@ -240,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn hadamard_then_cnot_makes_a_bell_pair() {
+    fn bell_pair() {
         let mut state = State::new(2);
         state.apply(&Matrix2::h(), 0, 0);
         state.apply(&Matrix2::x(), 1, 1 << 0);
@@ -253,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn toffoli_only_fires_with_both_controls_set() {
+    fn toffoli() {
         let mut state = State::new(3);
         state.apply(&Matrix2::x(), 0, 0);
         state.apply(&Matrix2::x(), 2, (1 << 0) | (1 << 1));
@@ -265,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn measurement_collapses_and_renormalises() {
+    fn collapses() {
         let mut state = State::new(2);
         state.apply(&Matrix2::h(), 0, 0);
         state.apply(&Matrix2::x(), 1, 1 << 0);
@@ -277,11 +293,11 @@ mod tests {
         assert!((state.qubit_probability(1) - if outcome { 1.0 } else { 0.0 }).abs() < 1e-12);
 
         let second = state.measure(1, &mut rng);
-        assert_eq!(second, outcome, "a bell pair must agree on both halves");
+        assert_eq!(second, outcome);
     }
 
     #[test]
-    fn measurement_statistics_match_the_amplitudes() {
+    fn measurement_statistics() {
         let mut rng = Rng::new(7);
         let mut ones = 0;
         let trials = 4000;
@@ -303,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_always_returns_the_qubit_to_zero() {
+    fn resets() {
         let mut rng = Rng::new(99);
         for _ in 0..50 {
             let mut state = State::new(2);
@@ -316,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn controlled_swap_respects_its_control() {
+    fn controlled_swap() {
         let mut state = State::new(3);
         state.apply(&Matrix2::x(), 0, 0);
         state.swap(0, 1, 1 << 2);

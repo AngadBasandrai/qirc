@@ -71,10 +71,6 @@ impl Token {
     pub fn text<'a>(&self, src: &'a str) -> &'a str {
         &src[self.span.range()]
     }
-
-    pub fn is(&self, kind: TokenKind) -> bool {
-        self.kind == kind
-    }
 }
 
 pub fn tokenize(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
@@ -561,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_comments_and_whitespace() {
+    fn comments() {
         assert_eq!(kinds("; a comment\n  ; another\n"), Vec::<TokenKind>::new());
         assert_eq!(
             kinds("ret ; trailing\nvoid"),
@@ -570,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn lexes_sigil_names() {
+    fn sigils() {
         assert_eq!(
             kinds("%q0 @main !0 #1"),
             vec![
@@ -584,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn lexes_quoted_names() {
+    fn quoted_names() {
         let src = r#"%"quoted type" @"quoted fn name""#;
         assert_eq!(
             kinds(src),
@@ -595,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn distinguishes_bang_from_metadata_ident() {
+    fn bang_vs_metadata() {
         assert_eq!(
             kinds("!llvm.module.flags = !{!0}"),
             vec![
@@ -627,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn lexes_numbers() {
+    fn numbers() {
         assert_eq!(
             kinds("0 42 -1 1.5 1.000000e+00 -5.000000e-01 0x400921FB54442D18"),
             vec![
@@ -643,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn hex_float_is_the_exact_double() {
+    fn hex_float() {
         let pi = parse_float("0x400921FB54442D18").unwrap();
         assert!((pi - std::f64::consts::PI).abs() < 1e-15);
         assert_eq!(parse_float("1.000000e+00"), Some(1.0));
@@ -652,19 +648,19 @@ mod tests {
     }
 
     #[test]
-    fn array_type_keeps_x_as_an_identifier() {
+    fn array_type_x() {
         assert_eq!(texts("[4 x i8]"), vec!["[", "4", "x", "i8", "]"]);
     }
 
     #[test]
-    fn lexes_c_strings_with_escapes() {
+    fn c_string_escapes() {
         let src = r#"c"ab\0A\00""#;
         assert_eq!(kinds(src), vec![TokenKind::CStringLit]);
         assert_eq!(decode_cstring(src), vec![b'a', b'b', 0x0A, 0x00]);
     }
 
     #[test]
-    fn ellipsis_is_one_token() {
+    fn ellipsis() {
         assert_eq!(
             kinds("(i64, ...)"),
             vec![
@@ -678,14 +674,14 @@ mod tests {
     }
 
     #[test]
-    fn reports_unterminated_string() {
+    fn unterminated_string() {
         let (_, errors) = tokenize("@g = constant [2 x i8] c\"ab");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].code, Some("QIR0003"));
     }
 
     #[test]
-    fn spans_are_exact() {
+    fn spans() {
         let src = "call void @__quantum__qis__h__body(%Qubit* null)";
         let (tokens, _) = tokenize(src);
         let global = tokens
@@ -697,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn block_comments_are_trivia() {
+    fn block_comments() {
         assert_eq!(
             kinds("ret /* skipped */ void"),
             vec![TokenKind::Ident, TokenKind::Ident]
@@ -712,14 +708,14 @@ line */ ret"
     }
 
     #[test]
-    fn decimal_floats_require_a_point() {
+    fn float_needs_point() {
         assert_eq!(kinds("1e10"), vec![TokenKind::IntLit, TokenKind::Ident]);
         assert_eq!(kinds("1.0e10"), vec![TokenKind::FloatLit]);
         assert_eq!(texts("1e10"), vec!["1", "e10"]);
     }
 
     #[test]
-    fn identifiers_may_contain_dashes() {
+    fn dashed_idents() {
         assert_eq!(kinds("-foo :"), vec![TokenKind::Ident, TokenKind::Colon]);
         assert_eq!(texts("frame-pointer"), vec!["frame-pointer"]);
         assert_eq!(kinds("i32 -1"), vec![TokenKind::Ident, TokenKind::IntLit]);
@@ -727,12 +723,12 @@ line */ ret"
     }
 
     #[test]
-    fn c_string_allows_space_before_quote() {
+    fn c_string_space() {
         assert_eq!(kinds("c \"ab\""), vec![TokenKind::CStringLit]);
     }
 
     #[test]
-    fn semicolons_inside_strings_are_data() {
+    fn semicolon_in_string() {
         let src = "@s = constant [4 x i8] c\";x\\00\"";
         let toks = texts(src);
         assert!(toks.iter().any(|t| t.contains(';')), "got {toks:?}");
@@ -762,7 +758,7 @@ line */ ret"
     ];
 
     #[test]
-    fn lexes_the_whole_corpus_without_errors() {
+    fn corpus() {
         for (name, src) in CORPUS {
             let (tokens, errors) = tokenize(src);
             assert!(errors.is_empty(), "{name} produced lex errors: {errors:#?}");
@@ -779,7 +775,7 @@ line */ ret"
     }
 
     #[test]
-    fn every_corpus_token_round_trips_to_source() {
+    fn corpus_spans() {
         for (name, src) in CORPUS {
             let (tokens, _) = tokenize(src);
             for token in tokens.iter().filter(|t| t.kind != TokenKind::Eof) {

@@ -35,7 +35,7 @@ fn compile(name: &str, src: &str) -> Program {
 }
 
 #[test]
-fn bell_lowers_to_two_gates_and_two_measurements() {
+fn bell() {
     let program = compile("bell", BELL);
 
     assert_eq!(program.profile, Profile::Base);
@@ -57,7 +57,7 @@ fn bell_lowers_to_two_gates_and_two_measurements() {
 }
 
 #[test]
-fn bell_records_its_outputs() {
+fn bell_outputs() {
     let program = compile("bell", BELL);
 
     let records: Vec<(&OutputKind, Option<ResultId>)> = program
@@ -76,7 +76,7 @@ fn bell_records_its_outputs() {
 }
 
 #[test]
-fn teleport_keeps_its_control_flow() {
+fn teleport_cfg() {
     let program = compile("teleport", TELEPORT);
 
     assert_eq!(program.profile, Profile::Adaptive);
@@ -107,7 +107,7 @@ fn teleport_keeps_its_control_flow() {
 }
 
 #[test]
-fn teleport_carries_its_rotation_angle() {
+fn teleport_angle() {
     let program = compile("teleport", TELEPORT);
 
     let ry = program
@@ -119,7 +119,7 @@ fn teleport_carries_its_rotation_angle() {
 }
 
 #[test]
-fn pyqir_null_becomes_qubit_zero_and_ccx_gets_two_controls() {
+fn pyqir() {
     let program = compile("pyqir", PYQIR);
 
     assert_eq!(program.num_qubits, 3);
@@ -138,18 +138,15 @@ fn pyqir_null_becomes_qubit_zero_and_ccx_gets_two_controls() {
 }
 
 #[test]
-fn adjoint_suffix_selects_the_dagger_gate() {
+fn adjoint_suffix() {
     let program = compile("pyqir", PYQIR);
 
     assert!(program.gates().any(|g| g.kind == GateKind::S));
-    assert!(
-        program.gates().any(|g| g.kind == GateKind::TDag),
-        "t__adj should lower to tdg"
-    );
+    assert!(program.gates().any(|g| g.kind == GateKind::TDag));
 }
 
 #[test]
-fn swap_lowers_to_two_targets() {
+fn swap() {
     let program = compile("pyqir", PYQIR);
 
     let swap = program
@@ -161,7 +158,7 @@ fn swap_lowers_to_two_targets() {
 }
 
 #[test]
-fn helper_functions_are_inlined() {
+fn inlining() {
     let (module, errors) = parse_module(DYNAMIC);
     assert!(errors.is_empty());
     let lowered = lower(&module);
@@ -172,30 +169,32 @@ fn helper_functions_are_inlined() {
         .filter(|g| g.kind == GateKind::Rz)
         .collect();
 
-    assert!(
-        !rz_gates.is_empty(),
-        "the Rotate helper should have been inlined into an rz"
-    );
+    assert!(!rz_gates.is_empty());
 }
 
 #[test]
-fn loop_dependent_qubit_index_is_rejected_clearly() {
-    let (module, errors) = parse_module(DYNAMIC);
-    assert!(errors.is_empty());
-    let lowered = lower(&module);
+fn dynamic_index() {
+    let program = compile("dynamic", DYNAMIC);
 
-    let message = lowered
-        .diagnostics
-        .iter()
-        .find(|d| d.message.contains("compile time constant"))
-        .expect("a diagnostic about non constant qubit indexing");
+    assert!(program.is_straight_line());
+    assert_eq!(program.num_qubits, 5);
 
-    assert_eq!(message.severity, qirc::diag::Severity::Error);
-    assert!(message.primary_span().is_some());
+    let cx: Vec<(QubitId, QubitId)> = program
+        .gates()
+        .filter(|g| g.kind == GateKind::X && g.controls.len() == 1)
+        .map(|g| (g.controls[0], g.targets[0]))
+        .collect();
+    assert_eq!(cx.len(), 4);
+    assert!(cx.iter().all(|(control, _)| *control == cx[0].0));
+
+    let mut targets: Vec<u32> = cx.iter().map(|(_, t)| t.0).collect();
+    targets.sort();
+    targets.dedup();
+    assert_eq!(targets.len(), 4);
 }
 
 #[test]
-fn qubit_parameters_are_allocated_in_order() {
+fn qubit_params() {
     let src = "\
 define void @main(%Qubit* %q0, %Qubit* %q1) {
 entry:
@@ -216,7 +215,7 @@ declare void @__quantum__qis__cnot(%Qubit*, %Qubit*)
 }
 
 #[test]
-fn program_depth_accounts_for_shared_wires() {
+fn depth() {
     let program = compile("bell", BELL);
     assert_eq!(program.depth(), 2);
 
@@ -225,7 +224,7 @@ fn program_depth_accounts_for_shared_wires() {
 }
 
 #[test]
-fn ir_display_is_readable() {
+fn display() {
     let program = compile("bell", BELL);
     let text = format!("{program}");
 

@@ -105,6 +105,14 @@ impl<'a> Parser<'a> {
         self.text(self.peek())
     }
 
+    fn prev_span(&self) -> Span {
+        self.tokens[self.pos.saturating_sub(1)].span
+    }
+
+    fn name(&self, token: Token) -> String {
+        lex::decode_name(self.text(token)).into_owned()
+    }
+
     fn at_eof(&self) -> bool {
         self.peek().kind == TokenKind::Eof
     }
@@ -223,7 +231,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     self.eat(TokenKind::Equal);
                     if let Some(t) = self.expect(TokenKind::StringLit) {
-                        module.source_filename = Some(lex::decode_name(self.text(t)).into_owned());
+                        module.source_filename = Some(self.name(t));
                     }
                 }
                 "target" => {
@@ -232,7 +240,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     self.eat(TokenKind::Equal);
                     if let Some(t) = self.expect(TokenKind::StringLit) {
-                        let value = lex::decode_name(self.text(t)).into_owned();
+                        let value = self.name(t);
                         if which == "triple" {
                             module.triple = Some(value);
                         } else {
@@ -274,7 +282,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::MetadataIdent => {
                 let name_token = self.peek();
-                let name = lex::decode_name(self.text(name_token)).into_owned();
+                let name = self.name(name_token);
 
                 if name.bytes().all(|b| b.is_ascii_digit()) && !name.is_empty() {
                     if let Some(def) = self.parse_metadata_def() {
@@ -291,7 +299,7 @@ impl<'a> Parser<'a> {
     fn parse_type_def(&mut self) -> Option<TypeDef> {
         let start = self.peek().span;
         let name_token = self.expect(TokenKind::LocalIdent)?;
-        let name = lex::decode_name(self.text(name_token)).into_owned();
+        let name = self.name(name_token);
         self.expect(TokenKind::Equal)?;
         self.eat_keyword("type");
         let ty = self.parse_type()?;
@@ -299,14 +307,14 @@ impl<'a> Parser<'a> {
         Some(TypeDef {
             name,
             ty,
-            span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+            span: start.to(self.prev_span()),
         })
     }
 
     fn parse_global(&mut self) -> Option<GlobalVar> {
         let start = self.peek().span;
         let name_token = self.expect(TokenKind::GlobalIdent)?;
-        let name = lex::decode_name(self.text(name_token)).into_owned();
+        let name = self.name(name_token);
         self.expect(TokenKind::Equal)?;
 
         let mut linkage = Vec::new();
@@ -355,7 +363,7 @@ impl<'a> Parser<'a> {
             initializer,
             is_constant,
             linkage,
-            span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+            span: start.to(self.prev_span()),
         })
     }
 
@@ -363,7 +371,7 @@ impl<'a> Parser<'a> {
         let start = self.peek().span;
         self.eat_keyword("attributes");
         let id_token = self.expect(TokenKind::AttrGroupId)?;
-        let id = lex::decode_name(self.text(id_token)).into_owned();
+        let id = self.name(id_token);
         self.expect(TokenKind::Equal)?;
         self.expect(TokenKind::LBrace)?;
 
@@ -376,7 +384,7 @@ impl<'a> Parser<'a> {
         Some(AttrGroup {
             id,
             attrs,
-            span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+            span: start.to(self.prev_span()),
         })
     }
 
@@ -393,7 +401,7 @@ impl<'a> Parser<'a> {
         if self.at(TokenKind::LParen) {
             let open = self.pos;
             self.skip_balanced(TokenKind::LParen, TokenKind::RParen);
-            let close = self.tokens[self.pos.saturating_sub(1)].span;
+            let close = self.prev_span();
             let inner = &self.src[self.tokens[open].span.end as usize..close.start as usize];
             return Attribute::KeyValue(key, inner.trim().to_string());
         }
@@ -415,7 +423,7 @@ impl<'a> Parser<'a> {
     fn parse_named_metadata(&mut self) -> Option<NamedMetadata> {
         let start = self.peek().span;
         let name_token = self.expect(TokenKind::MetadataIdent)?;
-        let name = lex::decode_name(self.text(name_token)).into_owned();
+        let name = self.name(name_token);
         self.expect(TokenKind::Equal)?;
         self.expect(TokenKind::Bang)?;
         self.expect(TokenKind::LBrace)?;
@@ -424,7 +432,7 @@ impl<'a> Parser<'a> {
         while !self.at(TokenKind::RBrace) && !self.at_eof() {
             if self.at(TokenKind::MetadataIdent) {
                 let token = self.bump();
-                operands.push(lex::decode_name(self.text(token)).into_owned());
+                operands.push(self.name(token));
             } else {
                 self.bump();
             }
@@ -435,14 +443,14 @@ impl<'a> Parser<'a> {
         Some(NamedMetadata {
             name,
             operands,
-            span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+            span: start.to(self.prev_span()),
         })
     }
 
     fn parse_metadata_def(&mut self) -> Option<MetadataDef> {
         let start = self.peek().span;
         let id_token = self.expect(TokenKind::MetadataIdent)?;
-        let id = lex::decode_name(self.text(id_token)).into_owned();
+        let id = self.name(id_token);
         self.expect(TokenKind::Equal)?;
 
         let distinct = self.eat_keyword("distinct");
@@ -462,7 +470,7 @@ impl<'a> Parser<'a> {
                 id,
                 distinct,
                 node: MetadataNode::Specialized { kind, body },
-                span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+                span: start.to(self.prev_span()),
             });
         }
 
@@ -480,7 +488,7 @@ impl<'a> Parser<'a> {
             id,
             distinct,
             node: MetadataNode::Tuple(items),
-            span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+            span: start.to(self.prev_span()),
         })
     }
 
@@ -525,7 +533,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn skip_leading_modifiers(&mut self) {
+    fn skip_modifiers(&mut self) {
         loop {
             match self.peek().kind {
                 TokenKind::Ident => {
@@ -551,11 +559,11 @@ impl<'a> Parser<'a> {
 
     fn parse_signature(&mut self) -> Option<FuncSig> {
         let start = self.peek().span;
-        self.skip_leading_modifiers();
+        self.skip_modifiers();
 
         let ret_ty = self.parse_type()?;
         let name_token = self.expect(TokenKind::GlobalIdent)?;
-        let name = lex::decode_name(self.text(name_token)).into_owned();
+        let name = self.name(name_token);
 
         self.expect(TokenKind::LParen)?;
 
@@ -576,7 +584,7 @@ impl<'a> Parser<'a> {
 
             let param_name = if self.at(TokenKind::LocalIdent) {
                 let token = self.bump();
-                Some(lex::decode_name(self.text(token)).into_owned())
+                Some(self.name(token))
             } else {
                 None
             };
@@ -585,7 +593,7 @@ impl<'a> Parser<'a> {
                 ty,
                 name: param_name,
                 attrs,
-                span: param_start.to(self.tokens[self.pos.saturating_sub(1)].span),
+                span: param_start.to(self.prev_span()),
             });
 
             if !self.eat(TokenKind::Comma) {
@@ -600,7 +608,7 @@ impl<'a> Parser<'a> {
         while !self.at_eof() && !self.at(TokenKind::LBrace) && !self.starts_new_line(self.pos) {
             if self.at(TokenKind::AttrGroupId) {
                 let token = self.bump();
-                attr_groups.push(lex::decode_name(self.text(token)).into_owned());
+                attr_groups.push(self.name(token));
                 continue;
             }
             if self.at(TokenKind::Ident) || self.at(TokenKind::StringLit) {
@@ -617,7 +625,7 @@ impl<'a> Parser<'a> {
             varargs,
             attr_groups,
             attrs,
-            span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+            span: start.to(self.prev_span()),
         })
     }
 
@@ -662,7 +670,7 @@ impl<'a> Parser<'a> {
 
         for param in &sig.params {
             if let Some(name) = &param.name {
-                self.observe_numbered_name(name);
+                self.note_number(name);
             } else {
                 self.next_unnamed += 1;
             }
@@ -685,11 +693,11 @@ impl<'a> Parser<'a> {
         Some(Function {
             sig,
             blocks,
-            span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+            span: start.to(self.prev_span()),
         })
     }
 
-    fn observe_numbered_name(&mut self, name: &str) {
+    fn note_number(&mut self, name: &str) {
         if let Ok(n) = name.parse::<u32>() {
             self.next_unnamed = self.next_unnamed.max(n + 1);
         }
@@ -714,7 +722,7 @@ impl<'a> Parser<'a> {
             let token = self.bump();
             self.bump();
             let name = self.text(token).to_string();
-            self.observe_numbered_name(&name);
+            self.note_number(&name);
             name
         } else {
             let name = self.next_unnamed.to_string();
@@ -744,7 +752,7 @@ impl<'a> Parser<'a> {
             label,
             instructions,
             terminator: terminator.unwrap_or(Terminator::Unreachable),
-            span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+            span: start.to(self.prev_span()),
         })
     }
 
@@ -767,7 +775,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     let token = self.expect(TokenKind::LocalIdent)?;
                     Terminator::Br {
-                        target: lex::decode_name(self.text(token)).into_owned(),
+                        target: self.name(token),
                     }
                 } else {
                     let cond = self.parse_typed_value()?;
@@ -779,8 +787,8 @@ impl<'a> Parser<'a> {
                     let else_token = self.expect(TokenKind::LocalIdent)?;
                     Terminator::CondBr {
                         cond,
-                        if_true: lex::decode_name(self.text(then_token)).into_owned(),
-                        if_false: lex::decode_name(self.text(else_token)).into_owned(),
+                        if_true: self.name(then_token),
+                        if_false: self.name(else_token),
                     }
                 }
             }
@@ -789,7 +797,7 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::Comma)?;
                 self.eat_keyword("label");
                 let default_token = self.expect(TokenKind::LocalIdent)?;
-                let default = lex::decode_name(self.text(default_token)).into_owned();
+                let default = self.name(default_token);
 
                 self.expect(TokenKind::LBracket)?;
                 let mut cases = Vec::new();
@@ -800,7 +808,7 @@ impl<'a> Parser<'a> {
                     self.expect(TokenKind::Comma)?;
                     self.eat_keyword("label");
                     let target = self.expect(TokenKind::LocalIdent)?;
-                    cases.push((value, lex::decode_name(self.text(target)).into_owned()));
+                    cases.push((value, self.name(target)));
                     self.eat(TokenKind::Comma);
                 }
                 self.eat(TokenKind::RBracket);
@@ -817,11 +825,11 @@ impl<'a> Parser<'a> {
             }
         };
 
-        self.consume_trailing_metadata();
+        self.skip_metadata();
         Some(term)
     }
 
-    fn consume_trailing_metadata(&mut self) {
+    fn skip_metadata(&mut self) {
         while self.at(TokenKind::Comma) && self.peek_at(1).kind == TokenKind::MetadataIdent {
             self.bump();
             self.bump();
@@ -834,7 +842,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn consume_trailing_suffixes(&mut self) {
+    fn skip_suffixes(&mut self) {
         loop {
             if self.at(TokenKind::Comma) && self.text(self.peek_at(1)) == "align" {
                 self.bump();
@@ -843,7 +851,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.at(TokenKind::Comma) && self.peek_at(1).kind == TokenKind::MetadataIdent {
-                self.consume_trailing_metadata();
+                self.skip_metadata();
                 continue;
             }
             break;
@@ -856,20 +864,20 @@ impl<'a> Parser<'a> {
         let result = if self.at(TokenKind::LocalIdent) && self.peek_at(1).kind == TokenKind::Equal {
             let token = self.bump();
             self.bump();
-            let name = lex::decode_name(self.text(token)).into_owned();
-            self.observe_numbered_name(&name);
+            let name = self.name(token);
+            self.note_number(&name);
             Some(name)
         } else {
             None
         };
 
         let kind = self.parse_inst_kind()?;
-        self.consume_trailing_suffixes();
+        self.skip_suffixes();
 
         Some(Instruction {
             result,
             kind,
-            span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+            span: start.to(self.prev_span()),
         })
     }
 
@@ -889,13 +897,13 @@ impl<'a> Parser<'a> {
 
         if matches!(opcode.as_str(), "tail" | "musttail" | "notail") {
             self.bump();
-            return self.parse_inst_kind_tail(true);
+            return self.parse_opcode(true);
         }
 
-        self.parse_inst_kind_tail(false)
+        self.parse_opcode(false)
     }
 
-    fn parse_inst_kind_tail(&mut self, tail: bool) -> Option<InstKind> {
+    fn parse_opcode(&mut self, tail: bool) -> Option<InstKind> {
         let opcode = self.cur_text().to_string();
         let opcode_span = self.peek().span;
 
@@ -975,7 +983,7 @@ impl<'a> Parser<'a> {
                     let value = self.parse_value()?;
                     self.expect(TokenKind::Comma)?;
                     let label_token = self.expect(TokenKind::LocalIdent)?;
-                    incoming.push((value, lex::decode_name(self.text(label_token)).into_owned()));
+                    incoming.push((value, self.name(label_token)));
                     self.expect(TokenKind::RBracket)?;
                     if !self.eat(TokenKind::Comma) {
                         break;
@@ -1113,7 +1121,7 @@ impl<'a> Parser<'a> {
                 ty,
                 attrs,
                 value,
-                span: arg_start.to(self.tokens[self.pos.saturating_sub(1)].span),
+                span: arg_start.to(self.prev_span()),
             });
             if !self.eat(TokenKind::Comma) {
                 break;
@@ -1124,7 +1132,7 @@ impl<'a> Parser<'a> {
         let mut attr_groups = Vec::new();
         while self.at(TokenKind::AttrGroupId) {
             let token = self.bump();
-            attr_groups.push(lex::decode_name(self.text(token)).into_owned());
+            attr_groups.push(self.name(token));
         }
 
         Some(Call {
@@ -1134,7 +1142,7 @@ impl<'a> Parser<'a> {
             callee,
             args,
             attr_groups,
-            span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+            span: start.to(self.prev_span()),
         })
     }
 
@@ -1172,7 +1180,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LocalIdent => {
                 self.bump();
-                Ty::Named(lex::decode_name(self.text(token)).into_owned())
+                Ty::Named(self.name(token))
             }
             TokenKind::LBracket => {
                 self.bump();
@@ -1294,7 +1302,7 @@ impl<'a> Parser<'a> {
         Some(TypedValue {
             ty,
             value,
-            span: start.to(self.tokens[self.pos.saturating_sub(1)].span),
+            span: start.to(self.prev_span()),
         })
     }
 
@@ -1304,15 +1312,11 @@ impl<'a> Parser<'a> {
         match token.kind {
             TokenKind::LocalIdent => {
                 self.bump();
-                Some(Value::Local(
-                    lex::decode_name(self.text(token)).into_owned(),
-                ))
+                Some(Value::Local(self.name(token)))
             }
             TokenKind::GlobalIdent => {
                 self.bump();
-                Some(Value::Global(
-                    lex::decode_name(self.text(token)).into_owned(),
-                ))
+                Some(Value::Global(self.name(token)))
             }
             TokenKind::IntLit => {
                 self.bump();
@@ -1330,9 +1334,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::StringLit => {
                 self.bump();
-                Some(Value::MetadataString(
-                    lex::decode_name(self.text(token)).into_owned(),
-                ))
+                Some(Value::MetadataString(self.name(token)))
             }
             TokenKind::MetadataIdent => {
                 self.bump();
