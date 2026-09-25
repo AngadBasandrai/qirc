@@ -1,10 +1,14 @@
 use num_complex::Complex;
+use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, FRAC_PI_4};
 
 use crate::ir::{self, GateKind};
 
 pub type C64 = Complex<f64>;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+const ZERO: C64 = C64::new(0.0, 0.0);
+const ONE: C64 = C64::new(1.0, 0.0);
+
+#[derive(Clone, Copy, Debug)]
 pub struct Matrix2 {
     pub a: C64,
     pub b: C64,
@@ -18,43 +22,23 @@ impl Matrix2 {
     }
 
     pub fn identity() -> Self {
-        Self::new(
-            C64::new(1.0, 0.0),
-            C64::new(0.0, 0.0),
-            C64::new(0.0, 0.0),
-            C64::new(1.0, 0.0),
-        )
+        Self::new(ONE, ZERO, ZERO, ONE)
     }
 
     pub fn x() -> Self {
-        Self::new(
-            C64::new(0.0, 0.0),
-            C64::new(1.0, 0.0),
-            C64::new(1.0, 0.0),
-            C64::new(0.0, 0.0),
-        )
+        Self::new(ZERO, ONE, ONE, ZERO)
     }
 
     pub fn y() -> Self {
-        Self::new(
-            C64::new(0.0, 0.0),
-            C64::new(0.0, -1.0),
-            C64::new(0.0, 1.0),
-            C64::new(0.0, 0.0),
-        )
+        Self::new(ZERO, C64::new(0.0, -1.0), C64::new(0.0, 1.0), ZERO)
     }
 
     pub fn z() -> Self {
-        Self::new(
-            C64::new(1.0, 0.0),
-            C64::new(0.0, 0.0),
-            C64::new(0.0, 0.0),
-            C64::new(-1.0, 0.0),
-        )
+        Self::new(ONE, ZERO, ZERO, C64::new(-1.0, 0.0))
     }
 
     pub fn h() -> Self {
-        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let s = FRAC_1_SQRT_2;
         Self::new(
             C64::new(s, 0.0),
             C64::new(s, 0.0),
@@ -65,28 +49,23 @@ impl Matrix2 {
 
     pub fn phase(angle: f64) -> Self {
         let (sin, cos) = angle.sin_cos();
-        Self::new(
-            C64::new(1.0, 0.0),
-            C64::new(0.0, 0.0),
-            C64::new(0.0, 0.0),
-            C64::new(cos, sin),
-        )
+        Self::new(ONE, ZERO, ZERO, C64::new(cos, sin))
     }
 
     pub fn s() -> Self {
-        Self::phase(std::f64::consts::FRAC_PI_2)
+        Self::phase(FRAC_PI_2)
     }
 
     pub fn s_dagger() -> Self {
-        Self::phase(-std::f64::consts::FRAC_PI_2)
+        Self::phase(-FRAC_PI_2)
     }
 
     pub fn t() -> Self {
-        Self::phase(std::f64::consts::FRAC_PI_4)
+        Self::phase(FRAC_PI_4)
     }
 
     pub fn t_dagger() -> Self {
-        Self::phase(-std::f64::consts::FRAC_PI_4)
+        Self::phase(-FRAC_PI_4)
     }
 
     pub fn sx() -> Self {
@@ -124,12 +103,7 @@ impl Matrix2 {
 
     pub fn rz(theta: f64) -> Self {
         let (sin, cos) = (theta / 2.0).sin_cos();
-        Self::new(
-            C64::new(cos, -sin),
-            C64::new(0.0, 0.0),
-            C64::new(0.0, 0.0),
-            C64::new(cos, sin),
-        )
+        Self::new(C64::new(cos, -sin), ZERO, ZERO, C64::new(cos, sin))
     }
 
     pub fn multiply(self, rhs: Matrix2) -> Matrix2 {

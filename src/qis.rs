@@ -1,6 +1,6 @@
-use crate::ir::GateKind;
+use crate::ir::{GateKind, OutputKind};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Functor {
     Body,
     Adjoint,
@@ -9,15 +9,6 @@ pub enum Functor {
 }
 
 impl Functor {
-    pub fn from_suffix(suffix: &str) -> Functor {
-        match suffix {
-            "adj" => Functor::Adjoint,
-            "ctl" => Functor::Controlled,
-            "ctladj" => Functor::ControlledAdjoint,
-            _ => Functor::Body,
-        }
-    }
-
     pub fn is_adjoint(self) -> bool {
         matches!(self, Functor::Adjoint | Functor::ControlledAdjoint)
     }
@@ -35,12 +26,13 @@ pub enum Intrinsic {
         targets: usize,
         params: usize,
     },
+    Ising(GateKind),
     Measure {
-        with_result_arg: bool,
+        reset: bool,
     },
     Reset,
     ReadResult,
-    RecordOutput(crate::ir::OutputKind),
+    RecordOutput(OutputKind),
     QubitAllocate,
     QubitAllocateArray,
     QubitRelease,
@@ -54,26 +46,24 @@ pub enum Intrinsic {
     Ignored,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Resolved {
     pub intrinsic: Intrinsic,
     pub functor: Functor,
 }
 
-pub fn split_mangled(name: &str) -> Option<(&str, &str, Functor)> {
+fn split_mangled(name: &str) -> Option<(&str, &str, Functor)> {
     let rest = name.strip_prefix("__quantum__")?;
     let (namespace, tail) = rest.split_once("__")?;
 
-    let mut functor = Functor::Body;
-    let mut base = tail;
-
-    for suffix in ["__ctladj", "__ctl", "__adj", "__body"] {
-        if let Some(stripped) = tail.strip_suffix(suffix) {
-            functor = Functor::from_suffix(&suffix[2..]);
-            base = stripped;
-            break;
-        }
-    }
+    let (base, functor) = [
+        ("__ctladj", Functor::ControlledAdjoint),
+        ("__ctl", Functor::Controlled),
+        ("__adj", Functor::Adjoint),
+        ("__body", Functor::Body),
+    ]
+    .into_iter()
+    .find_map(|(s, f)| Some((tail.strip_suffix(s)?, f)))
+    .unwrap_or((tail, Functor::Body));
 
     Some((namespace, base, functor))
 }
@@ -130,24 +120,21 @@ fn resolve_qis(base: &str) -> Option<Intrinsic> {
         "crz" => gate(GateKind::Rz, 1, 1, 1),
         "cr1" | "cp" => gate(GateKind::R1, 1, 1, 1),
 
-        "rxx" | "ryy" | "rzz" => return None,
+        "rxx" => Intrinsic::Ising(GateKind::Rx),
+        "ryy" => Intrinsic::Ising(GateKind::Ry),
+        "rzz" => Intrinsic::Ising(GateKind::Rz),
 
-        "m" | "measure" => Intrinsic::Measure {
-            with_result_arg: false,
-        },
-        "mz" | "mresz" => Intrinsic::Measure {
-            with_result_arg: true,
-        },
+        "m" | "mz" | "measure" => Intrinsic::Measure { reset: false },
+        "mresetz" => Intrinsic::Measure { reset: true },
         "reset" => Intrinsic::Reset,
         "read_result" => Intrinsic::ReadResult,
+        "barrier" => Intrinsic::Ignored,
 
         _ => return None,
     })
 }
 
 fn resolve_rt(base: &str) -> Option<Intrinsic> {
-    use crate::ir::OutputKind;
-
     Some(match base {
         "result_record_output" => Intrinsic::RecordOutput(OutputKind::Result),
         "bool_record_output" => Intrinsic::RecordOutput(OutputKind::Bool),
@@ -159,7 +146,8 @@ fn resolve_rt(base: &str) -> Option<Intrinsic> {
         "array_record_output" | "array_start_record_output" => {
             Intrinsic::RecordOutput(OutputKind::Array)
         }
-        "tuple_end_record_output" | "array_end_record_output" => Intrinsic::Ignored,
+        "tuple_end_record_output" => Intrinsic::RecordOutput(OutputKind::TupleEnd),
+        "array_end_record_output" => Intrinsic::RecordOutput(OutputKind::ArrayEnd),
 
         "qubit_allocate" => Intrinsic::QubitAllocate,
         "qubit_allocate_array" => Intrinsic::QubitAllocateArray,
@@ -167,6 +155,7 @@ fn resolve_rt(base: &str) -> Option<Intrinsic> {
         "qubit_release_array" => Intrinsic::QubitReleaseArray,
         "array_get_element_ptr_1d" => Intrinsic::ArrayGetElementPtr,
 
+        "read_result" => Intrinsic::ReadResult,
         "result_get_zero" => Intrinsic::ResultGetZero,
         "result_get_one" => Intrinsic::ResultGetOne,
         "result_equal" => Intrinsic::ResultEqual,
@@ -235,52 +224,38 @@ mod tests {
     #[test]
     fn controlled_aliases() {
         let cnot = resolve("__quantum__qis__cnot__body").unwrap();
-        assert_eq!(
-            cnot.intrinsic,
-            Intrinsic::Gate {
-                kind: GateKind::X,
-                controls: 1,
-                targets: 1,
-                params: 0
-            }
-        );
+        assert_eq!(cnot.intrinsic, gate(GateKind::X, 1, 1, 0));
 
         let ccx = resolve("__quantum__qis__ccx__body").unwrap();
-        assert_eq!(
-            ccx.intrinsic,
-            Intrinsic::Gate {
-                kind: GateKind::X,
-                controls: 2,
-                targets: 1,
-                params: 0
-            }
-        );
+        assert_eq!(ccx.intrinsic, gate(GateKind::X, 2, 1, 0));
 
         let crz = resolve("__quantum__qis__crz__body").unwrap();
-        assert_eq!(
-            crz.intrinsic,
-            Intrinsic::Gate {
-                kind: GateKind::Rz,
-                controls: 1,
-                targets: 1,
-                params: 1
-            }
-        );
+        assert_eq!(crz.intrinsic, gate(GateKind::Rz, 1, 1, 1));
     }
 
     #[test]
     fn measure_variants() {
+        let plain = Intrinsic::Measure { reset: false };
         assert_eq!(
             resolve("__quantum__qis__mz__body").unwrap().intrinsic,
-            Intrinsic::Measure {
-                with_result_arg: true
-            }
+            plain
+        );
+        assert_eq!(resolve("__quantum__qis__m__body").unwrap().intrinsic, plain);
+        assert_eq!(
+            resolve("__quantum__qis__mresetz__body").unwrap().intrinsic,
+            Intrinsic::Measure { reset: true }
+        );
+    }
+
+    #[test]
+    fn qsharp_names() {
+        assert_eq!(
+            resolve("__quantum__rt__read_result").unwrap().intrinsic,
+            Intrinsic::ReadResult
         );
         assert_eq!(
-            resolve("__quantum__qis__m__body").unwrap().intrinsic,
-            Intrinsic::Measure {
-                with_result_arg: false
-            }
+            resolve("__quantum__qis__rzz__body").unwrap().intrinsic,
+            Intrinsic::Ising(GateKind::Rz)
         );
     }
 
@@ -305,14 +280,5 @@ mod tests {
         assert!(resolve("__quantum__qis__nope__body").is_none());
         assert!(resolve("@printf").is_none());
         assert!(resolve("Program__Rotate__body").is_none());
-    }
-
-    #[test]
-    fn adjoints() {
-        assert_eq!(GateKind::S.adjoint(), Some(GateKind::SDag));
-        assert_eq!(GateKind::SDag.adjoint(), Some(GateKind::S));
-        assert_eq!(GateKind::T.adjoint(), Some(GateKind::TDag));
-        assert_eq!(GateKind::H.adjoint(), Some(GateKind::H));
-        assert_eq!(GateKind::Rz.adjoint(), None);
     }
 }

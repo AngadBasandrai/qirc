@@ -1,3 +1,5 @@
+use std::f64::consts::{FRAC_PI_4, PI};
+
 use qirc::ast::*;
 use qirc::diag::SourceFile;
 use qirc::parse::parse_module;
@@ -95,8 +97,9 @@ fn inttoptr_qubit() {
     let module = parse_clean("bell", BELL);
     let main = module.entry_point().unwrap();
 
-    let InstKind::Call(call) = &main.blocks[0].instructions[0].kind else {
-        panic!("first instruction should be a call");
+    let inst = &main.blocks[0].instructions[0];
+    let InstKind::Call(call) = &inst.kind else {
+        panic!("{inst:?}");
     };
     assert_eq!(call.callee_name(), Some("__quantum__qis__h__body"));
     assert_eq!(call.args.len(), 1);
@@ -147,7 +150,7 @@ fn teleport() {
         if_true, if_false, ..
     } = &main.blocks[0].terminator
     else {
-        panic!("entry should end in a conditional branch");
+        panic!("{:?}", main.blocks[0].terminator);
     };
     assert_eq!(if_true, "then_x");
     assert_eq!(if_false, "join_x");
@@ -186,7 +189,7 @@ fn rotation_angle() {
     let Value::Float(theta) = call.args[0].value else {
         panic!("expected a float angle");
     };
-    assert!((theta - std::f64::consts::FRAC_PI_4).abs() < 1e-15);
+    assert!((theta - FRAC_PI_4).abs() < 1e-15);
 }
 
 #[test]
@@ -199,27 +202,23 @@ fn pyqir() {
     };
     assert_eq!(first.args[0].value, Value::Null);
 
-    let rz = main.blocks[0]
-        .instructions
-        .iter()
-        .find_map(|i| match &i.kind {
-            InstKind::Call(c) if c.callee_name() == Some("__quantum__qis__rz__body") => Some(c),
-            _ => None,
-        })
-        .expect("an rz call");
+    let call = |name| {
+        main.blocks[0]
+            .instructions
+            .iter()
+            .find_map(|i| match &i.kind {
+                InstKind::Call(c) if c.callee_name() == Some(name) => Some(c),
+                _ => None,
+            })
+    };
+
+    let rz = call("__quantum__qis__rz__body").expect("an rz call");
     let Value::Float(theta) = rz.args[0].value else {
         panic!("expected a float");
     };
-    assert!((theta - std::f64::consts::PI).abs() < 1e-15);
+    assert!((theta - PI).abs() < 1e-15);
 
-    let ccx = main.blocks[0]
-        .instructions
-        .iter()
-        .find_map(|i| match &i.kind {
-            InstKind::Call(c) if c.callee_name() == Some("__quantum__qis__ccx__body") => Some(c),
-            _ => None,
-        })
-        .expect("a ccx call");
+    let ccx = call("__quantum__qis__ccx__body").expect("a ccx call");
     assert_eq!(ccx.args.len(), 3);
 }
 
@@ -232,7 +231,7 @@ fn param_attrs() {
         .find(|d| d.name == "__quantum__qis__mz__body")
         .expect("mz declaration");
     assert_eq!(mz.params.len(), 2);
-    assert_eq!(mz.params[1].attrs, vec!["writeonly".to_string()]);
+    assert_eq!(mz.params[1].attrs, ["writeonly"]);
     assert_eq!(mz.params[1].ty.pointee_name(), Some("Result"));
 }
 

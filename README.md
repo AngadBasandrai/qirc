@@ -6,6 +6,7 @@ qirc reads `.ll` files, checks them against the QIR profile they declare, optimi
 
 ```
 $ qirc tests/corpus/base_profile_bell.ll --shots 1000
+source:  tests/corpus/base_profile_bell.ll
 kernel:  AVX2 + FMA (4 x f64 lanes)
 program: 2 qubits, 2 results, 2 gates, depth 2, profile base_profile
 
@@ -16,9 +17,23 @@ State vector (2 qubits, 4 amplitudes):
   |00>  0.707107 + 0.000000i   p = 0.500000
   |11>  0.707107 + 0.000000i   p = 0.500000
 
+  P(q0 = 1) = 0.500000
+  P(q1 = 1) = 0.500000
+
+output recording:
+  TUPLE 2
+  RESULT r0
+  RESULT r1
+
+returned over 1000 shots:
+  (0, 0)       515   0.5150
+  (1, 1)       485   0.4850
+
 measurement over 1000 shots (sampled from the final state):
-  00       526   0.5260
-  11       474   0.4740
+  00       515   0.5150
+  11       485   0.4850
+
+simulated in 851.600µs
 ```
 
 ## Building
@@ -30,7 +45,7 @@ cargo build --release
 ./target/release/qirc --help
 ```
 
-There are no dependencies beyond `num-complex`.
+The only direct dependency is `num-complex`.
 
 ## Usage
 
@@ -158,6 +173,10 @@ rz(3.141592653589793) q[0];
 cx q[0], q[1];
 cx q[1], q[2];
 cx q[2], q[3];
+c[0] = measure q[0];
+c[1] = measure q[1];
+c[2] = measure q[2];
+c[3] = measure q[3];
 ```
 
 ## Simulator
@@ -178,7 +197,7 @@ cargo test
 
 The tests include:
 
-- `tests/corpus/`, a set of QIR modules in Base Profile, Adaptive Profile, PyQIR, Q# and unrestricted styles, all accepted by clang.
+- `tests/corpus/`, a set of QIR modules in Base Profile, Adaptive Profile, PyQIR, Q# and unrestricted styles, all accepted by clang. `qsharp_bell`, `qsharp_ising`, `qsharp_teleport` and `qsharp_count` come straight from the Q# compiler with only its comment line removed, and `pyqir_real` is byte for byte what PyQIR 0.12 emits.
 - A differential test that checks the AVX2 kernel against a naive reference simulator on random circuits.
 - Random unitary, measurement and memory programs compared across every optimisation level.
 - Round trips through the QIR emitter and back through the frontend.
@@ -189,7 +208,8 @@ The tests include:
 - A qubit index that depends on a measurement cannot be resolved, because qubits are assigned at compile time.
 - Recursive functions are rejected.
 - Routing requires a straight line program.
-- OpenQASM 3 output does not include classical control flow.
+- OpenQASM 3 output writes branches as `if` and `else`, loops as a `while` over blocks, classical values as typed variables and recorded values as `output` variables. A floating point remainder, a pointer cast or a value recorded inside a loop is refused rather than approximated, and `--emit qir` keeps them.
+- QIR output decomposes a controlled gate that has no QIR function of its own, and refuses one with three or more controls.
 
 ## License
 

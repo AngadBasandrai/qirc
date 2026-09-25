@@ -68,10 +68,6 @@ impl State {
         }
     }
 
-    pub fn num_qubits(&self) -> usize {
-        self.n
-    }
-
     pub fn len(&self) -> usize {
         self.re.len()
     }
@@ -129,7 +125,7 @@ impl State {
             .sqrt()
     }
 
-    pub fn collapse(&mut self, qubit: usize, outcome: bool) {
+    fn collapse(&mut self, qubit: usize, outcome: bool) {
         if qubit >= self.n {
             return;
         }
@@ -186,7 +182,7 @@ impl State {
         Sampler { cumulative }
     }
 
-    pub fn ket(&self, index: usize) -> String {
+    fn ket(&self, index: usize) -> String {
         format!("|{:0width$b}>", index, width = self.n.max(1))
     }
 }
@@ -246,6 +242,7 @@ impl fmt::Display for State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::{FRAC_PI_3, FRAC_PI_6};
 
     #[test]
     fn initial_state() {
@@ -304,13 +301,13 @@ mod tests {
 
         for _ in 0..trials {
             let mut state = State::new(1);
-            state.apply(&Matrix2::ry(std::f64::consts::FRAC_PI_3), 0, 0);
+            state.apply(&Matrix2::ry(FRAC_PI_3), 0, 0);
             if state.measure(0, &mut rng) {
                 ones += 1;
             }
         }
 
-        let expected = (std::f64::consts::FRAC_PI_6).sin().powi(2);
+        let expected = FRAC_PI_6.sin().powi(2);
         let observed = ones as f64 / trials as f64;
         assert!(
             (observed - expected).abs() < 0.03,

@@ -1,4 +1,4 @@
-use std::f64::consts::PI;
+use std::f64::consts::{FRAC_PI_2, PI};
 use std::fmt;
 
 use crate::codegen::zyz_angles;
@@ -51,12 +51,12 @@ impl Basis {
     }
 }
 
-#[derive(Clone, Debug, Default)]
 pub struct TranspileStats {
-    pub basis: Option<&'static str>,
+    pub basis: Basis,
     pub gates_before: usize,
     pub gates_after: usize,
     pub entanglers: usize,
+    pub leftover: usize,
 }
 
 impl fmt::Display for TranspileStats {
@@ -64,7 +64,7 @@ impl fmt::Display for TranspileStats {
         write!(
             f,
             "basis {}: {} gates became {} ({} two qubit)",
-            self.basis.unwrap_or("none"),
+            self.basis.name(),
             self.gates_before,
             self.gates_after,
             self.entanglers
@@ -73,21 +73,15 @@ impl fmt::Display for TranspileStats {
 }
 
 pub fn transpile(program: &mut Program, basis: Basis) -> TranspileStats {
-    let mut stats = TranspileStats {
-        basis: Some(basis.name()),
-        gates_before: program.gate_count(),
-        ..Default::default()
-    };
+    let gates_before = program.gate_count();
 
     for block in &mut program.blocks {
-        let mut rewritten: Vec<Op> = Vec::with_capacity(block.ops.len());
+        let mut rewritten = Vec::with_capacity(block.ops.len());
 
         for op in block.ops.drain(..) {
             match op {
                 Op::Gate(gate) => {
-                    for replacement in decompose(&gate, basis) {
-                        rewritten.push(Op::Gate(replacement));
-                    }
+                    rewritten.extend(decompose(&gate, basis).into_iter().map(Op::Gate))
                 }
                 other => rewritten.push(other),
             }
@@ -96,12 +90,16 @@ pub fn transpile(program: &mut Program, basis: Basis) -> TranspileStats {
         block.ops = rewritten;
     }
 
-    stats.gates_after = program.gate_count();
-    stats.entanglers = program
-        .gates()
-        .filter(|g| !g.controls.is_empty() || g.targets.len() > 1)
-        .count();
-    stats
+    TranspileStats {
+        basis,
+        gates_before,
+        gates_after: program.gate_count(),
+        entanglers: program
+            .gates()
+            .filter(|g| !g.controls.is_empty() || g.targets.len() > 1)
+            .count(),
+        leftover: program.gates().filter(|g| !basis.allows(g)).count(),
+    }
 }
 
 fn gate(kind: GateKind, targets: Vec<QubitId>, params: Vec<f64>, span: Span) -> Gate {
@@ -127,86 +125,120 @@ fn controlled(kind: GateKind, control: QubitId, target: QubitId, span: Span) -> 
     }
 }
 
-fn decompose(gate_in: &Gate, basis: Basis) -> Vec<Gate> {
-    if basis.allows(gate_in) {
-        return vec![gate_in.clone()];
+pub(crate) fn decompose(gate: &Gate, basis: Basis) -> Vec<Gate> {
+    if basis.allows(gate) {
+        return vec![gate.clone()];
     }
 
-    let span = gate_in.span;
+    let span = gate.span;
 
-    if gate_in.kind == GateKind::Swap && gate_in.controls.is_empty() {
-        let (a, b) = (gate_in.targets[0], gate_in.targets[1]);
+    if gate.kind == GateKind::Swap && gate.controls.is_empty() {
+        let (a, b) = (gate.targets[0], gate.targets[1]);
         return [
-            cx(a, b, basis, span),
-            cx(b, a, basis, span),
-            cx(a, b, basis, span),
+            entangle(GateKind::X, a, b, basis, span),
+            entangle(GateKind::X, b, a, basis, span),
+            entangle(GateKind::X, a, b, basis, span),
         ]
         .concat();
     }
 
-    if gate_in.controls.len() == 2 && gate_in.targets.len() == 1 {
-        return toffoli(
-            gate_in.controls[0],
-            gate_in.controls[1],
-            gate_in.targets[0],
-            basis,
-            span,
-        );
+    if gate.kind == GateKind::Swap && gate.controls.len() == 1 {
+        let (control, a, b) = (gate.controls[0], gate.targets[0], gate.targets[1]);
+        return [
+            entangle(GateKind::X, b, a, basis, span),
+            toffoli(control, a, b, basis, span),
+            entangle(GateKind::X, b, a, basis, span),
+        ]
+        .concat();
     }
 
-    if gate_in.controls.len() == 1 && gate_in.targets.len() == 1 {
-        return controlled_single(gate_in, basis, span);
+    if gate.params.iter().any(|p| p.constant().is_none()) {
+        return runtime_rotation(gate, basis).unwrap_or_else(|| vec![gate.clone()]);
     }
 
-    if gate_in.controls.is_empty() && gate_in.targets.len() == 1 {
-        let matrix = matrix_for(gate_in.kind, &constant_params(gate_in));
-        return single(matrix, gate_in.targets[0], basis, span);
+    if gate.controls.len() == 2 && gate.targets.len() == 1 {
+        let (a, b, target) = (gate.controls[0], gate.controls[1], gate.targets[0]);
+        return match gate.kind {
+            GateKind::X => toffoli(a, b, target, basis, span),
+            GateKind::Z => [
+                single(Matrix2::h(), target, basis, span),
+                toffoli(a, b, target, basis, span),
+                single(Matrix2::h(), target, basis, span),
+            ]
+            .concat(),
+            _ => vec![gate.clone()],
+        };
     }
 
-    vec![gate_in.clone()]
+    if gate.controls.len() == 1 && gate.targets.len() == 1 {
+        return controlled_single(gate, basis);
+    }
+
+    if gate.controls.is_empty() && gate.targets.len() == 1 {
+        let matrix = matrix_for(gate.kind, &gate.constant_params());
+        return single(matrix, gate.targets[0], basis, span);
+    }
+
+    vec![gate.clone()]
 }
 
-fn constant_params(gate: &Gate) -> Vec<f64> {
-    gate.params
-        .iter()
-        .filter_map(|p| p.constant().map(|c| c.as_f64()))
-        .collect()
-}
+fn runtime_rotation(gate: &Gate, basis: Basis) -> Option<Vec<Gate>> {
+    if !gate.controls.is_empty() || gate.targets.len() != 1 {
+        return None;
+    }
+    let (target, span) = (gate.targets[0], gate.span);
+    let turn = |angle: f64| self::gate(GateKind::Rz, vec![target], vec![angle], span);
+    let rotate = |kind| Gate {
+        kind,
+        ..gate.clone()
+    };
+    let hadamard = || single(Matrix2::h(), target, basis, span);
 
-fn cx(control: QubitId, target: QubitId, basis: Basis, span: Span) -> Vec<Gate> {
-    match basis {
-        Basis::RzSxCx => vec![controlled(GateKind::X, control, target, span)],
-        Basis::RzRyCz => {
-            let mut out = single(Matrix2::h(), target, basis, span);
-            out.push(controlled(GateKind::Z, control, target, span));
-            out.extend(single(Matrix2::h(), target, basis, span));
-            out
+    Some(match (gate.kind, basis) {
+        (GateKind::R1, _) => vec![rotate(GateKind::Rz)],
+        (GateKind::Rx, Basis::RzSxCx) => {
+            [hadamard(), vec![rotate(GateKind::Rz)], hadamard()].concat()
         }
-    }
-}
-
-fn cz(control: QubitId, target: QubitId, basis: Basis, span: Span) -> Vec<Gate> {
-    match basis {
-        Basis::RzRyCz => vec![controlled(GateKind::Z, control, target, span)],
-        Basis::RzSxCx => {
-            let mut out = single(Matrix2::h(), target, basis, span);
-            out.push(controlled(GateKind::X, control, target, span));
-            out.extend(single(Matrix2::h(), target, basis, span));
-            out
+        (GateKind::Ry, Basis::RzSxCx) => [
+            vec![turn(-FRAC_PI_2)],
+            hadamard(),
+            vec![rotate(GateKind::Rz)],
+            hadamard(),
+            vec![turn(FRAC_PI_2)],
+        ]
+        .concat(),
+        (GateKind::Rx, Basis::RzRyCz) => {
+            vec![turn(FRAC_PI_2), rotate(GateKind::Ry), turn(-FRAC_PI_2)]
         }
-    }
+        _ => return None,
+    })
 }
 
-fn controlled_single(gate_in: &Gate, basis: Basis, span: Span) -> Vec<Gate> {
-    let control = gate_in.controls[0];
-    let target = gate_in.targets[0];
+fn entangle(
+    kind: GateKind,
+    control: QubitId,
+    target: QubitId,
+    basis: Basis,
+    span: Span,
+) -> Vec<Gate> {
+    if kind == basis.entangler() {
+        return vec![controlled(kind, control, target, span)];
+    }
+    let mut out = single(Matrix2::h(), target, basis, span);
+    out.push(controlled(basis.entangler(), control, target, span));
+    out.extend(single(Matrix2::h(), target, basis, span));
+    out
+}
 
-    match gate_in.kind {
-        GateKind::X => cx(control, target, basis, span),
-        GateKind::Z => cz(control, target, basis, span),
+fn controlled_single(gate: &Gate, basis: Basis) -> Vec<Gate> {
+    let control = gate.controls[0];
+    let target = gate.targets[0];
+
+    match gate.kind {
+        GateKind::X | GateKind::Z => entangle(gate.kind, control, target, basis, gate.span),
         _ => {
-            let matrix = matrix_for(gate_in.kind, &constant_params(gate_in));
-            controlled_unitary(matrix, control, target, basis, span)
+            let matrix = matrix_for(gate.kind, &gate.constant_params());
+            controlled_unitary(matrix, control, target, basis, gate.span)
         }
     }
 }
@@ -225,10 +257,8 @@ fn global_phase(matrix: &Matrix2, theta: f64, phi: f64, lambda: f64) -> f64 {
 
     entries
         .iter()
-        .filter(|(_, r)| r.norm() > 1e-9)
-        .map(|(l, r)| (l / r).arg())
-        .next()
-        .unwrap_or(0.0)
+        .find(|(_, r)| r.norm() > 1e-9)
+        .map_or(0.0, |(l, r)| (l / r).arg())
 }
 
 fn controlled_unitary(
@@ -248,9 +278,9 @@ fn controlled_unitary(
     let mut out = Vec::new();
 
     out.extend(single(c, target, basis, span));
-    out.extend(cx(control, target, basis, span));
+    out.extend(entangle(GateKind::X, control, target, basis, span));
     out.extend(single(b, target, basis, span));
-    out.extend(cx(control, target, basis, span));
+    out.extend(entangle(GateKind::X, control, target, basis, span));
     out.extend(single(a, target, basis, span));
     out.extend(single(Matrix2::phase(alpha), control, basis, span));
 
@@ -261,20 +291,20 @@ fn toffoli(a: QubitId, b: QubitId, target: QubitId, basis: Basis, span: Span) ->
     let mut out = Vec::new();
 
     out.extend(single(Matrix2::h(), target, basis, span));
-    out.extend(cx(b, target, basis, span));
+    out.extend(entangle(GateKind::X, b, target, basis, span));
     out.extend(single(Matrix2::t_dagger(), target, basis, span));
-    out.extend(cx(a, target, basis, span));
+    out.extend(entangle(GateKind::X, a, target, basis, span));
     out.extend(single(Matrix2::t(), target, basis, span));
-    out.extend(cx(b, target, basis, span));
+    out.extend(entangle(GateKind::X, b, target, basis, span));
     out.extend(single(Matrix2::t_dagger(), target, basis, span));
-    out.extend(cx(a, target, basis, span));
+    out.extend(entangle(GateKind::X, a, target, basis, span));
     out.extend(single(Matrix2::t(), b, basis, span));
     out.extend(single(Matrix2::t(), target, basis, span));
     out.extend(single(Matrix2::h(), target, basis, span));
-    out.extend(cx(a, b, basis, span));
+    out.extend(entangle(GateKind::X, a, b, basis, span));
     out.extend(single(Matrix2::t(), a, basis, span));
     out.extend(single(Matrix2::t_dagger(), b, basis, span));
-    out.extend(cx(a, b, basis, span));
+    out.extend(entangle(GateKind::X, a, b, basis, span));
 
     out
 }
@@ -331,34 +361,31 @@ fn wrap(angle: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulator::matrix::C64;
+    use crate::simulator::state::State;
 
     fn product(gates: &[Gate]) -> Matrix2 {
         let mut acc = Matrix2::identity();
         for g in gates {
-            let matrix = matrix_for(g.kind, &constant_params(g));
+            let matrix = matrix_for(g.kind, &g.constant_params());
             acc = matrix.multiply(acc);
         }
         acc
     }
 
-    fn equal_up_to_phase(left: &Matrix2, right: &Matrix2) -> bool {
-        let entries = [
-            (left.a, right.a),
-            (left.b, right.b),
-            (left.c, right.c),
-            (left.d, right.d),
-        ];
-
-        let Some((reference, target)) = entries.iter().find(|(_, r)| r.norm() > 1e-9) else {
+    fn same_up_to_phase(left: &[C64], right: &[C64]) -> bool {
+        let Some(p) = right.iter().position(|r| r.norm() > 1e-9) else {
             return false;
         };
-        let phase = reference / target;
+        let phase = left[p] / right[p];
 
         if (phase.norm() - 1.0).abs() > 1e-9 {
             return false;
         }
 
-        entries.iter().all(|(l, r)| (l - phase * r).norm() < 1e-9)
+        left.iter()
+            .zip(right)
+            .all(|(l, r)| (l - phase * r).norm() < 1e-9)
     }
 
     fn sample_matrices() -> Vec<Matrix2> {
@@ -381,17 +408,7 @@ mod tests {
         ]
     }
 
-    use crate::simulator::state::State;
-
-    fn run_gates(gates: &[Gate], qubits: usize, start: usize) -> Vec<C64Pair> {
-        run_from(gates, qubits, start, false)
-    }
-
-    fn run_superposed(gates: &[Gate], qubits: usize, start: usize) -> Vec<C64Pair> {
-        run_from(gates, qubits, start, true)
-    }
-
-    fn run_from(gates: &[Gate], qubits: usize, start: usize, spread: bool) -> Vec<C64Pair> {
+    fn run_from(gates: &[Gate], qubits: usize, start: usize, spread: bool) -> Vec<C64> {
         let mut state = State::new(qubits);
         for bit in 0..qubits {
             if (start >> bit) & 1 == 1 {
@@ -410,38 +427,12 @@ mod tests {
                 state.swap(g.targets[0].index(), g.targets[1].index(), controls);
                 continue;
             }
-            let matrix = matrix_for(g.kind, &constant_params(g));
+            let matrix = matrix_for(g.kind, &g.constant_params());
             for t in &g.targets {
                 state.apply(&matrix, t.index(), controls);
             }
         }
-        (0..state.len())
-            .map(|i| {
-                let amp = state.amplitude(i);
-                (amp.re, amp.im)
-            })
-            .collect()
-    }
-
-    type C64Pair = (f64, f64);
-
-    fn same_up_to_phase(left: &[C64Pair], right: &[C64Pair]) -> bool {
-        let Some(pivot) = (0..right.len()).find(|&i| right[i].0.hypot(right[i].1) > 1e-9) else {
-            return false;
-        };
-        let (rr, ri) = right[pivot];
-        let (lr, li) = left[pivot];
-        let denominator = rr * rr + ri * ri;
-        let phase = (
-            (lr * rr + li * ri) / denominator,
-            (li * rr - lr * ri) / denominator,
-        );
-
-        left.iter().zip(right).all(|((ar, ai), (br, bi))| {
-            let pr = phase.0 * br - phase.1 * bi;
-            let pi = phase.0 * bi + phase.1 * br;
-            (ar - pr).hypot(ai - pi) < 1e-9
-        })
+        (0..state.len()).map(|i| state.amplitude(i)).collect()
     }
 
     #[test]
@@ -457,21 +448,15 @@ mod tests {
             }];
 
             for start in 0..8usize {
-                let got = run_gates(&decomposed, 3, start);
-                let want = run_gates(&direct, 3, start);
-                assert!(
-                    same_up_to_phase(&got, &want),
-                    "{} toffoli wrong from |{start:03b}>",
-                    basis.name()
-                );
-
-                let got = run_superposed(&decomposed, 3, start);
-                let want = run_superposed(&direct, 3, start);
-                assert!(
-                    same_up_to_phase(&got, &want),
-                    "{} toffoli wrong on superposed controls from |{start:03b}>",
-                    basis.name()
-                );
+                for spread in [false, true] {
+                    let got = run_from(&decomposed, 3, start, spread);
+                    let want = run_from(&direct, 3, start, spread);
+                    assert!(
+                        same_up_to_phase(&got, &want),
+                        "{} toffoli wrong from |{start:03b}> (spread {spread})",
+                        basis.name()
+                    );
+                }
             }
         }
     }
@@ -491,21 +476,15 @@ mod tests {
                 }];
 
                 for start in 0..4usize {
-                    let got = run_gates(&decomposed, 2, start);
-                    let want = run_gates(&direct, 2, start);
-                    assert!(
-                        same_up_to_phase(&got, &want),
-                        "{} controlled decomposition wrong from |{start:02b}> for {matrix:?}",
-                        basis.name()
-                    );
-
-                    let got = run_superposed(&decomposed, 2, start);
-                    let want = run_superposed(&direct, 2, start);
-                    assert!(
-                        same_up_to_phase(&got, &want),
-                        "{} controlled decomposition wrong on a superposed control from |{start:02b}> for {matrix:?}",
-                        basis.name()
-                    );
+                    for spread in [false, true] {
+                        let got = run_from(&decomposed, 2, start, spread);
+                        let want = run_from(&direct, 2, start, spread);
+                        assert!(
+                            same_up_to_phase(&got, &want),
+                            "{} controlled decomposition wrong from |{start:02b}> for {matrix:?} (spread {spread})",
+                            basis.name()
+                        );
+                    }
                 }
             }
         }
@@ -514,23 +493,25 @@ mod tests {
     #[test]
     fn swap_gate() {
         for basis in [Basis::RzSxCx, Basis::RzRyCz] {
-            let gate_in = Gate {
+            let direct = [Gate {
                 kind: GateKind::Swap,
                 controls: Vec::new(),
                 targets: vec![QubitId(0), QubitId(1)],
                 params: Vec::new(),
                 span: Span::DUMMY,
-            };
-            let decomposed = decompose(&gate_in, basis);
+            }];
+            let decomposed = decompose(&direct[0], basis);
 
             for start in 0..4usize {
-                let got = run_superposed(&decomposed, 2, start);
-                let want = run_superposed(std::slice::from_ref(&gate_in), 2, start);
-                assert!(
-                    same_up_to_phase(&got, &want),
-                    "{} swap wrong from |{start:02b}>",
-                    basis.name()
-                );
+                for spread in [false, true] {
+                    let got = run_from(&decomposed, 2, start, spread);
+                    let want = run_from(&direct, 2, start, spread);
+                    assert!(
+                        same_up_to_phase(&got, &want),
+                        "{} swap wrong from |{start:02b}> (spread {spread})",
+                        basis.name()
+                    );
+                }
             }
         }
     }
@@ -542,7 +523,10 @@ mod tests {
                 let gates = single(matrix, QubitId(0), basis, Span::DUMMY);
                 let rebuilt = product(&gates);
                 assert!(
-                    equal_up_to_phase(&matrix, &rebuilt),
+                    same_up_to_phase(
+                        &[matrix.a, matrix.b, matrix.c, matrix.d],
+                        &[rebuilt.a, rebuilt.b, rebuilt.c, rebuilt.d]
+                    ),
                     "{} failed to reproduce {matrix:?}, got {rebuilt:?}",
                     basis.name()
                 );
@@ -567,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_is_empty() {
+    fn identity() {
         for basis in [Basis::RzSxCx, Basis::RzRyCz] {
             assert!(single(Matrix2::identity(), QubitId(0), basis, Span::DUMMY).is_empty());
         }

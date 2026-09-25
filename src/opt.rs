@@ -3,12 +3,13 @@ use std::fmt;
 
 use crate::ir::*;
 use crate::simulator::matrix::{Matrix2, matrix_for};
+use crate::verify;
 
 const ANGLE_EPSILON: f64 = 1e-12;
 const MATRIX_EPSILON: f64 = 1e-12;
 const MAX_FIXPOINT_ROUNDS: usize = 16;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct OptStats {
     pub gates_before: usize,
     pub gates_after: usize,
@@ -53,11 +54,7 @@ impl fmt::Display for OptStats {
     }
 }
 
-pub fn optimise(program: &mut Program, level: u8) -> OptStats {
-    optimise_verified(program, level, false)
-}
-
-pub fn optimise_verified(program: &mut Program, level: u8, verify_each: bool) -> OptStats {
+pub fn optimise(program: &mut Program, level: u8, verify_each: bool) -> OptStats {
     let mut stats = OptStats {
         gates_before: program.gate_count(),
         depth_before: program.depth(),
@@ -78,7 +75,13 @@ pub fn optimise_verified(program: &mut Program, level: u8, verify_each: bool) ->
     for round in 0..rounds {
         let mut changed = 0usize;
 
-        for (name, hits) in run_round(program, level, verify_each, &mut stats.violations) {
+        for (name, pass) in schedule(level) {
+            let hits = pass(program);
+            if verify_each {
+                for found in verify::verify(program) {
+                    stats.violations.push(format!("after {name}: {found}"));
+                }
+            }
             if hits > 0 {
                 *totals.entry(name).or_insert(0) += hits;
                 changed += hits;
@@ -104,30 +107,7 @@ pub fn optimise_verified(program: &mut Program, level: u8, verify_each: bool) ->
 
 type Pass = fn(&mut Program) -> usize;
 
-fn run_pass(
-    program: &mut Program,
-    name: &'static str,
-    pass: Pass,
-    verify_each: bool,
-    violations: &mut Vec<String>,
-) -> (&'static str, usize) {
-    let hits = pass(program);
-
-    if verify_each {
-        for found in crate::verify::verify(program) {
-            violations.push(format!("after {name}: {found}"));
-        }
-    }
-
-    (name, hits)
-}
-
-fn run_round(
-    program: &mut Program,
-    level: u8,
-    verify_each: bool,
-    violations: &mut Vec<String>,
-) -> Vec<(&'static str, usize)> {
+fn schedule(level: u8) -> Vec<(&'static str, Pass)> {
     let mut schedule: Vec<(&'static str, Pass)> = vec![
         ("drop-identity", drop_identity_gates),
         ("cancel-inverses", cancel_inverses),
@@ -145,11 +125,7 @@ fn run_round(
     }
 
     schedule.push(("dead-code", eliminate_dead_code));
-
     schedule
-        .into_iter()
-        .map(|(name, pass)| run_pass(program, name, pass, verify_each, violations))
-        .collect()
 }
 
 fn op_wires(op: &Op) -> Vec<QubitId> {
@@ -173,15 +149,10 @@ fn signature(gate: &Gate) -> (Vec<QubitId>, Vec<QubitId>) {
 }
 
 fn next_on_shared_wire(ops: &[Op], from: usize, wires: &[QubitId]) -> Option<usize> {
-    let set: HashSet<QubitId> = wires.iter().copied().collect();
-
-    for (offset, op) in ops.iter().enumerate().skip(from + 1) {
-        if op_wires(op).iter().any(|w| set.contains(w)) {
-            return Some(offset);
-        }
-    }
-
-    None
+    ops[from + 1..]
+        .iter()
+        .position(|op| op_wires(op).iter().any(|w| wires.contains(w)))
+        .map(|i| from + 1 + i)
 }
 
 fn are_inverse(a: &Gate, b: &Gate) -> bool {
@@ -207,45 +178,16 @@ fn are_inverse(a: &Gate, b: &Gate) -> bool {
     a.kind.adjoint() == Some(b.kind)
 }
 
-fn cancel_inverses(program: &mut Program) -> usize {
-    let mut removed = 0;
-
-    for block in &mut program.blocks {
-        let mut changed = true;
-
-        while changed {
-            changed = false;
-
-            for index in 0..block.ops.len() {
-                let Some(gate) = block.ops[index].as_gate() else {
-                    continue;
-                };
-                let wires: Vec<QubitId> = gate.wires().collect();
-
-                let Some(partner) = next_on_shared_wire(&block.ops, index, &wires) else {
-                    continue;
-                };
-
-                let Some(other) = block.ops[partner].as_gate() else {
-                    continue;
-                };
-
-                if are_inverse(gate, other) {
-                    block.ops.remove(partner);
-                    block.ops.remove(index);
-                    removed += 2;
-                    changed = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    removed
+enum Rewrite {
+    Drop,
+    Replace(Gate),
 }
 
-fn merge_rotations(program: &mut Program) -> usize {
-    let mut merged = 0;
+fn rewrite_pairs(
+    program: &mut Program,
+    mut decide: impl FnMut(&Gate, &Gate) -> Option<Rewrite>,
+) -> usize {
+    let mut hits = 0;
 
     for block in &mut program.blocks {
         let mut changed = true;
@@ -257,11 +199,8 @@ fn merge_rotations(program: &mut Program) -> usize {
                 let Some(gate) = block.ops[index].as_gate() else {
                     continue;
                 };
-                if gate.kind.param_count() == 0 {
-                    continue;
-                }
-
                 let wires: Vec<QubitId> = gate.wires().collect();
+
                 let Some(partner) = next_on_shared_wire(&block.ops, index, &wires) else {
                     continue;
                 };
@@ -270,29 +209,41 @@ fn merge_rotations(program: &mut Program) -> usize {
                     continue;
                 };
 
-                if gate.kind != other.kind || signature(gate) != signature(other) {
-                    continue;
-                }
-
-                let (Some(x), Some(y)) = (gate.constant_angle(), other.constant_angle()) else {
+                let Some(rewrite) = decide(gate, other) else {
                     continue;
                 };
 
-                let total = x + y;
                 block.ops.remove(partner);
-
-                if let Op::Gate(target) = &mut block.ops[index] {
-                    target.params = vec![Operand::Const(Const::Float(total))];
+                match rewrite {
+                    Rewrite::Replace(gate) => block.ops[index] = Op::Gate(gate),
+                    Rewrite::Drop => {
+                        block.ops.remove(index);
+                    }
                 }
-
-                merged += 1;
+                hits += 1;
                 changed = true;
                 break;
             }
         }
     }
 
-    merged
+    hits
+}
+
+fn cancel_inverses(program: &mut Program) -> usize {
+    rewrite_pairs(program, |a, b| are_inverse(a, b).then_some(Rewrite::Drop)) * 2
+}
+
+fn merge_rotations(program: &mut Program) -> usize {
+    rewrite_pairs(program, |a, b| {
+        if a.kind.param_count() == 0 || a.kind != b.kind || signature(a) != signature(b) {
+            return None;
+        }
+        let (x, y) = (a.constant_angle()?, b.constant_angle()?);
+        let mut merged = a.clone();
+        merged.params = vec![Operand::Const(Const::Float(x + y))];
+        Some(Rewrite::Replace(merged))
+    })
 }
 
 fn is_identity_gate(gate: &Gate) -> bool {
@@ -301,8 +252,7 @@ fn is_identity_gate(gate: &Gate) -> bool {
         GateKind::Unitary(m) => Matrix2::from_ir(m).is_identity(MATRIX_EPSILON),
         GateKind::Rx | GateKind::Ry | GateKind::Rz | GateKind::R1 => gate
             .constant_angle()
-            .map(|angle| angle.abs() < ANGLE_EPSILON)
-            .unwrap_or(false),
+            .is_some_and(|angle| angle.abs() < ANGLE_EPSILON),
         GateKind::Swap => gate.targets.len() == 2 && gate.targets[0] == gate.targets[1],
         _ => false,
     }
@@ -313,10 +263,9 @@ fn drop_identity_gates(program: &mut Program) -> usize {
 
     for block in &mut program.blocks {
         let before = block.ops.len();
-        block.ops.retain(|op| match op.as_gate() {
-            Some(gate) => !is_identity_gate(gate),
-            None => true,
-        });
+        block
+            .ops
+            .retain(|op| !op.as_gate().is_some_and(is_identity_gate));
         removed += before - block.ops.len();
     }
 
@@ -330,13 +279,8 @@ fn peephole(program: &mut Program) -> usize {
         let mut index = 0;
 
         while index + 2 < block.ops.len() {
-            let window = (
-                block.ops[index].as_gate().cloned(),
-                block.ops[index + 1].as_gate().cloned(),
-                block.ops[index + 2].as_gate().cloned(),
-            );
-
-            let (Some(first), Some(middle), Some(last)) = window else {
+            let [Op::Gate(first), Op::Gate(middle), Op::Gate(last)] = &block.ops[index..index + 3]
+            else {
                 index += 1;
                 continue;
             };
@@ -354,17 +298,14 @@ fn peephole(program: &mut Program) -> usize {
                 && last.kind == GateKind::H
                 && matches!(middle.kind, GateKind::X | GateKind::Z)
             {
-                let replacement = if middle.kind == GateKind::X {
+                let mut rewritten = middle.clone();
+                rewritten.kind = if middle.kind == GateKind::X {
                     GateKind::Z
                 } else {
                     GateKind::X
                 };
 
-                let mut rewritten = middle.clone();
-                rewritten.kind = replacement;
-
-                block.ops.drain(index..index + 3);
-                block.ops.insert(index, Op::Gate(rewritten));
+                block.ops.splice(index..index + 3, [Op::Gate(rewritten)]);
                 rewrites += 1;
                 continue;
             }
@@ -377,70 +318,29 @@ fn peephole(program: &mut Program) -> usize {
 }
 
 fn fuse_single_qubit(program: &mut Program) -> usize {
-    let mut fused = 0;
-
-    for block in &mut program.blocks {
-        let mut changed = true;
-
-        while changed {
-            changed = false;
-
-            for index in 0..block.ops.len() {
-                let Some(gate) = block.ops[index].as_gate() else {
-                    continue;
-                };
-
-                if !gate.controls.is_empty() || gate.targets.len() != 1 {
-                    continue;
-                }
-                if gate.is_parameterised() && gate.constant_angle().is_none() {
-                    continue;
-                }
-
-                let wire = gate.targets[0];
-                let Some(partner) = next_on_shared_wire(&block.ops, index, &[wire]) else {
-                    continue;
-                };
-
-                let Some(other) = block.ops[partner].as_gate() else {
-                    continue;
-                };
-
-                if !other.controls.is_empty() || other.targets != vec![wire] {
-                    continue;
-                }
-                if other.kind == GateKind::Swap || gate.kind == GateKind::Swap {
-                    continue;
-                }
-                if other.is_parameterised() && other.constant_angle().is_none() {
-                    continue;
-                }
-
-                let first = matrix_for(gate.kind, &collect_params(gate));
-                let second = matrix_for(other.kind, &collect_params(other));
-                let combined = second.multiply(first);
-
-                block.ops.remove(partner);
-                if let Op::Gate(target) = &mut block.ops[index] {
-                    target.kind = GateKind::Unitary(combined.to_ir());
-                    target.params.clear();
-                }
-
-                fused += 1;
-                changed = true;
-                break;
-            }
+    rewrite_pairs(program, |a, b| {
+        if !a.controls.is_empty() || a.targets.len() != 1 {
+            return None;
         }
-    }
+        if a.is_parameterised() && a.constant_angle().is_none() {
+            return None;
+        }
 
-    fused
-}
+        let wire = a.targets[0];
+        if !b.controls.is_empty() || b.targets != [wire] {
+            return None;
+        }
+        if b.is_parameterised() && b.constant_angle().is_none() {
+            return None;
+        }
 
-fn collect_params(gate: &Gate) -> Vec<f64> {
-    gate.params
-        .iter()
-        .filter_map(|p| p.constant().map(|c| c.as_f64()))
-        .collect()
+        let first = matrix_for(a.kind, &a.constant_params());
+        let second = matrix_for(b.kind, &b.constant_params());
+        let mut fused = a.clone();
+        fused.kind = GateKind::Unitary(second.multiply(first).to_ir());
+        fused.params.clear();
+        Some(Rewrite::Replace(fused))
+    })
 }
 
 fn fold_constants(program: &mut Program) -> usize {
@@ -451,7 +351,7 @@ fn fold_constants(program: &mut Program) -> usize {
 
     for block in &mut program.blocks {
         for op in &mut block.ops {
-            let Op::Assign { dest, expr, .. } = op else {
+            let Op::Assign { dest, ty, expr, .. } = op else {
                 continue;
             };
 
@@ -468,7 +368,7 @@ fn fold_constants(program: &mut Program) -> usize {
                 continue;
             }
 
-            if let Some(value) = try_fold(expr, &known) {
+            if let Some(value) = expr.fold(*ty, |o| o.resolve(&known)) {
                 *expr = Expr::Const(value);
                 known.insert(*dest, value);
                 folded += 1;
@@ -481,13 +381,6 @@ fn fold_constants(program: &mut Program) -> usize {
     }
 
     folded
-}
-
-fn try_fold(expr: &Expr, known: &HashMap<ValueId, Const>) -> Option<Const> {
-    expr.fold(|operand| match operand {
-        Operand::Const(c) => Some(*c),
-        Operand::Value(id) => known.get(id).copied(),
-    })
 }
 
 fn substitute_known(program: &mut Program, known: &HashMap<ValueId, Const>) {
@@ -508,15 +401,15 @@ fn substitute_known(program: &mut Program, known: &HashMap<ValueId, Const>) {
                     }
                 }
                 Op::Store { value, .. } => replace(value),
+                Op::RecordOutput {
+                    value: Some(value), ..
+                } => replace(value),
                 _ => {}
             }
         }
 
-        match &mut block.term {
-            Term::CondBr { cond, .. } => replace(cond),
-            Term::Switch { scrutinee, .. } => replace(scrutinee),
-            Term::Ret(Some(operand)) => replace(operand),
-            _ => {}
+        if let Some(o) = block.term.operand_mut() {
+            replace(o);
         }
     }
 }
@@ -525,47 +418,14 @@ fn eliminate_dead_code(program: &mut Program) -> usize {
     let mut live: HashSet<ValueId> = HashSet::new();
 
     for block in &program.blocks {
-        for op in &block.ops {
-            match op {
-                Op::Gate(gate) => {
-                    for param in &gate.params {
-                        if let Some(id) = param.value() {
-                            live.insert(id);
-                        }
-                    }
-                }
-                Op::Assign { expr, .. } => {
-                    for id in expr_uses(expr) {
-                        live.insert(id);
-                    }
-                }
-                Op::Store { value, .. } => {
-                    if let Some(id) = value.value() {
-                        live.insert(id);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        match &block.term {
-            Term::CondBr { cond, .. } => {
-                if let Some(id) = cond.value() {
-                    live.insert(id);
-                }
-            }
-            Term::Switch { scrutinee, .. } => {
-                if let Some(id) = scrutinee.value() {
-                    live.insert(id);
-                }
-            }
-            Term::Ret(Some(operand)) => {
-                if let Some(id) = operand.value() {
-                    live.insert(id);
-                }
-            }
-            _ => {}
-        }
+        live.extend(
+            block
+                .ops
+                .iter()
+                .flat_map(Op::operands)
+                .chain(block.term.operand())
+                .filter_map(|o| o.value()),
+        );
     }
 
     let mut removed = 0;
@@ -582,42 +442,6 @@ fn eliminate_dead_code(program: &mut Program) -> usize {
     }
 
     removed
-}
-
-fn expr_uses(expr: &Expr) -> Vec<ValueId> {
-    let mut out = Vec::new();
-    let mut push = |operand: &Operand| {
-        if let Some(id) = operand.value() {
-            out.push(id);
-        }
-    };
-
-    match expr {
-        Expr::Const(_) | Expr::ReadResult(_) | Expr::Load(_) => {}
-        Expr::Copy(o) | Expr::Cast { operand: o, .. } => push(o),
-        Expr::Binary { lhs, rhs, .. }
-        | Expr::ICmp { lhs, rhs, .. }
-        | Expr::FCmp { lhs, rhs, .. } => {
-            push(lhs);
-            push(rhs);
-        }
-        Expr::Select {
-            cond,
-            if_true,
-            if_false,
-        } => {
-            push(cond);
-            push(if_true);
-            push(if_false);
-        }
-        Expr::Phi(incoming) => {
-            for (_, operand) in incoming {
-                push(operand);
-            }
-        }
-    }
-
-    out
 }
 
 fn simplify_cfg(program: &mut Program) -> usize {
@@ -658,13 +482,11 @@ fn simplify_cfg(program: &mut Program) -> usize {
     }
 
     let reachable = program.reachable();
-    if reachable.iter().any(|live| !live) {
-        for (index, live) in reachable.iter().enumerate() {
-            if !live && !program.blocks[index].ops.is_empty() {
-                program.blocks[index].ops.clear();
-                program.blocks[index].term = Term::Unreachable;
-                changes += 1;
-            }
+    for (index, live) in reachable.iter().enumerate() {
+        if !live && !program.blocks[index].ops.is_empty() {
+            program.blocks[index].ops.clear();
+            program.blocks[index].term = Term::Unreachable;
+            changes += 1;
         }
     }
 

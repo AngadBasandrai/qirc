@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::slice;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::codegen;
 use crate::diag::{Diagnostic, Severity, SourceFile};
@@ -14,8 +16,9 @@ use crate::simulator::exec::{self, ExecConfig};
 use crate::simulator::simd;
 use crate::simulator::state;
 use crate::transpile::{self, Basis, TranspileStats};
+use crate::verify;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Debug)]
 pub enum Emit {
     Run,
     Ir,
@@ -41,7 +44,7 @@ impl Emit {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy)]
 pub enum Color {
     Auto,
     Always,
@@ -148,102 +151,70 @@ options:
 pub fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut options = Options::default();
     let mut input: Option<PathBuf> = None;
-    let mut index = 0;
+    let mut args = args.iter();
 
-    while index < args.len() {
-        let arg = args[index].as_str();
-
-        match arg {
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
             "-h" | "--help" => return Err(String::new()),
 
             "--emit" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--emit needs a kind".to_string())?;
+                let value = value(&mut args, "--emit needs a kind")?;
                 options.emit =
                     Emit::parse(value).ok_or_else(|| format!("unknown emit kind `{value}`"))?;
-                index += 2;
             }
 
             "--shots" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--shots needs a count".to_string())?;
+                let value = value(&mut args, "--shots needs a count")?;
                 options.shots = value
                     .parse()
                     .map_err(|_| format!("invalid shot count `{value}`"))?;
-                index += 2;
             }
 
             "--seed" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--seed needs a number".to_string())?;
+                let value = value(&mut args, "--seed needs a number")?;
                 options.seed = Some(
                     value
                         .parse()
                         .map_err(|_| format!("invalid seed `{value}`"))?,
                 );
-                index += 2;
             }
 
             "-o" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "-o needs a path".to_string())?;
+                let value = value(&mut args, "-o needs a path")?;
                 options.output = Some(PathBuf::from(value));
-                index += 2;
             }
 
             "--basis" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--basis needs a name".to_string())?;
+                let value = value(&mut args, "--basis needs a name")?;
                 options.basis =
                     Some(Basis::parse(value).ok_or_else(|| format!("unknown basis `{value}`"))?);
-                index += 2;
             }
 
             "--coupling" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--coupling needs a map".to_string())?;
+                let value = value(&mut args, "--coupling needs a map")?;
                 options.coupling = Some(
                     Coupling::parse(value)
                         .ok_or_else(|| format!("unknown coupling map `{value}`"))?,
                 );
-                index += 2;
             }
 
             "--color" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--color needs auto, always or never".to_string())?;
-                options.color = match value.as_str() {
+                let value = value(&mut args, "--color needs auto, always or never")?;
+                options.color = match value {
                     "auto" => Color::Auto,
                     "always" => Color::Always,
                     "never" => Color::Never,
                     _ => return Err(format!("unknown color setting `{value}`")),
                 };
-                index += 2;
             }
 
-            "--verify-each" => {
-                options.verify_each = true;
-                index += 1;
-            }
+            "--verify-each" => options.verify_each = true,
 
-            "--no-state" => {
-                options.show_state = false;
-                index += 1;
-            }
+            "--no-state" => options.show_state = false,
 
-            "-v" | "--verbose" => {
-                options.verbose = true;
-                index += 1;
-            }
+            "-v" | "--verbose" => options.verbose = true,
 
-            _ if arg.starts_with("-O") => {
+            arg if arg.starts_with("-O") => {
                 let level = arg[2..]
                     .parse::<u8>()
                     .map_err(|_| format!("invalid optimisation level `{arg}`"))?;
@@ -251,22 +222,26 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
                     return Err(format!("optimisation level {level} is out of range"));
                 }
                 options.opt_level = level;
-                index += 1;
             }
 
-            _ if arg.starts_with('-') => return Err(format!("unknown option `{arg}`")),
+            arg if arg.starts_with('-') => return Err(format!("unknown option `{arg}`")),
 
             path => {
                 if input.replace(PathBuf::from(path)).is_some() {
                     return Err("expected exactly one input file".into());
                 }
-                index += 1;
             }
         }
     }
 
     options.input = input.ok_or_else(|| "no input file given".to_string())?;
     Ok(options)
+}
+
+fn value<'a>(args: &mut slice::Iter<'a, String>, missing: &str) -> Result<&'a str, String> {
+    args.next()
+        .map(String::as_str)
+        .ok_or_else(|| missing.to_string())
 }
 
 #[derive(Default)]
@@ -281,17 +256,13 @@ pub struct Compilation {
     pub transpiled: Option<TranspileStats>,
     pub routed: Option<RouteStats>,
     pub diagnostics: Vec<Diagnostic>,
-    pub parse_time: std::time::Duration,
-    pub lower_time: std::time::Duration,
-    pub opt_time: std::time::Duration,
+    pub parse_time: Duration,
+    pub lower_time: Duration,
+    pub opt_time: Duration,
 }
 
 pub fn compile(source: &str, opt_level: u8) -> Compilation {
-    compile_verified(source, opt_level, false)
-}
-
-pub fn compile_verified(source: &str, opt_level: u8, verify_each: bool) -> Compilation {
-    compile_for(source, opt_level, verify_each, &Target::default())
+    compile_for(source, opt_level, false, &Target::default())
 }
 
 pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Target) -> Compilation {
@@ -313,13 +284,13 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     let mut lowering_violations = Vec::new();
     let lowered_cleanly = !diagnostics.iter().any(|d| d.severity == Severity::Error);
     if verify_each && lowered_cleanly {
-        for found in crate::verify::verify(&program) {
+        for found in verify::verify(&program) {
             lowering_violations.push(format!("after lowering: {found}"));
         }
     }
 
     let started = Instant::now();
-    let mut stats = opt::optimise_verified(&mut program, opt_level, verify_each && lowered_cleanly);
+    let mut stats = opt::optimise(&mut program, opt_level, verify_each && lowered_cleanly);
     let opt_time = started.elapsed();
 
     lowering_violations.append(&mut stats.violations);
@@ -328,6 +299,19 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     let transpiled = target
         .basis
         .map(|basis| transpile::transpile(&mut program, basis));
+    if let Some(stats) = &transpiled
+        && stats.leftover > 0
+    {
+        let noun = if stats.leftover == 1 { "gate" } else { "gates" };
+        diagnostics.push(
+            Diagnostic::warning(format!(
+                "{} {noun} left untranslated, with no exact form in basis {}",
+                stats.leftover,
+                stats.basis.name()
+            ))
+            .with_code("QIR0401"),
+        );
+    }
 
     let mut routed = None;
     if let Some(coupling) = &target.coupling {
@@ -341,7 +325,7 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     }
 
     if verify_each && (transpiled.is_some() || routed.is_some()) {
-        for found in crate::verify::verify(&program) {
+        for found in verify::verify(&program) {
             stats.violations.push(format!("after targeting: {found}"));
         }
     }
@@ -367,10 +351,9 @@ pub fn run(options: Options) -> i32 {
         }
     };
 
-    let name = options.input.display().to_string();
-    let file = SourceFile::new(name.clone(), source.clone());
+    let file = SourceFile::new(options.input.display().to_string(), source);
     let compilation = compile_for(
-        &source,
+        &file.text,
         options.opt_level,
         options.verify_each,
         &Target {
@@ -386,8 +369,7 @@ pub fn run(options: Options) -> i32 {
     let color = options.color.enabled();
     let mut errors = 0;
     for diagnostic in &compilation.diagnostics {
-        eprint!("{}", diagnostic.render_styled(&file, color));
-        eprintln!();
+        eprintln!("{}", diagnostic.render_styled(&file, color));
         if diagnostic.severity == Severity::Error {
             errors += 1;
         }
@@ -427,19 +409,25 @@ pub fn run(options: Options) -> i32 {
 
     let emitted = match options.emit {
         Emit::Check => {
-            println!(
-                "ok: {} qubits, {} results, {} gates, depth {}, profile {}",
-                program.num_qubits,
-                program.num_results,
-                program.gate_count(),
-                program.depth(),
-                program.profile.name()
-            );
+            println!("ok: {}", summary(program));
             return 0;
         }
         Emit::Ir => format!("{program}"),
-        Emit::Qasm3 => codegen::emit_qasm3(program),
-        Emit::Qir => codegen::emit_qir(program),
+        Emit::Qasm3 => match codegen::emit_qasm3(program) {
+            Ok(text) => text,
+            Err(reason) => {
+                eprintln!("error: cannot emit OpenQASM 3: {reason}");
+                eprintln!("note: --emit qir keeps the whole program");
+                return 1;
+            }
+        },
+        Emit::Qir => match codegen::emit_qir(program) {
+            Ok(text) => text,
+            Err(reason) => {
+                eprintln!("error: cannot emit QIR: {reason}");
+                return 1;
+            }
+        },
         Emit::Json => codegen::emit_json(program),
         Emit::Circuit => codegen::emit_circuit(program),
         Emit::Run => return execute(&options, &compilation),
@@ -480,22 +468,15 @@ fn execute(options: &Options, compilation: &Compilation) -> i32 {
     }
 
     let seed = options.seed.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(1)
     });
 
     println!("source:  {}", options.input.display());
     println!("kernel:  {}", simd::backend());
-    println!(
-        "program: {} qubits, {} results, {} gates, depth {}, profile {}",
-        program.num_qubits,
-        program.num_results,
-        program.gate_count(),
-        program.depth(),
-        program.profile.name()
-    );
+    println!("program: {}", summary(program));
 
     if compilation.stats.changed() {
         println!(
@@ -527,12 +508,10 @@ fn execute(options: &Options, compilation: &Compilation) -> i32 {
 
     if let Some(state) = &outcome.final_state {
         println!();
-        if outcome.sampled {
-            print!("{state}");
-        } else {
+        if !outcome.sampled {
             println!("state after the last shot:");
-            print!("{state}");
         }
+        print!("{state}");
 
         println!();
         for qubit in 0..program.num_qubits as usize {
@@ -555,27 +534,49 @@ fn execute(options: &Options, compilation: &Compilation) -> i32 {
         }
     }
 
-    if !outcome.counts.is_empty() {
-        let total: u64 = outcome.counts.values().sum();
-        println!();
-        println!(
-            "measurement over {total} shots ({}):",
-            if outcome.sampled {
-                "sampled from the final state"
-            } else {
-                "simulated per shot"
-            }
-        );
-
-        let mut rows: Vec<(&String, &u64)> = outcome.counts.iter().collect();
-        rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-
-        for (bits, count) in rows {
-            println!("  {bits}  {count:>8}   {:.4}", *count as f64 / total as f64);
-        }
-    }
+    print_tally("returned", "", &outcome.returns);
+    print_tally(
+        "measurement",
+        if outcome.sampled {
+            " (sampled from the final state)"
+        } else {
+            " (simulated per shot)"
+        },
+        &outcome.counts,
+    );
 
     println!();
     println!("simulated in {elapsed:.3?}");
     0
+}
+
+fn summary(program: &Program) -> String {
+    format!(
+        "{} qubits, {} results, {} gates, depth {}, profile {}",
+        program.num_qubits,
+        program.num_results,
+        program.gate_count(),
+        program.depth(),
+        program.profile.name()
+    )
+}
+
+fn print_tally(name: &str, note: &str, tally: &BTreeMap<String, u64>) {
+    if tally.is_empty() {
+        return;
+    }
+
+    let total: u64 = tally.values().sum();
+    let width = tally.keys().map(String::len).max().unwrap_or(0);
+    let mut rows: Vec<(&String, &u64)> = tally.iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+
+    println!();
+    println!("{name} over {total} shots{note}:");
+    for (key, count) in rows {
+        println!(
+            "  {key:<width$}  {count:>8}   {:.4}",
+            *count as f64 / total as f64
+        );
+    }
 }

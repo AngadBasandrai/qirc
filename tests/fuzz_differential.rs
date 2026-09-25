@@ -1,9 +1,11 @@
 mod common;
 
-use common::compile;
+use std::collections::BTreeMap;
+
+use common::{compile, final_state, run};
 use qirc::ir::*;
-use qirc::simulator::exec::{self, ExecConfig};
-use qirc::simulator::matrix::{C64, Matrix2, matrix_for};
+use qirc::simulator::exec;
+use qirc::simulator::matrix::{C64, matrix_for};
 use qirc::simulator::state::Rng;
 
 struct Gen(Rng);
@@ -105,12 +107,8 @@ fn random_unitary_circuit(rng: &mut Gen, qubits: usize, depth: usize) -> String 
                 );
             }
             5 if qubits >= 3 => {
-                let a = rng.below(qubits);
-                let mut b = rng.below(qubits);
+                let (a, b) = rng.two_distinct(qubits);
                 let mut c = rng.below(qubits);
-                while b == a {
-                    b = rng.below(qubits);
-                }
                 while c == a || c == b {
                     c = rng.below(qubits);
                 }
@@ -146,11 +144,7 @@ fn reference_state(program: &Program) -> Vec<C64> {
 
     for gate in program.gates() {
         let controls: Vec<usize> = gate.controls.iter().map(|q| q.index()).collect();
-        let params: Vec<f64> = gate
-            .params
-            .iter()
-            .filter_map(|p| p.constant().map(|c| c.as_f64()))
-            .collect();
+        let params = gate.constant_params();
 
         if gate.kind == GateKind::Swap {
             let (a, b) = (gate.targets[0].index(), gate.targets[1].index());
@@ -168,7 +162,7 @@ fn reference_state(program: &Program) -> Vec<C64> {
             continue;
         }
 
-        let matrix: Matrix2 = matrix_for(gate.kind, &params);
+        let matrix = matrix_for(gate.kind, &params);
         let target = gate.targets[0].index();
         let mut next = state.clone();
 
@@ -193,16 +187,12 @@ fn reference_state(program: &Program) -> Vec<C64> {
 }
 
 fn simulated_state(program: &Program) -> Vec<C64> {
-    let outcome = exec::execute(
-        program,
-        ExecConfig {
-            shots: 0,
-            seed: 1,
-            keep_state: true,
-        },
-    );
-    let state = outcome.final_state.expect("a final state");
+    let state = final_state(program);
     (0..state.len()).map(|i| state.amplitude(i)).collect()
+}
+
+fn counts(source: &str, level: u8, shots: u64, seed: u64) -> BTreeMap<String, u64> {
+    run(&compile(source, level), shots, seed).counts
 }
 
 fn assert_same_state(left: &[C64], right: &[C64], context: &str) {
@@ -261,7 +251,7 @@ fn opt_levels_unitary() {
 
         let baseline = simulated_state(&compile(&source, 0));
 
-        for level in 1..=3u8 {
+        for level in 1..=3 {
             let optimised = simulated_state(&compile(&source, level));
             assert_same_state(
                 &baseline,
@@ -325,27 +315,11 @@ fn opt_levels_measured() {
         let qubits = 2 + rng.below(3);
         let source = random_measured_circuit(&mut rng, qubits);
 
-        let baseline = exec::execute(
-            &compile(&source, 0),
-            ExecConfig {
-                shots: 600,
-                seed: 4242,
-                keep_state: false,
-            },
-        );
-
-        for level in 1..=3u8 {
-            let optimised = exec::execute(
-                &compile(&source, level),
-                ExecConfig {
-                    shots: 600,
-                    seed: 4242,
-                    keep_state: false,
-                },
-            );
-
+        let base = counts(&source, 0, 600, 4242);
+        for level in 1..=3 {
             assert_eq!(
-                baseline.counts, optimised.counts,
+                base,
+                counts(&source, level, 600, 4242),
                 "trial {trial} at -O{level} changed the observed outcomes\n{source}"
             );
         }
@@ -419,27 +393,11 @@ fn opt_levels_slots() {
     for trial in 0..40 {
         let source = random_slot_circuit(&mut rng);
 
-        let baseline = exec::execute(
-            &compile(&source, 0),
-            ExecConfig {
-                shots: 400,
-                seed: 909,
-                keep_state: false,
-            },
-        );
-
-        for level in 1..=3u8 {
-            let optimised = exec::execute(
-                &compile(&source, level),
-                ExecConfig {
-                    shots: 400,
-                    seed: 909,
-                    keep_state: false,
-                },
-            );
-
+        let base = counts(&source, 0, 400, 909);
+        for level in 1..=3 {
             assert_eq!(
-                baseline.counts, optimised.counts,
+                base,
+                counts(&source, level, 400, 909),
                 "trial {trial} at -O{level} changed a program that stores through memory\n{source}"
             );
         }
@@ -455,7 +413,7 @@ fn verifier_accepts() {
         let depth = 4 + rng.below(10);
         let source = random_unitary_circuit(&mut rng, qubits, depth);
 
-        for level in 0..=3u8 {
+        for level in 0..=3 {
             let program = compile(&source, level);
             let violations = qirc::verify::verify(&program);
             assert!(

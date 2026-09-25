@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::f64::consts::FRAC_PI_2;
 use std::mem;
+use std::ops::Range;
 
 use crate::ast;
 use crate::diag::{Diagnostic, Span};
+use crate::inline::inline_module;
 use crate::ir::*;
 use crate::qis::{self, Functor, Intrinsic};
 
@@ -12,7 +15,7 @@ pub struct Lowered {
 }
 
 pub fn lower(module: &ast::Module) -> Lowered {
-    let expanded = crate::inline::inline_module(module);
+    let expanded = inline_module(module);
     let module = &expanded.module;
 
     let mut flattener = Lowerer::new(module, Mode::Flatten);
@@ -37,13 +40,13 @@ pub fn lower(module: &ast::Module) -> Lowered {
     }
 }
 
-pub const MAX_WIRES: u32 = 1 << 16;
+const MAX_WIRES: u32 = 1 << 16;
 
 const MAX_INLINE_DEPTH: usize = 32;
 const MAX_FLATTEN_STEPS: usize = 200_000;
 const MAX_FLATTEN_OPS: usize = 2_000_000;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(PartialEq)]
 enum Mode {
     Cfg,
     Flatten,
@@ -63,7 +66,6 @@ enum Binding {
     Id(u32),
 }
 
-#[derive(Clone, Copy)]
 struct GateShape {
     kind: GateKind,
     controls: usize,
@@ -174,7 +176,32 @@ impl<'a> Lowerer<'a> {
         self.max_result = self.max_result.max(result.0 + 1);
     }
 
-    fn entry_setup(&mut self) -> Option<(&'a ast::Function, Profile)> {
+    fn alloc_result(&mut self) -> ResultId {
+        let id = ResultId(self.next_result);
+        self.next_result += 1;
+        self.note_result(id);
+        id
+    }
+
+    fn read_result(&mut self, id: ResultId, span: Span) -> Operand {
+        self.note_result(id);
+        let dest = self.fresh_value();
+        self.ops.push(Op::Assign {
+            dest,
+            ty: Scalar::Bool,
+            expr: Expr::ReadResult(id),
+            span,
+        });
+        Operand::Value(dest)
+    }
+
+    fn bind(&mut self, name: Option<&str>, binding: Binding) {
+        if let Some(name) = name {
+            self.env.insert(name.to_string(), binding);
+        }
+    }
+
+    fn entry(&self) -> Option<(&'a ast::Function, Profile, u32, u32)> {
         let entry = self.module.entry_point()?;
         let attrs = self.module.attributes_of(&entry.sig);
 
@@ -190,17 +217,14 @@ impl<'a> Lowerer<'a> {
         let declared_results =
             attribute_count(&attrs, &["required_num_results", "num_required_results"]);
 
-        if declared_qubits > MAX_WIRES || declared_results > MAX_WIRES {
-            self.too_many_wires = true;
-            return Some((entry, profile));
-        }
+        Some((entry, profile, declared_qubits, declared_results))
+    }
 
-        self.next_qubit = declared_qubits;
-        self.next_result = declared_results;
-        self.max_qubit = declared_qubits;
-        self.max_result = declared_results;
-
-        Some((entry, profile))
+    fn declare(&mut self, qubits: u32, results: u32) {
+        self.next_qubit = qubits;
+        self.next_result = results;
+        self.max_qubit = qubits;
+        self.max_result = results;
     }
 
     fn bind_params(&mut self, entry: &ast::Function) {
@@ -212,9 +236,7 @@ impl<'a> Lowerer<'a> {
                     self.env.insert(name.clone(), Binding::Qubit(qubit));
                 }
                 Some("Result") => {
-                    let result = ResultId(self.next_result);
-                    self.next_result += 1;
-                    self.max_result = self.max_result.max(self.next_result);
+                    let result = self.alloc_result();
                     self.env.insert(name.clone(), Binding::Result(result));
                 }
                 _ => {}
@@ -223,7 +245,12 @@ impl<'a> Lowerer<'a> {
     }
 
     fn run_flat(&mut self) -> Option<Program> {
-        let (entry, profile) = self.entry_setup()?;
+        let (entry, profile, qubits, results) = self.entry()?;
+        if qubits > MAX_WIRES || results > MAX_WIRES {
+            self.too_many_wires = true;
+        } else {
+            self.declare(qubits, results);
+        }
 
         self.bind_params(entry);
         self.execute_function(entry);
@@ -240,11 +267,9 @@ impl<'a> Lowerer<'a> {
             term: Term::Ret(None),
             span: entry.span,
         });
-        program.entry = BlockId(0);
         program.num_qubits = self.max_qubit;
         program.num_results = self.max_result;
         program.next_value = self.next_value;
-        program.num_slots = 0;
         self.check_wire_limit(&mut program);
 
         Some(program)
@@ -270,7 +295,24 @@ impl<'a> Lowerer<'a> {
             };
             self.previous_label = previous.clone();
 
-            for inst in &block.instructions {
+            let phis = block
+                .instructions
+                .iter()
+                .take_while(|inst| matches!(inst.kind, ast::InstKind::Phi { .. }))
+                .count();
+            let chosen: Vec<Option<Binding>> = block.instructions[..phis]
+                .iter()
+                .map(|inst| self.phi_choice(inst))
+                .collect();
+            for (inst, binding) in block.instructions[..phis].iter().zip(chosen) {
+                let Some(binding) = binding else {
+                    self.bailed = true;
+                    return None;
+                };
+                self.bind(inst.result.as_deref(), binding);
+            }
+
+            for inst in &block.instructions[phis..] {
                 self.lower_instruction(inst);
                 if self.bailed {
                     return None;
@@ -310,11 +352,7 @@ impl<'a> Lowerer<'a> {
                     let key = value.as_i64();
                     cases
                         .iter()
-                        .find(|(candidate, _)| match &candidate.value {
-                            ast::Value::Int(i) => *i as i64 == key,
-                            ast::Value::Bool(b) => i64::from(*b) == key,
-                            _ => false,
-                        })
+                        .find(|(candidate, _)| case_key(&candidate.value) == Some(key))
                         .map(|(_, label)| label.clone())
                         .unwrap_or_else(|| default.clone())
                 }
@@ -331,7 +369,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn const_of(&mut self, value: &ast::Value) -> Option<Const> {
+    fn const_of(&self, value: &ast::Value) -> Option<Const> {
         match value {
             ast::Value::Int(i) => Some(Const::Int(*i as i64)),
             ast::Value::Float(f) => Some(Const::Float(*f)),
@@ -342,18 +380,11 @@ impl<'a> Lowerer<'a> {
                 Some(Binding::Qubit(q)) => Some(Const::Int(i64::from(q.0))),
                 Some(Binding::Id(id)) => Some(Const::Int(i64::from(*id))),
                 Some(Binding::ResultConst(b)) => Some(Const::Bool(*b)),
-                Some(Binding::Cell(index)) => {
-                    let slot = *index;
-                    self.cells.get(slot).copied().flatten()
-                }
+                Some(Binding::Cell(index)) => self.cells.get(*index).copied().flatten(),
                 _ => None,
             },
             _ => None,
         }
-    }
-
-    fn evaluate(&self, expr: &Expr) -> Option<Const> {
-        expr.fold(|operand| operand.constant())
     }
 
     fn global_element(&self, name: &str, index: u64) -> Option<ast::Value> {
@@ -364,7 +395,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn run(&mut self) -> Program {
-        let Some(entry) = self.module.entry_point() else {
+        let Some((entry, profile, qubits, results)) = self.entry() else {
             self.diagnostics.push(
                 Diagnostic::error("no entry point found")
                     .with_code("QIR0201")
@@ -372,25 +403,7 @@ impl<'a> Lowerer<'a> {
             );
             return Program::new("empty", Profile::Unrestricted);
         };
-
-        let attrs = self.module.attributes_of(&entry.sig);
-
-        let profile = attrs
-            .iter()
-            .find(|a| a.key() == "qir_profiles")
-            .and_then(|a| a.value())
-            .map(Profile::from_attribute)
-            .unwrap_or(Profile::Unrestricted);
-
-        let declared_qubits =
-            attribute_count(&attrs, &["required_num_qubits", "num_required_qubits"]);
-        let declared_results =
-            attribute_count(&attrs, &["required_num_results", "num_required_results"]);
-
-        self.next_qubit = declared_qubits;
-        self.next_result = declared_results;
-        self.max_qubit = declared_qubits;
-        self.max_result = declared_results;
+        self.declare(qubits, results);
 
         let mut program = Program::new(entry.sig.name.clone(), profile);
 
@@ -399,26 +412,9 @@ impl<'a> Lowerer<'a> {
                 .insert(block.label.clone(), BlockId(index as u32));
         }
 
-        for param in &entry.sig.params {
-            let Some(name) = &param.name else { continue };
-            match param.ty.pointee_name() {
-                Some("Qubit") => {
-                    let qubit = self.alloc_qubits(1);
-                    self.env.insert(name.clone(), Binding::Qubit(qubit));
-                }
-                Some("Result") => {
-                    let result = ResultId(self.next_result);
-                    self.next_result += 1;
-                    self.max_result = self.max_result.max(self.next_result);
-                    self.env.insert(name.clone(), Binding::Result(result));
-                }
-                _ => {}
-            }
-        }
+        self.bind_params(entry);
 
         for block in &entry.blocks {
-            self.ops = Vec::new();
-
             for inst in &block.instructions {
                 self.lower_instruction(inst);
             }
@@ -445,7 +441,6 @@ impl<'a> Lowerer<'a> {
             });
         }
 
-        program.entry = BlockId(0);
         program.num_slots = self.next_slot;
         program.num_qubits = self.max_qubit;
         program.num_results = self.max_result;
@@ -457,7 +452,7 @@ impl<'a> Lowerer<'a> {
             .drain()
             .map(|(name, (_, span))| (name, span))
             .collect();
-        unresolved.sort_by_key(|(_, span)| span.start);
+        unresolved.sort_by(|(a, x), (b, y)| (x.start, a).cmp(&(y.start, b)));
         for (name, span) in unresolved {
             self.error(
                 format!("`%{name}` is not defined"),
@@ -533,10 +528,8 @@ impl<'a> Lowerer<'a> {
                         );
                         continue;
                     };
-                    let key = match &value.value {
-                        ast::Value::Int(i) => *i as i64,
-                        ast::Value::Bool(b) => *b as i64,
-                        _ => continue,
+                    let Some(key) = case_key(&value.value) else {
+                        continue;
                     };
                     lowered.push((key, target));
                 }
@@ -555,49 +548,33 @@ impl<'a> Lowerer<'a> {
         match &inst.kind {
             ast::InstKind::Call(call) => self.lower_call(inst.result.as_deref(), call, span),
 
-            ast::InstKind::Binary { op, lhs, rhs, .. } => {
-                let (Some(l), Some(r)) = (self.operand(lhs, span), self.operand(rhs, span)) else {
-                    return;
-                };
-                self.assign(
-                    inst.result.as_deref(),
-                    Expr::Binary {
-                        op: *op,
-                        lhs: l,
-                        rhs: r,
-                    },
-                    span,
-                );
+            ast::InstKind::Binary { op, ty, lhs, rhs } => {
+                let ty = Scalar::of(ty);
+                self.assign_pair(inst, ty, ty, lhs, rhs, |lhs, rhs| Expr::Binary {
+                    op: *op,
+                    lhs,
+                    rhs,
+                })
             }
 
-            ast::InstKind::ICmp { pred, lhs, rhs, .. } => {
-                let (Some(l), Some(r)) = (self.operand(lhs, span), self.operand(rhs, span)) else {
-                    return;
-                };
-                self.assign(
-                    inst.result.as_deref(),
-                    Expr::ICmp {
-                        pred: *pred,
-                        lhs: l,
-                        rhs: r,
-                    },
-                    span,
-                );
+            ast::InstKind::ICmp { pred, ty, lhs, rhs } => {
+                let ty = Scalar::of(ty);
+                self.assign_pair(inst, ty, Scalar::Bool, lhs, rhs, |lhs, rhs| Expr::ICmp {
+                    pred: *pred,
+                    ty,
+                    lhs,
+                    rhs,
+                })
             }
 
             ast::InstKind::FCmp { pred, lhs, rhs, .. } => {
-                let (Some(l), Some(r)) = (self.operand(lhs, span), self.operand(rhs, span)) else {
-                    return;
-                };
-                self.assign(
-                    inst.result.as_deref(),
+                self.assign_pair(inst, Scalar::Double, Scalar::Bool, lhs, rhs, |lhs, rhs| {
                     Expr::FCmp {
                         pred: *pred,
-                        lhs: l,
-                        rhs: r,
-                    },
-                    span,
-                );
+                        lhs,
+                        rhs,
+                    }
+                })
             }
 
             ast::InstKind::Select {
@@ -605,15 +582,17 @@ impl<'a> Lowerer<'a> {
                 if_true,
                 if_false,
             } => {
+                let ty = Scalar::of(&if_true.ty);
                 let (Some(c), Some(t), Some(f)) = (
-                    self.operand(&cond.value, span),
-                    self.operand(&if_true.value, span),
-                    self.operand(&if_false.value, span),
+                    self.typed(&cond.value, Scalar::Bool, span),
+                    self.typed(&if_true.value, ty, span),
+                    self.typed(&if_false.value, ty, span),
                 ) else {
                     return;
                 };
                 self.assign(
                     inst.result.as_deref(),
+                    ty,
                     Expr::Select {
                         cond: c,
                         if_true: t,
@@ -627,14 +606,12 @@ impl<'a> Lowerer<'a> {
                 if let Some(qubit) = self.static_qubit(&operand.value)
                     && to.pointee_name() == Some("Qubit")
                 {
-                    if let Some(name) = inst.result.as_deref() {
-                        self.env.insert(name.to_string(), Binding::Qubit(qubit));
-                    }
+                    self.bind(inst.result.as_deref(), Binding::Qubit(qubit));
                     return;
                 }
 
+                let kind = to.pointee_name().unwrap_or("ptr");
                 if *op == ast::CastOp::IntToPtr
-                    && let Some(kind) = to.pointee_name().or(Some("ptr"))
                     && matches!(kind, "Qubit" | "Result" | "ptr")
                     && let Some(index) = self.const_of(&operand.value)
                     && let Some(name) = inst.result.as_deref()
@@ -665,34 +642,27 @@ impl<'a> Lowerer<'a> {
                     return;
                 }
 
-                let Some(value) = self.operand(&operand.value, span) else {
+                let from = Scalar::of(&operand.ty);
+                let Some(value) = self.typed(&operand.value, from, span) else {
                     return;
                 };
                 self.assign(
                     inst.result.as_deref(),
+                    Scalar::of(to),
                     Expr::Cast {
                         op: *op,
+                        from,
                         operand: value,
                     },
                     span,
                 );
             }
 
-            ast::InstKind::Phi { incoming, .. } => {
+            ast::InstKind::Phi { ty, incoming } => {
+                let ty = Scalar::of(ty);
                 if self.flattening() {
-                    let from = self.previous_label.clone();
-                    let chosen = from.and_then(|label| {
-                        incoming
-                            .iter()
-                            .find(|(_, block)| *block == label)
-                            .map(|(value, _)| value.clone())
-                    });
-                    match chosen.and_then(|value| self.binding_for(&value)) {
-                        Some(binding) => {
-                            if let Some(name) = inst.result.as_deref() {
-                                self.env.insert(name.to_string(), binding);
-                            }
-                        }
+                    match self.phi_choice(inst) {
+                        Some(binding) => self.bind(inst.result.as_deref(), binding),
                         None => self.bailed = true,
                     }
                     return;
@@ -717,31 +687,27 @@ impl<'a> Lowerer<'a> {
                             }
                             Operand::Value(id)
                         }
-                        _ => match self.operand(value, span) {
+                        _ => match self.typed(value, ty, span) {
                             Some(operand) => operand,
                             None => continue,
                         },
                     };
                     lowered.push((block, operand));
                 }
-                self.assign(inst.result.as_deref(), Expr::Phi(lowered), span);
+                self.assign(inst.result.as_deref(), ty, Expr::Phi(lowered), span);
             }
 
             ast::InstKind::Alloca { .. } => {
                 if self.flattening() {
                     let cell = self.cells.len();
                     self.cells.push(None);
-                    if let Some(name) = inst.result.as_deref() {
-                        self.env.insert(name.to_string(), Binding::Cell(cell));
-                    }
+                    self.bind(inst.result.as_deref(), Binding::Cell(cell));
                     return;
                 }
 
                 let slot = SlotId(self.next_slot);
                 self.next_slot += 1;
-                if let Some(name) = inst.result.as_deref() {
-                    self.env.insert(name.to_string(), Binding::Slot(slot));
-                }
+                self.bind(inst.result.as_deref(), Binding::Slot(slot));
             }
 
             ast::InstKind::Store { value, ptr } => {
@@ -771,7 +737,7 @@ impl<'a> Lowerer<'a> {
                 let Some(slot) = self.resolve_slot(&ptr.value) else {
                     return;
                 };
-                let Some(operand) = self.operand(&value.value, span) else {
+                let Some(operand) = self.typed(&value.value, Scalar::of(&value.ty), span) else {
                     return;
                 };
                 self.ops.push(Op::Store {
@@ -781,7 +747,7 @@ impl<'a> Lowerer<'a> {
                 });
             }
 
-            ast::InstKind::Load { ptr, .. } => {
+            ast::InstKind::Load { ty, ptr } => {
                 if self.flattening() {
                     let binding = match &ptr.value {
                         ast::Value::Local(name) => self.env.get(name).cloned(),
@@ -791,20 +757,14 @@ impl<'a> Lowerer<'a> {
                     match binding {
                         Some(Binding::Cell(index)) => {
                             if let Some(qubit) = self.env.get(&format!("cell#{index}")).cloned() {
-                                if let Some(name) = inst.result.as_deref() {
-                                    self.env.insert(name.to_string(), qubit);
-                                }
+                                self.bind(inst.result.as_deref(), qubit);
                                 return;
                             }
                             match self.cells.get(index).copied().flatten() {
-                                Some(value) => {
-                                    if let Some(name) = inst.result.as_deref() {
-                                        self.env.insert(
-                                            name.to_string(),
-                                            Binding::Value(Operand::Const(value)),
-                                        );
-                                    }
-                                }
+                                Some(value) => self.bind(
+                                    inst.result.as_deref(),
+                                    Binding::Value(Operand::Const(value)),
+                                ),
                                 None => self.bailed = true,
                             }
                             return;
@@ -815,11 +775,7 @@ impl<'a> Lowerer<'a> {
                         }) => {
                             match self.global_element(&global, index) {
                                 Some(element) => match self.binding_for(&element) {
-                                    Some(found) => {
-                                        if let Some(name) = inst.result.as_deref() {
-                                            self.env.insert(name.to_string(), found);
-                                        }
-                                    }
+                                    Some(found) => self.bind(inst.result.as_deref(), found),
                                     None => self.bailed = true,
                                 },
                                 None => self.bailed = true,
@@ -831,7 +787,12 @@ impl<'a> Lowerer<'a> {
                 }
 
                 if let Some(slot) = self.resolve_slot(&ptr.value) {
-                    self.assign(inst.result.as_deref(), Expr::Load(slot), span);
+                    self.assign(
+                        inst.result.as_deref(),
+                        Scalar::of(ty),
+                        Expr::Load(slot),
+                        span,
+                    );
                     return;
                 }
                 if let ast::Value::Global(global) = &ptr.value
@@ -874,24 +835,18 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn array_element(&mut self, base: &ast::Value, indices: &[ast::TypedValue]) -> Option<Binding> {
+    fn array_element(&self, base: &ast::Value, indices: &[ast::TypedValue]) -> Option<Binding> {
         let ast::Value::Global(name) = base else {
             return None;
         };
         self.module.global(name)?;
 
         let last = indices.last()?;
-        let index = match self.const_of(&last.value) {
-            Some(value) => value.as_i64(),
-            None => return None,
-        };
-        if index < 0 {
-            return None;
-        }
+        let index = u64::try_from(self.const_of(&last.value)?.as_i64()).ok()?;
 
         Some(Binding::GlobalElement {
             name: name.clone(),
-            index: index as u64,
+            index,
         })
     }
 
@@ -914,14 +869,20 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn assign(&mut self, result: Option<&str>, expr: Expr, span: Span) {
+    fn phi_choice(&mut self, inst: &ast::Instruction) -> Option<Binding> {
+        let ast::InstKind::Phi { incoming, .. } = &inst.kind else {
+            return None;
+        };
+        let label = self.previous_label.as_deref()?;
+        let (value, _) = incoming.iter().find(|(_, block)| block == label)?;
+        self.binding_for(value)
+    }
+
+    fn assign(&mut self, result: Option<&str>, ty: Scalar, expr: Expr, span: Span) {
         if self.flattening()
-            && let Some(value) = self.evaluate(&expr)
+            && let Some(value) = expr.fold(ty, |o| o.constant())
         {
-            if let Some(name) = result {
-                self.env
-                    .insert(name.to_string(), Binding::Value(Operand::Const(value)));
-            }
+            self.bind(result, Binding::Value(Operand::Const(value)));
             return;
         }
 
@@ -929,11 +890,32 @@ impl<'a> Lowerer<'a> {
             Some((id, _)) => id,
             None => self.fresh_value(),
         };
-        self.ops.push(Op::Assign { dest, expr, span });
-        if let Some(name) = result {
-            self.env
-                .insert(name.to_string(), Binding::Value(Operand::Value(dest)));
-        }
+        self.ops.push(Op::Assign {
+            dest,
+            ty,
+            expr,
+            span,
+        });
+        self.bind(result, Binding::Value(Operand::Value(dest)));
+    }
+
+    fn assign_pair(
+        &mut self,
+        inst: &ast::Instruction,
+        operands: Scalar,
+        ty: Scalar,
+        lhs: &ast::Value,
+        rhs: &ast::Value,
+        make: impl FnOnce(Operand, Operand) -> Expr,
+    ) {
+        let span = inst.span;
+        let (Some(l), Some(r)) = (
+            self.typed(lhs, operands, span),
+            self.typed(rhs, operands, span),
+        ) else {
+            return;
+        };
+        self.assign(inst.result.as_deref(), ty, make(l, r), span);
     }
 
     fn lower_call(&mut self, result: Option<&str>, call: &ast::Call, span: Span) {
@@ -953,6 +935,15 @@ impl<'a> Lowerer<'a> {
 
         if let Some(function) = self.module.function(callee) {
             self.inline(result, call, function, span);
+            return;
+        }
+
+        if callee.starts_with("__quantum__qis__") {
+            self.error(
+                format!("unsupported quantum instruction `{callee}`"),
+                span,
+                "dropping it would change what the program computes",
+            );
             return;
         }
 
@@ -989,14 +980,7 @@ impl<'a> Lowerer<'a> {
         }
 
         if self.flattening() {
-            let mut scope: HashMap<String, Binding> = HashMap::new();
-            for (param, arg) in function.sig.params.iter().zip(&call.args) {
-                let Some(name) = &param.name else { continue };
-                if let Some(binding) = self.binding_for(&arg.value) {
-                    scope.insert(name.clone(), binding);
-                }
-            }
-
+            let scope = self.scope(function, call);
             let saved_env = mem::replace(&mut self.env, scope);
             let saved_previous = self.previous_label.take();
             self.inline_depth += 1;
@@ -1007,8 +991,8 @@ impl<'a> Lowerer<'a> {
             self.env = saved_env;
             self.previous_label = saved_previous;
 
-            if let (Some(name), Some(binding)) = (result, returned) {
-                self.env.insert(name.to_string(), binding);
+            if let Some(binding) = returned {
+                self.bind(result, binding);
             }
             return;
         }
@@ -1022,14 +1006,7 @@ impl<'a> Lowerer<'a> {
             return;
         }
 
-        let mut scope: HashMap<String, Binding> = HashMap::new();
-        for (param, arg) in function.sig.params.iter().zip(&call.args) {
-            let Some(name) = &param.name else { continue };
-            if let Some(binding) = self.binding_for(&arg.value) {
-                scope.insert(name.clone(), binding);
-            }
-        }
-
+        let scope = self.scope(function, call);
         let saved = mem::replace(&mut self.env, scope);
         self.inline_depth += 1;
 
@@ -1046,9 +1023,20 @@ impl<'a> Lowerer<'a> {
         self.inline_depth -= 1;
         self.env = saved;
 
-        if let (Some(name), Some(binding)) = (result, returned) {
-            self.env.insert(name.to_string(), binding);
+        if let Some(binding) = returned {
+            self.bind(result, binding);
         }
+    }
+
+    fn scope(&mut self, function: &ast::Function, call: &ast::Call) -> HashMap<String, Binding> {
+        let mut scope = HashMap::new();
+        for (param, arg) in function.sig.params.iter().zip(&call.args) {
+            let Some(name) = &param.name else { continue };
+            if let Some(binding) = self.binding_for(&arg.value) {
+                scope.insert(name.clone(), binding);
+            }
+        }
+        scope
     }
 
     fn binding_for(&mut self, value: &ast::Value) -> Option<Binding> {
@@ -1060,8 +1048,7 @@ impl<'a> Lowerer<'a> {
             return self.env.get(name).cloned();
         }
 
-        let span = Span::DUMMY;
-        self.operand(value, span).map(Binding::Value)
+        self.operand(value, Span::DUMMY).map(Binding::Value)
     }
 
     fn lower_intrinsic(
@@ -1090,41 +1077,36 @@ impl<'a> Lowerer<'a> {
                 span,
             ),
 
-            Intrinsic::Measure { with_result_arg } => {
+            Intrinsic::Ising(axis) => self.lower_ising(call, axis, functor, span),
+
+            Intrinsic::Measure { reset } => {
                 let Some(qubit) = self.qubit_arg(call, 0, span) else {
                     return;
                 };
 
-                let result_id = if with_result_arg {
-                    match self.result_arg(call, 1, span) {
-                        Some(id) => id,
-                        None => return,
-                    }
-                } else {
-                    let id = ResultId(self.next_result);
-                    self.next_result += 1;
+                let result_id = if call.args.len() > 1 {
+                    let Some(id) = self.result_arg(call, 1, span) else {
+                        return;
+                    };
                     id
+                } else {
+                    self.alloc_result()
                 };
 
-                self.note_qubit(qubit);
-                self.note_result(result_id);
-
-                if let Some(name) = result {
-                    self.env
-                        .insert(name.to_string(), Binding::Result(result_id));
-                }
+                self.bind(result, Binding::Result(result_id));
 
                 self.ops.push(Op::Measure {
                     qubit,
                     result: result_id,
-                    dest: None,
                     span,
                 });
+                if reset {
+                    self.ops.push(Op::Reset { qubit, span });
+                }
             }
 
             Intrinsic::Reset => {
                 if let Some(qubit) = self.qubit_arg(call, 0, span) {
-                    self.note_qubit(qubit);
                     self.ops.push(Op::Reset { qubit, span });
                 }
             }
@@ -1133,47 +1115,48 @@ impl<'a> Lowerer<'a> {
                 let Some(result_id) = self.result_arg(call, 0, span) else {
                     return;
                 };
-                self.note_result(result_id);
-                self.assign(result, Expr::ReadResult(result_id), span);
+                self.assign(result, Scalar::Bool, Expr::ReadResult(result_id), span);
             }
 
-            Intrinsic::ResultGetZero => {
-                if let Some(name) = result {
-                    self.env
-                        .insert(name.to_string(), Binding::ResultConst(false));
-                }
-            }
+            Intrinsic::ResultGetZero => self.bind(result, Binding::ResultConst(false)),
 
-            Intrinsic::ResultGetOne => {
-                if let Some(name) = result {
-                    self.env
-                        .insert(name.to_string(), Binding::ResultConst(true));
-                }
-            }
+            Intrinsic::ResultGetOne => self.bind(result, Binding::ResultConst(true)),
 
             Intrinsic::ResultEqual => self.lower_result_equal(result, call, span),
 
             Intrinsic::RecordOutput(kind) => {
-                let (result_id, count) = match kind {
-                    OutputKind::Tuple | OutputKind::Array => {
-                        let count = call.args.first().and_then(|a| match a.value {
-                            ast::Value::Int(i) => Some(i as i64),
-                            _ => None,
-                        });
-                        (None, count)
+                let (result_id, value, count) = match kind {
+                    OutputKind::Tuple | OutputKind::Array if call.args.len() > 1 => {
+                        match self.operand(&call.args[0].value, call.args[0].span) {
+                            Some(Operand::Const(count)) => (None, None, Some(count.as_i64())),
+                            count => (None, count, None),
+                        }
                     }
-                    _ => (self.result_arg(call, 0, span), None),
+                    OutputKind::Tuple
+                    | OutputKind::Array
+                    | OutputKind::TupleEnd
+                    | OutputKind::ArrayEnd => (None, None, None),
+                    OutputKind::Result => (self.result_arg(call, 0, span), None, None),
+                    OutputKind::Bool | OutputKind::Int | OutputKind::Double => {
+                        let ty = match kind {
+                            OutputKind::Bool => Scalar::Bool,
+                            OutputKind::Double => Scalar::Double,
+                            _ => Scalar::Int(64),
+                        };
+                        let value = call
+                            .args
+                            .first()
+                            .and_then(|a| self.typed(&a.value, ty, a.span));
+                        (None, value, None)
+                    }
                 };
-
-                if let Some(id) = result_id {
-                    self.note_result(id);
-                }
 
                 let label = call.args.last().and_then(|a| self.resolve_label(&a.value));
 
                 self.ops.push(Op::RecordOutput {
                     kind,
                     result: result_id,
+                    value,
                     count,
                     label,
                     span,
@@ -1182,18 +1165,11 @@ impl<'a> Lowerer<'a> {
 
             Intrinsic::QubitAllocate => {
                 let qubit = self.alloc_qubits(1);
-                if let Some(name) = result {
-                    self.env.insert(name.to_string(), Binding::Qubit(qubit));
-                }
+                self.bind(result, Binding::Qubit(qubit));
             }
 
             Intrinsic::QubitAllocateArray => {
-                let count = match call
-                    .args
-                    .first()
-                    .map(|a| a.value.clone())
-                    .and_then(|value| self.const_of(&value))
-                {
+                let count = match call.args.first().and_then(|a| self.const_of(&a.value)) {
                     Some(n) if n.as_i64() >= 0 => n.as_i64() as u64,
                     _ => {
                         self.error(
@@ -1205,17 +1181,12 @@ impl<'a> Lowerer<'a> {
                     }
                 };
                 let base = self.alloc_qubits(count);
-                if let Some(name) = result {
-                    self.env
-                        .insert(name.to_string(), Binding::QubitArray { base, len: count });
-                }
+                self.bind(result, Binding::QubitArray { base, len: count });
             }
 
             Intrinsic::ArrayGetElementPtr => {
-                let Some(array) = call.args.first().map(|a| a.value.clone()) else {
-                    return;
-                };
-                let ast::Value::Local(array_name) = &array else {
+                let Some(ast::Value::Local(array_name)) = call.args.first().map(|a| &a.value)
+                else {
                     return;
                 };
                 let Some(Binding::QubitArray { base, len }) = self.env.get(array_name).cloned()
@@ -1223,12 +1194,7 @@ impl<'a> Lowerer<'a> {
                     return;
                 };
 
-                let index = match call
-                    .args
-                    .get(1)
-                    .map(|a| a.value.clone())
-                    .and_then(|value| self.const_of(&value))
-                {
+                let index = match call.args.get(1).and_then(|a| self.const_of(&a.value)) {
                     Some(i) if i.as_i64() >= 0 => i.as_i64() as u64,
                     _ => {
                         self.error(
@@ -1251,9 +1217,7 @@ impl<'a> Lowerer<'a> {
 
                 let qubit = QubitId(base.0 + index as u32);
                 self.note_qubit(qubit);
-                if let Some(name) = result {
-                    self.env.insert(name.to_string(), Binding::Qubit(qubit));
-                }
+                self.bind(result, Binding::Qubit(qubit));
             }
 
             Intrinsic::QubitRelease | Intrinsic::QubitReleaseArray | Intrinsic::Initialize => {}
@@ -1278,60 +1242,34 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_result_equal(&mut self, result: Option<&str>, call: &ast::Call, span: Span) {
-        let lhs = call.args.first().map(|a| a.value.clone());
-        let rhs = call.args.get(1).map(|a| a.value.clone());
-
-        let resolve = |this: &mut Self, value: Option<ast::Value>| -> Option<Binding> {
+        let resolve = |value: Option<&ast::Value>| {
             let value = value?;
-            if let Some(id) = this.static_result(&value) {
+            if let Some(id) = self.static_result(value) {
                 return Some(Binding::Result(id));
             }
-            if let ast::Value::Local(name) = &value {
-                return this.env.get(name).cloned();
+            if let ast::Value::Local(name) = value {
+                return self.env.get(name).cloned();
             }
             None
         };
 
-        let left = resolve(self, lhs);
-        let right = resolve(self, rhs);
+        let left = resolve(call.args.first().map(|a| &a.value));
+        let right = resolve(call.args.get(1).map(|a| &a.value));
 
         let expr = match (left, right) {
             (Some(Binding::Result(id)), Some(Binding::ResultConst(expected)))
-            | (Some(Binding::ResultConst(expected)), Some(Binding::Result(id))) => {
-                self.note_result(id);
-                let read = self.fresh_value();
-                self.ops.push(Op::Assign {
-                    dest: read,
-                    expr: Expr::ReadResult(id),
-                    span,
-                });
-                Expr::ICmp {
-                    pred: IntPredicate::Eq,
-                    lhs: Operand::Value(read),
-                    rhs: Operand::Const(Const::Bool(expected)),
-                }
-            }
-            (Some(Binding::Result(a)), Some(Binding::Result(b))) => {
-                self.note_result(a);
-                self.note_result(b);
-                let left_value = self.fresh_value();
-                self.ops.push(Op::Assign {
-                    dest: left_value,
-                    expr: Expr::ReadResult(a),
-                    span,
-                });
-                let right_value = self.fresh_value();
-                self.ops.push(Op::Assign {
-                    dest: right_value,
-                    expr: Expr::ReadResult(b),
-                    span,
-                });
-                Expr::ICmp {
-                    pred: IntPredicate::Eq,
-                    lhs: Operand::Value(left_value),
-                    rhs: Operand::Value(right_value),
-                }
-            }
+            | (Some(Binding::ResultConst(expected)), Some(Binding::Result(id))) => Expr::ICmp {
+                pred: IntPredicate::Eq,
+                ty: Scalar::Bool,
+                lhs: self.read_result(id, span),
+                rhs: Operand::Const(Const::Bool(expected)),
+            },
+            (Some(Binding::Result(a)), Some(Binding::Result(b))) => Expr::ICmp {
+                pred: IntPredicate::Eq,
+                ty: Scalar::Bool,
+                lhs: self.read_result(a, span),
+                rhs: self.read_result(b, span),
+            },
             (Some(Binding::ResultConst(a)), Some(Binding::ResultConst(b))) => {
                 Expr::Const(Const::Bool(a == b))
             }
@@ -1345,7 +1283,7 @@ impl<'a> Lowerer<'a> {
             }
         };
 
-        self.assign(result, expr, span);
+        self.assign(result, Scalar::Bool, expr, span);
     }
 
     fn lower_gate(&mut self, call: &ast::Call, shape: GateShape, functor: Functor, span: Span) {
@@ -1374,38 +1312,29 @@ impl<'a> Lowerer<'a> {
         let extra_controls = usize::from(functor.is_controlled());
         let total_controls = controls + extra_controls;
 
+        let negate = functor.is_adjoint() && kind.param_count() == 1;
         let mut angles = Vec::new();
         for index in 0..params {
-            let Some(arg) = call.args.get(index) else {
-                self.error("missing rotation angle", span, "expected a double argument");
+            let Some(angle) = self.angle_arg(call, index, negate, span) else {
                 return;
             };
-            let Some(mut operand) = self.operand(&arg.value, arg.span) else {
-                self.error(
-                    "rotation angle is not a value",
-                    arg.span,
-                    "expected a number",
-                );
-                return;
-            };
-            if functor.is_adjoint() && kind.param_count() == 1 {
-                operand = self.negate(operand, span);
-            }
-            angles.push(operand);
+            angles.push(angle);
         }
 
-        let mut wires = Vec::new();
-        for index in 0..(total_controls + targets) {
-            let Some(qubit) = self.qubit_arg(call, params + index, span) else {
-                return;
-            };
-            wires.push(qubit);
+        let Some(mut wires) =
+            self.qubit_args(call, params..params + total_controls + targets, span)
+        else {
+            return;
+        };
+        if functor.is_controlled()
+            && let Some(array) = call
+                .args
+                .get(params)
+                .and_then(|a| self.control_array(&a.value))
+        {
+            wires.splice(0..1, array);
         }
-
-        let target_wires = wires.split_off(total_controls);
-        for qubit in wires.iter().chain(target_wires.iter()) {
-            self.note_qubit(*qubit);
-        }
+        let target_wires = wires.split_off(wires.len() - targets);
 
         self.ops.push(Op::Gate(Gate {
             kind,
@@ -1416,6 +1345,112 @@ impl<'a> Lowerer<'a> {
         }));
     }
 
+    fn lower_ising(&mut self, call: &ast::Call, axis: GateKind, functor: Functor, span: Span) {
+        let Some(angle) = self.angle_arg(call, 0, functor.is_adjoint(), span) else {
+            return;
+        };
+
+        let controls = usize::from(functor.is_controlled());
+        let Some(mut wires) = self.qubit_args(call, 1..controls + 3, span) else {
+            return;
+        };
+        if functor.is_controlled()
+            && let Some(array) = call.args.get(1).and_then(|a| self.control_array(&a.value))
+        {
+            wires.splice(0..1, array);
+        }
+        if let Some(repeated) = wires
+            .iter()
+            .enumerate()
+            .find_map(|(i, q)| wires[..i].contains(q).then_some(q))
+        {
+            let name = match axis {
+                GateKind::Rx => "rxx",
+                GateKind::Ry => "ryy",
+                _ => "rzz",
+            };
+            self.error(
+                format!("`{name}` uses q{} more than once", repeated.0),
+                span,
+                "each qubit may appear once",
+            );
+            return;
+        }
+        let pair = wires.split_off(wires.len() - 2);
+
+        let gate = |kind, controls, targets, params| {
+            Op::Gate(Gate {
+                kind,
+                controls,
+                targets,
+                params,
+                span,
+            })
+        };
+        let basis = |sign: f64| match axis {
+            GateKind::Rx => Some((GateKind::H, vec![])),
+            GateKind::Ry => Some((
+                GateKind::Rx,
+                vec![Operand::Const(Const::Float(sign * FRAC_PI_2))],
+            )),
+            _ => None,
+        };
+
+        if let Some((kind, params)) = basis(1.0) {
+            for &qubit in &pair {
+                self.ops
+                    .push(gate(kind, vec![], vec![qubit], params.clone()));
+            }
+        }
+        self.ops
+            .push(gate(GateKind::X, vec![pair[0]], vec![pair[1]], vec![]));
+        self.ops
+            .push(gate(GateKind::Rz, wires, vec![pair[1]], vec![angle]));
+        self.ops
+            .push(gate(GateKind::X, vec![pair[0]], vec![pair[1]], vec![]));
+        if let Some((kind, params)) = basis(-1.0) {
+            for &qubit in &pair {
+                self.ops
+                    .push(gate(kind, vec![], vec![qubit], params.clone()));
+            }
+        }
+    }
+
+    fn angle_arg(
+        &mut self,
+        call: &ast::Call,
+        index: usize,
+        negate: bool,
+        span: Span,
+    ) -> Option<Operand> {
+        let Some(arg) = call.args.get(index) else {
+            self.error("missing rotation angle", span, "expected a double argument");
+            return None;
+        };
+        let Some(operand) = self.operand(&arg.value, arg.span) else {
+            self.error(
+                "rotation angle is not a value",
+                arg.span,
+                "expected a number",
+            );
+            return None;
+        };
+        Some(if negate {
+            self.negate(operand, span)
+        } else {
+            operand
+        })
+    }
+
+    fn qubit_args(
+        &mut self,
+        call: &ast::Call,
+        range: Range<usize>,
+        span: Span,
+    ) -> Option<Vec<QubitId>> {
+        range.map(|i| self.qubit_arg(call, i, span)).collect()
+    }
+
     fn negate(&mut self, operand: Operand, span: Span) -> Operand {
         if let Operand::Const(c) = operand {
             return Operand::Const(Const::Float(-c.as_f64()));
@@ -1424,6 +1459,7 @@ impl<'a> Lowerer<'a> {
         let dest = self.fresh_value();
         self.ops.push(Op::Assign {
             dest,
+            ty: Scalar::Double,
             expr: Expr::Binary {
                 op: BinOp::FSub,
                 lhs: Operand::Const(Const::Float(0.0)),
@@ -1432,6 +1468,16 @@ impl<'a> Lowerer<'a> {
             span,
         });
         Operand::Value(dest)
+    }
+
+    fn control_array(&self, value: &ast::Value) -> Option<Vec<QubitId>> {
+        let ast::Value::Local(name) = value else {
+            return None;
+        };
+        let Some(Binding::QubitArray { base, len }) = self.env.get(name) else {
+            return None;
+        };
+        Some((0..*len).map(|i| QubitId(base.0 + i as u32)).collect())
     }
 
     fn qubit_arg(&mut self, call: &ast::Call, index: usize, span: Span) -> Option<QubitId> {
@@ -1449,7 +1495,7 @@ impl<'a> Lowerer<'a> {
             return Some(qubit);
         }
 
-        if let Some(index) = literal_index(&arg.value)
+        if let Some(index) = inttoptr(&arg.value).map(|(i, _)| i)
             && wire(index).is_none()
         {
             self.error(
@@ -1460,17 +1506,12 @@ impl<'a> Lowerer<'a> {
             return None;
         }
 
-        self.error(
-            "cannot resolve this operand to a qubit",
-            arg.span,
-            "expected a static qubit reference",
+        self.diagnostics.push(
+            Diagnostic::error("cannot resolve this operand to a qubit")
+                .with_code("QIR0200")
+                .primary(arg.span, "expected a static qubit reference")
+                .note("use inttoptr, null, or a constant array index"),
         );
-
-        if let Some(last) = self.diagnostics.last_mut() {
-            last.notes
-                .push("use inttoptr, null, or a constant array index".into());
-        }
-
         None
     }
 
@@ -1489,7 +1530,7 @@ impl<'a> Lowerer<'a> {
             return Some(id);
         }
 
-        if let Some(index) = literal_index(&arg.value)
+        if let Some(index) = inttoptr(&arg.value).map(|(i, _)| i)
             && wire(index).is_none()
         {
             self.error(
@@ -1511,22 +1552,10 @@ impl<'a> Lowerer<'a> {
     fn static_qubit(&self, value: &ast::Value) -> Option<QubitId> {
         match value {
             ast::Value::Null => Some(QubitId(0)),
-            ast::Value::ConstExpr(expr) => match expr.as_ref() {
-                ast::ConstExpr::Cast {
-                    op: ast::CastOp::IntToPtr,
-                    operand,
-                    to,
-                } => {
-                    if !matches!(to.pointee_name(), Some("Qubit") | None) {
-                        return None;
-                    }
-                    match operand.value {
-                        ast::Value::Int(i) => wire(i).map(QubitId),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            },
+            ast::Value::ConstExpr(_) => inttoptr(value)
+                .filter(|(_, p)| matches!(p, Some("Qubit") | None))
+                .and_then(|(i, _)| wire(i))
+                .map(QubitId),
             ast::Value::Local(name) => match self.env.get(name) {
                 Some(Binding::Qubit(q)) => Some(*q),
                 Some(Binding::QubitArray { base, .. }) => Some(*base),
@@ -1540,22 +1569,10 @@ impl<'a> Lowerer<'a> {
     fn static_result(&self, value: &ast::Value) -> Option<ResultId> {
         match value {
             ast::Value::Null => Some(ResultId(0)),
-            ast::Value::ConstExpr(expr) => match expr.as_ref() {
-                ast::ConstExpr::Cast {
-                    op: ast::CastOp::IntToPtr,
-                    operand,
-                    to,
-                } => {
-                    if !matches!(to.pointee_name(), Some("Result") | None) {
-                        return None;
-                    }
-                    match operand.value {
-                        ast::Value::Int(i) => wire(i).map(ResultId),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            },
+            ast::Value::ConstExpr(_) => inttoptr(value)
+                .filter(|(_, p)| matches!(p, Some("Result") | None))
+                .and_then(|(i, _)| wire(i))
+                .map(ResultId),
             ast::Value::Local(name) => match self.env.get(name) {
                 Some(Binding::Result(r)) => Some(*r),
                 Some(Binding::Id(id)) => Some(ResultId(*id)),
@@ -1565,23 +1582,27 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn resolve_label(&mut self, value: &ast::Value) -> Option<String> {
+    fn resolve_label(&self, value: &ast::Value) -> Option<String> {
         match value {
             ast::Value::Null => None,
             ast::Value::Bytes(bytes) => Some(decode_label(bytes)),
             ast::Value::Global(name) => self.global_bytes(name).map(|b| decode_label(&b)),
             ast::Value::ConstExpr(expr) => match expr.as_ref() {
-                ast::ConstExpr::GetElementPtr { ptr, .. } => self.resolve_label(&ptr.value),
+                ast::ConstExpr::GetElementPtr { ptr, indices, .. } => {
+                    let label = self.resolve_label(&ptr.value)?;
+                    let offset = match indices.last().map(|i| &i.value) {
+                        Some(ast::Value::Int(n)) => usize::try_from(*n).unwrap_or(usize::MAX),
+                        _ => 0,
+                    };
+                    Some(label.get(offset..).unwrap_or_default().to_string())
+                }
                 ast::ConstExpr::Cast { operand, .. } => self.resolve_label(&operand.value),
                 _ => None,
             },
-            ast::Value::Local(name) => {
-                let bytes = match self.env.get(name) {
-                    Some(Binding::Bytes(bytes)) => Some(bytes.clone()),
-                    _ => None,
-                };
-                bytes.map(|b| decode_label(&b))
-            }
+            ast::Value::Local(name) => match self.env.get(name) {
+                Some(Binding::Bytes(bytes)) => Some(decode_label(bytes)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1593,15 +1614,23 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    fn typed(&mut self, value: &ast::Value, ty: Scalar, span: Span) -> Option<Operand> {
+        Some(match self.operand(value, span)? {
+            Operand::Const(c) => Operand::Const(ty.normalize(c)),
+            operand => operand,
+        })
+    }
+
     fn operand(&mut self, value: &ast::Value, span: Span) -> Option<Operand> {
         match value {
             ast::Value::Int(i) => Some(Operand::Const(Const::Int(*i as i64))),
             ast::Value::Float(f) => Some(Operand::Const(Const::Float(*f))),
             ast::Value::Bool(b) => Some(Operand::Const(Const::Bool(*b))),
-            ast::Value::Null | ast::Value::ZeroInit | ast::Value::NoneValue => {
-                Some(Operand::Const(Const::Int(0)))
-            }
-            ast::Value::Undef | ast::Value::Poison => Some(Operand::Const(Const::Int(0))),
+            ast::Value::Null
+            | ast::Value::ZeroInit
+            | ast::Value::NoneValue
+            | ast::Value::Undef
+            | ast::Value::Poison => Some(Operand::Const(Const::Int(0))),
             ast::Value::Local(name) => match self.env.get(name) {
                 Some(Binding::Value(operand)) => Some(*operand),
                 Some(Binding::ResultConst(b)) => Some(Operand::Const(Const::Bool(*b))),
@@ -1610,14 +1639,7 @@ impl<'a> Lowerer<'a> {
                 }
                 Some(Binding::Result(id)) => {
                     let id = *id;
-                    self.note_result(id);
-                    let dest = self.fresh_value();
-                    self.ops.push(Op::Assign {
-                        dest,
-                        expr: Expr::ReadResult(id),
-                        span,
-                    });
-                    Some(Operand::Value(dest))
+                    Some(self.read_result(id, span))
                 }
                 _ => {
                     self.error(format!("`%{name}` is not defined"), span, "unknown value");
@@ -1633,19 +1655,27 @@ impl<'a> Lowerer<'a> {
     }
 }
 
-fn literal_index(value: &ast::Value) -> Option<i128> {
-    match value {
-        ast::Value::ConstExpr(expr) => match expr.as_ref() {
-            ast::ConstExpr::Cast {
-                op: ast::CastOp::IntToPtr,
-                operand,
-                ..
-            } => match operand.value {
-                ast::Value::Int(i) => Some(i),
-                _ => None,
-            },
+fn inttoptr(value: &ast::Value) -> Option<(i128, Option<&str>)> {
+    let ast::Value::ConstExpr(expr) = value else {
+        return None;
+    };
+    match expr.as_ref() {
+        ast::ConstExpr::Cast {
+            op: ast::CastOp::IntToPtr,
+            operand,
+            to,
+        } => match operand.value {
+            ast::Value::Int(i) => Some((i, to.pointee_name())),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn case_key(value: &ast::Value) -> Option<i64> {
+    match value {
+        ast::Value::Int(i) => Some(*i as i64),
+        ast::Value::Bool(b) => Some(i64::from(*b)),
         _ => None,
     }
 }
@@ -1655,12 +1685,8 @@ fn wire(index: i128) -> Option<u32> {
 }
 
 fn decode_label(bytes: &[u8]) -> String {
-    let trimmed = bytes
-        .iter()
-        .copied()
-        .take_while(|b| *b != 0)
-        .collect::<Vec<u8>>();
-    String::from_utf8_lossy(&trimmed).into_owned()
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 fn attribute_count(attrs: &[&ast::Attribute], keys: &[&str]) -> u32 {

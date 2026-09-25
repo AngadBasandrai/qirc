@@ -15,39 +15,30 @@ pub fn inline_module(module: &Module) -> Inlined {
     let mut working = module.clone();
     let mut diagnostics = Vec::new();
 
-    let Some(entry_name) = module.entry_point().map(|f| f.sig.name.clone()) else {
+    let Some(index) = module.entry_point().and_then(|entry| {
+        module
+            .functions
+            .iter()
+            .position(|f| f.sig.name == entry.sig.name)
+    }) else {
         return Inlined {
             module: working,
             diagnostics,
         };
     };
 
-    let mut tag = 0usize;
-
     for round in 0..MAX_ROUNDS {
-        let Some(index) = working
-            .functions
-            .iter()
-            .position(|f| f.sig.name == entry_name)
-        else {
-            break;
-        };
-
         let Some(site) = find_call_site(&working, &working.functions[index]) else {
             break;
         };
 
-        let callee = working.functions[site.callee_index].clone();
-        let caller = working.functions[index].clone();
-
-        tag += 1;
-        match expand(&caller, &callee, &site, tag) {
-            Ok(expanded) => working.functions[index] = expanded,
-            Err(diagnostic) => {
-                diagnostics.push(diagnostic);
-                break;
-            }
-        }
+        let expanded = expand(
+            &working.functions[index],
+            &working.functions[site.callee_index],
+            &site,
+            round + 1,
+        );
+        working.functions[index] = expanded;
 
         if round + 1 == MAX_ROUNDS {
             diagnostics.push(
@@ -98,33 +89,30 @@ fn find_call_site(module: &Module, caller: &Function) -> Option<CallSite> {
     None
 }
 
-fn expand(
-    caller: &Function,
-    callee: &Function,
-    site: &CallSite,
-    tag: usize,
-) -> Result<Function, Diagnostic> {
+fn expand(caller: &Function, callee: &Function, site: &CallSite, tag: usize) -> Function {
     let host = &caller.blocks[site.block];
-    let InstKind::Call(call) = &host.instructions[site.instruction].kind else {
-        return Err(Diagnostic::error("inlining lost its call site"));
+    let inst = &host.instructions[site.instruction];
+    let InstKind::Call(call) = &inst.kind else {
+        unreachable!()
     };
 
     let prefix = format!("{}.{tag}.", callee.sig.name);
     let continuation = format!("{prefix}continue");
 
-    let mut substitution: HashMap<String, Value> = HashMap::new();
-    for (param, argument) in callee.sig.params.iter().zip(&call.args) {
-        if let Some(name) = &param.name {
-            substitution.insert(name.clone(), argument.value.clone());
-        }
-    }
+    let substitution = callee
+        .sig
+        .params
+        .iter()
+        .zip(&call.args)
+        .filter_map(|(p, a)| Some((p.name.clone()?, a.value.clone())))
+        .collect();
 
     let renamer = Renamer {
         prefix: prefix.clone(),
         substitution,
     };
 
-    let mut blocks: Vec<BasicBlock> = Vec::new();
+    let mut blocks = Vec::new();
 
     for (index, block) in caller.blocks.iter().enumerate() {
         if index != site.block {
@@ -140,7 +128,7 @@ fn expand(
         blocks.push(head);
     }
 
-    let mut returns: Vec<(Value, String)> = Vec::new();
+    let mut returns = Vec::new();
 
     for block in &callee.blocks {
         let mut cloned = BasicBlock {
@@ -166,55 +154,51 @@ fn expand(
         blocks.push(cloned);
     }
 
-    let tail_block = &caller.blocks[site.block];
     let mut tail = BasicBlock {
-        label: continuation,
-        instructions: tail_block.instructions[site.instruction + 1..].to_vec(),
-        terminator: tail_block.terminator.clone(),
-        span: tail_block.span,
+        label: continuation.clone(),
+        instructions: host.instructions[site.instruction + 1..].to_vec(),
+        terminator: host.terminator.clone(),
+        span: host.span,
     };
 
-    if let Some(result) = &host.instructions[site.instruction].result
+    if let Some(result) = &inst.result
         && !returns.is_empty()
     {
-        let ty = call.ret_ty.clone();
         tail.instructions.insert(
             0,
             Instruction {
                 result: Some(result.clone()),
                 kind: InstKind::Phi {
-                    ty,
-                    incoming: returns.into_iter().collect(),
+                    ty: call.ret_ty.clone(),
+                    incoming: returns,
                 },
-                span: host.instructions[site.instruction].span,
+                span: inst.span,
             },
         );
     }
 
     blocks.push(tail);
 
-    let host_label = host.label.clone();
-    let continuation_label = format!("{prefix}continue");
     for block in &mut blocks {
-        if block.label.starts_with(&prefix) && block.label != continuation_label {
+        if block.label.starts_with(&prefix) && block.label != continuation {
             continue;
         }
         for inst in &mut block.instructions {
             if let InstKind::Phi { incoming, .. } = &mut inst.kind {
                 for (_, label) in incoming.iter_mut() {
-                    if *label == host_label {
-                        *label = continuation_label.clone();
+                    if *label == host.label {
+                        *label = continuation.clone();
                     }
                 }
             }
         }
     }
 
-    Ok(Function {
+    Function {
         sig: caller.sig.clone(),
         blocks,
         span: caller.span,
-    })
+    }
 }
 
 struct Renamer {
@@ -227,15 +211,11 @@ impl Renamer {
         if let Some(value) = self.substitution.get(name) {
             return value.clone();
         }
-        Value::Local(format!("{}{name}", self.prefix))
+        Value::Local(self.name(name))
     }
 
-    fn label(&self, label: &str) -> String {
-        format!("{}{label}", self.prefix)
-    }
-
-    fn define(&self, name: &str) -> String {
-        format!("{}{name}", self.prefix)
+    fn name(&self, s: &str) -> String {
+        format!("{}{s}", self.prefix)
     }
 
     fn value(&self, value: &Value) -> Value {
@@ -281,7 +261,7 @@ impl Renamer {
 
     fn instruction(&self, inst: &Instruction) -> Instruction {
         Instruction {
-            result: inst.result.as_deref().map(|name| self.define(name)),
+            result: inst.result.as_deref().map(|name| self.name(name)),
             kind: self.kind(&inst.kind),
             span: inst.span,
         }
@@ -289,24 +269,13 @@ impl Renamer {
 
     fn kind(&self, kind: &InstKind) -> InstKind {
         match kind {
-            InstKind::Call(call) => InstKind::Call(Call {
-                tail: call.tail,
-                ret_ty: call.ret_ty.clone(),
-                explicit_fn_ty: call.explicit_fn_ty.clone(),
-                callee: call.callee.clone(),
-                args: call
-                    .args
-                    .iter()
-                    .map(|arg| Argument {
-                        ty: arg.ty.clone(),
-                        attrs: arg.attrs.clone(),
-                        value: self.value(&arg.value),
-                        span: arg.span,
-                    })
-                    .collect(),
-                attr_groups: call.attr_groups.clone(),
-                span: call.span,
-            }),
+            InstKind::Call(call) => {
+                let mut call = call.clone();
+                for arg in &mut call.args {
+                    arg.value = self.value(&arg.value);
+                }
+                InstKind::Call(call)
+            }
             InstKind::Binary { op, ty, lhs, rhs } => InstKind::Binary {
                 op: *op,
                 ty: ty.clone(),
@@ -343,7 +312,7 @@ impl Renamer {
                 ty: ty.clone(),
                 incoming: incoming
                     .iter()
-                    .map(|(value, label)| (self.value(value), self.label(label)))
+                    .map(|(value, label)| (self.value(value), self.name(label)))
                     .collect(),
             },
             InstKind::Alloca { ty, count } => InstKind::Alloca {
@@ -394,7 +363,7 @@ impl Renamer {
         match term {
             Terminator::Ret(value) => Terminator::Ret(value.as_ref().map(|tv| self.typed(tv))),
             Terminator::Br { target } => Terminator::Br {
-                target: self.label(target),
+                target: self.name(target),
             },
             Terminator::CondBr {
                 cond,
@@ -402,8 +371,8 @@ impl Renamer {
                 if_false,
             } => Terminator::CondBr {
                 cond: self.typed(cond),
-                if_true: self.label(if_true),
-                if_false: self.label(if_false),
+                if_true: self.name(if_true),
+                if_false: self.name(if_false),
             },
             Terminator::Switch {
                 scrutinee,
@@ -411,10 +380,10 @@ impl Renamer {
                 cases,
             } => Terminator::Switch {
                 scrutinee: self.typed(scrutinee),
-                default: self.label(default),
+                default: self.name(default),
                 cases: cases
                     .iter()
-                    .map(|(value, label)| (self.typed(value), self.label(label)))
+                    .map(|(value, label)| (self.typed(value), self.name(label)))
                     .collect(),
             },
             Terminator::Unreachable => Terminator::Unreachable,

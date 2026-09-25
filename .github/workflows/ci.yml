@@ -45,8 +45,9 @@ jobs:
       - name: emitted QIR is valid LLVM IR
         run: |
           for file in tests/corpus/base_profile_bell.ll tests/corpus/adaptive_teleport.ll \
-                      tests/corpus/pyqir_simple.ll tests/corpus/qsharp_loop.ll \
-                      tests/corpus/unrestricted_dynamic.ll examples/small.ll; do
+                      tests/corpus/pyqir_simple.ll tests/corpus/pyqir_real.ll \
+                      tests/corpus/unrestricted_dynamic.ll tests/corpus/qsharp_*.ll \
+                      examples/small.ll; do
             for level in 0 1 2 3; do
               ./target/release/qirc "$file" --emit qir -O$level -o out.ll
               clang -x ir -S -emit-llvm -o /dev/null out.ll

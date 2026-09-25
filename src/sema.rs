@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::diag::Diagnostic;
+use crate::diag::{Diagnostic, Span};
 use crate::ir::*;
 
 pub fn validate(program: &Program) -> Vec<Diagnostic> {
@@ -25,7 +25,7 @@ fn check_profile(program: &Program, out: &mut Vec<Diagnostic>) {
             .iter()
             .find(|b| !matches!(b.term, Term::Ret(_) | Term::Unreachable));
 
-        let span = block.map(|b| b.span).unwrap_or_default();
+        let span = block.map_or(Span::DUMMY, |b| b.span);
 
         out.push(
             Diagnostic::error("the Base Profile forbids branching")
@@ -36,27 +36,28 @@ fn check_profile(program: &Program, out: &mut Vec<Diagnostic>) {
     }
 
     for op in program.ops() {
-        if let Op::Assign {
-            expr: Expr::ReadResult(result),
-            span,
-            ..
-        } = op
-        {
-            out.push(
-                Diagnostic::error("the Base Profile forbids reading a measurement result")
-                    .with_code("QIR0301")
-                    .primary(
-                        *span,
-                        format!("r{} is read back into the program", result.0),
-                    ),
-            );
-        }
-
-        if let Op::Reset { span, .. } = op {
-            out.push(
-                Diagnostic::warning("the Base Profile does not guarantee qubit reset")
-                    .primary(*span, "this reset may not be supported by the target"),
-            );
+        match op {
+            Op::Assign {
+                expr: Expr::ReadResult(result),
+                span,
+                ..
+            } => {
+                out.push(
+                    Diagnostic::error("the Base Profile forbids reading a measurement result")
+                        .with_code("QIR0301")
+                        .primary(
+                            *span,
+                            format!("r{} is read back into the program", result.0),
+                        ),
+                );
+            }
+            Op::Reset { span, .. } => {
+                out.push(
+                    Diagnostic::warning("the Base Profile does not guarantee qubit reset")
+                        .primary(*span, "this reset may not be supported by the target"),
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -158,7 +159,7 @@ fn check_wires(program: &Program, out: &mut Vec<Diagnostic>) {
 fn check_control_flow(program: &Program, out: &mut Vec<Diagnostic>) {
     for block in &program.blocks {
         for successor in block.term.successors() {
-            if successor.0 as usize >= program.blocks.len() {
+            if successor.index() >= program.blocks.len() {
                 out.push(
                     Diagnostic::error("branch target does not exist")
                         .with_code("QIR0307")
@@ -168,15 +169,11 @@ fn check_control_flow(program: &Program, out: &mut Vec<Diagnostic>) {
         }
     }
 
-    let reachable = program.reachable();
-    for (index, live) in reachable.iter().enumerate() {
-        if !live && !program.blocks[index].ops.is_empty() {
+    for (block, &live) in program.blocks.iter().zip(&program.reachable()) {
+        if !live && !block.ops.is_empty() {
             out.push(
-                Diagnostic::warning(format!(
-                    "block `{}` is unreachable",
-                    program.blocks[index].label
-                ))
-                .primary(program.blocks[index].span, "no path reaches this block"),
+                Diagnostic::warning(format!("block `{}` is unreachable", block.label))
+                    .primary(block.span, "no path reaches this block"),
             );
         }
     }

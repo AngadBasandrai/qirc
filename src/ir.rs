@@ -1,8 +1,10 @@
+use crate::ast;
+pub use crate::ast::{BinOp, CastOp, FloatPredicate, IntPredicate};
 use crate::diag::Span;
 use std::collections::HashMap;
 use std::fmt;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BlockId(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -16,6 +18,12 @@ pub struct ResultId(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SlotId(pub u32);
+
+impl BlockId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 impl SlotId {
     pub fn index(self) -> usize {
@@ -35,11 +43,10 @@ impl ResultId {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Profile {
     Base,
     Adaptive,
-    #[default]
     Unrestricted,
 }
 
@@ -104,6 +111,77 @@ impl Const {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Scalar {
+    Bool,
+    Int(u32),
+    Double,
+}
+
+impl Scalar {
+    pub fn of(ty: &ast::Ty) -> Scalar {
+        match ty {
+            ast::Ty::Int(1) => Scalar::Bool,
+            ast::Ty::Int(bits) => Scalar::Int((*bits).clamp(2, 64)),
+            ast::Ty::Half
+            | ast::Ty::Float
+            | ast::Ty::Double
+            | ast::Ty::X86Fp80
+            | ast::Ty::Fp128 => Scalar::Double,
+            _ => Scalar::Int(64),
+        }
+    }
+
+    pub fn normalize(self, c: Const) -> Const {
+        match self {
+            Scalar::Bool => Const::Bool(c.as_i64() & 1 == 1),
+            Scalar::Int(bits) => Const::Int(wrap(c.as_i64(), bits)),
+            Scalar::Double => Const::Float(c.as_f64()),
+        }
+    }
+
+    pub fn signed(self, c: Const) -> i64 {
+        match self {
+            Scalar::Bool => -(c.as_i64() & 1),
+            _ => c.as_i64(),
+        }
+    }
+
+    pub fn unsigned(self, c: Const) -> u64 {
+        match self {
+            Scalar::Bool => c.as_i64() as u64 & 1,
+            Scalar::Int(bits) if bits < 64 => c.as_i64() as u64 & ((1 << bits) - 1),
+            _ => c.as_i64() as u64,
+        }
+    }
+
+    pub fn bits(self) -> u32 {
+        match self {
+            Scalar::Bool => 1,
+            Scalar::Int(bits) => bits,
+            Scalar::Double => 64,
+        }
+    }
+}
+
+impl fmt::Display for Scalar {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Scalar::Bool => write!(f, "i1"),
+            Scalar::Int(bits) => write!(f, "i{bits}"),
+            Scalar::Double => write!(f, "double"),
+        }
+    }
+}
+
+fn wrap(value: i64, bits: u32) -> i64 {
+    if bits >= 64 {
+        return value;
+    }
+    let shift = 64 - bits;
+    (value << shift) >> shift
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Operand {
     Const(Const),
@@ -124,12 +202,17 @@ impl Operand {
             Operand::Const(_) => None,
         }
     }
+
+    pub fn resolve(&self, known: &HashMap<ValueId, Const>) -> Option<Const> {
+        match self {
+            Operand::Const(c) => Some(*c),
+            Operand::Value(id) => known.get(id).copied(),
+        }
+    }
 }
 
-pub use crate::ast::{BinOp, CastOp, FloatPredicate, IntPredicate};
-
 impl BinOp {
-    pub fn apply(self, a: Const, b: Const) -> Const {
+    pub fn apply(self, ty: Scalar, a: Const, b: Const) -> Const {
         if self.is_float() {
             let (x, y) = (a.as_f64(), b.as_f64());
             return Const::Float(match self {
@@ -141,41 +224,40 @@ impl BinOp {
             });
         }
 
-        let (x, y) = (a.as_i64(), b.as_i64());
+        let (x, y) = (ty.signed(a), ty.signed(b));
+        let (ux, uy) = (ty.unsigned(a), ty.unsigned(b));
+        let shift = uy.min(u64::from(ty.bits())) as u32;
         let value = match self {
             BinOp::Add => x.wrapping_add(y),
             BinOp::Sub => x.wrapping_sub(y),
             BinOp::Mul => x.wrapping_mul(y),
             BinOp::SDiv if y != 0 => x.wrapping_div(y),
-            BinOp::UDiv if y != 0 => ((x as u64) / (y as u64)) as i64,
+            BinOp::UDiv if uy != 0 => (ux / uy) as i64,
             BinOp::SRem if y != 0 => x.wrapping_rem(y),
-            BinOp::URem if y != 0 => ((x as u64) % (y as u64)) as i64,
-            BinOp::Shl => x.wrapping_shl(y as u32),
-            BinOp::LShr => (x as u64).wrapping_shr(y as u32) as i64,
-            BinOp::AShr => x.wrapping_shr(y as u32),
+            BinOp::URem if uy != 0 => (ux % uy) as i64,
+            BinOp::Shl => x.checked_shl(shift).unwrap_or(0),
+            BinOp::LShr => ux.checked_shr(shift).unwrap_or(0) as i64,
+            BinOp::AShr => x >> shift.min(63),
             BinOp::And => x & y,
             BinOp::Or => x | y,
             BinOp::Xor => x ^ y,
             _ => 0,
         };
-
-        match (a, b) {
-            (Const::Bool(_), Const::Bool(_)) => Const::Bool(value != 0),
-            _ => Const::Int(value),
-        }
+        ty.normalize(Const::Int(value))
     }
 }
 
 impl IntPredicate {
-    pub fn test(self, a: i64, b: i64) -> bool {
-        let (ua, ub) = (a as u64, b as u64);
+    pub fn test(self, ty: Scalar, a: Const, b: Const) -> bool {
+        let (sa, sb) = (ty.signed(a), ty.signed(b));
+        let (ua, ub) = (ty.unsigned(a), ty.unsigned(b));
         match self {
-            IntPredicate::Eq => a == b,
-            IntPredicate::Ne => a != b,
-            IntPredicate::Sgt => a > b,
-            IntPredicate::Sge => a >= b,
-            IntPredicate::Slt => a < b,
-            IntPredicate::Sle => a <= b,
+            IntPredicate::Eq => ua == ub,
+            IntPredicate::Ne => ua != ub,
+            IntPredicate::Sgt => sa > sb,
+            IntPredicate::Sge => sa >= sb,
+            IntPredicate::Slt => sa < sb,
+            IntPredicate::Sle => sa <= sb,
             IntPredicate::Ugt => ua > ub,
             IntPredicate::Uge => ua >= ub,
             IntPredicate::Ult => ua < ub,
@@ -209,55 +291,31 @@ impl FloatPredicate {
 }
 
 impl CastOp {
-    pub fn apply(self, value: Const) -> Const {
-        match self {
-            CastOp::SIToFP | CastOp::UIToFP | CastOp::FPExt | CastOp::FPTrunc => {
-                Const::Float(value.as_f64())
-            }
-            CastOp::FPToSI | CastOp::FPToUI => Const::Int(value.as_f64() as i64),
-            CastOp::ZExt | CastOp::SExt => Const::Int(value.as_i64()),
-            CastOp::Trunc => match value {
-                Const::Bool(_) => value,
-                _ => Const::Int(value.as_i64()),
+    pub fn apply(self, from: Scalar, to: Scalar, value: Const) -> Const {
+        let result = match self {
+            CastOp::Trunc | CastOp::SExt => Const::Int(from.signed(value)),
+            CastOp::ZExt => Const::Int(from.unsigned(value) as i64),
+            CastOp::FPToSI => Const::Int(value.as_f64() as i64),
+            CastOp::FPToUI => Const::Int(value.as_f64() as u64 as i64),
+            CastOp::SIToFP => Const::Float(from.signed(value) as f64),
+            CastOp::UIToFP => Const::Float(from.unsigned(value) as f64),
+            CastOp::FPTrunc => Const::Float(value.as_f64() as f32 as f64),
+            CastOp::BitCast => match (from, to) {
+                (Scalar::Double, Scalar::Int(_)) => Const::Int(value.as_f64().to_bits() as i64),
+                (Scalar::Int(_), Scalar::Double) => {
+                    Const::Float(f64::from_bits(value.as_i64() as u64))
+                }
+                _ => value,
             },
             _ => value,
-        }
+        };
+        to.normalize(result)
     }
 }
 
-impl Expr {
-    pub fn fold(&self, mut get: impl FnMut(&Operand) -> Option<Const>) -> Option<Const> {
-        match self {
-            Expr::Const(c) => Some(*c),
-            Expr::Copy(o) => get(o),
-            Expr::Binary { op, lhs, rhs } => Some(op.apply(get(lhs)?, get(rhs)?)),
-            Expr::ICmp { pred, lhs, rhs } => Some(Const::Bool(
-                pred.test(get(lhs)?.as_i64(), get(rhs)?.as_i64()),
-            )),
-            Expr::FCmp { pred, lhs, rhs } => Some(Const::Bool(
-                pred.test(get(lhs)?.as_f64(), get(rhs)?.as_f64()),
-            )),
-            Expr::Select {
-                cond,
-                if_true,
-                if_false,
-            } => {
-                if get(cond)?.truthy() {
-                    get(if_true)
-                } else {
-                    get(if_false)
-                }
-            }
-            Expr::Cast { op, operand } => Some(op.apply(get(operand)?)),
-            Expr::Phi(_) | Expr::ReadResult(_) | Expr::Load(_) => None,
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug)]
 pub enum Expr {
     Const(Const),
-    Copy(Operand),
     Binary {
         op: BinOp,
         lhs: Operand,
@@ -265,6 +323,7 @@ pub enum Expr {
     },
     ICmp {
         pred: IntPredicate,
+        ty: Scalar,
         lhs: Operand,
         rhs: Operand,
     },
@@ -280,11 +339,64 @@ pub enum Expr {
     },
     Cast {
         op: CastOp,
+        from: Scalar,
         operand: Operand,
     },
     Phi(Vec<(BlockId, Operand)>),
     ReadResult(ResultId),
     Load(SlotId),
+}
+
+impl Expr {
+    pub fn fold(
+        &self,
+        ty: Scalar,
+        mut get: impl FnMut(&Operand) -> Option<Const>,
+    ) -> Option<Const> {
+        match self {
+            Expr::Const(c) => Some(ty.normalize(*c)),
+            Expr::Binary { op, lhs, rhs } => Some(op.apply(ty, get(lhs)?, get(rhs)?)),
+            Expr::ICmp {
+                pred,
+                ty: operands,
+                lhs,
+                rhs,
+            } => Some(Const::Bool(pred.test(*operands, get(lhs)?, get(rhs)?))),
+            Expr::FCmp { pred, lhs, rhs } => Some(Const::Bool(
+                pred.test(get(lhs)?.as_f64(), get(rhs)?.as_f64()),
+            )),
+            Expr::Select {
+                cond,
+                if_true,
+                if_false,
+            } => {
+                let chosen = if get(cond)?.truthy() {
+                    get(if_true)
+                } else {
+                    get(if_false)
+                };
+                Some(ty.normalize(chosen?))
+            }
+            Expr::Cast { op, from, operand } => Some(op.apply(*from, ty, get(operand)?)),
+            Expr::Phi(_) | Expr::ReadResult(_) | Expr::Load(_) => None,
+        }
+    }
+
+    pub fn operands(&self) -> Vec<Operand> {
+        match self {
+            Expr::Const(_) | Expr::ReadResult(_) | Expr::Load(_) => Vec::new(),
+            Expr::Cast { operand, .. } => vec![*operand],
+            Expr::Binary { lhs, rhs, .. }
+            | Expr::ICmp { lhs, rhs, .. }
+            | Expr::FCmp { lhs, rhs, .. } => vec![*lhs, *rhs],
+            Expr::Select {
+                cond,
+                if_true,
+                if_false,
+            } => vec![*cond, *if_true, *if_false],
+            Expr::Phi(incoming) => incoming.iter().map(|(_, o)| *o).collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -374,7 +486,7 @@ impl GateKind {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug)]
 pub struct Gate {
     pub kind: GateKind,
     pub controls: Vec<QubitId>,
@@ -395,9 +507,16 @@ impl Gate {
     pub fn constant_angle(&self) -> Option<f64> {
         self.params.first()?.constant().map(|c| c.as_f64())
     }
+
+    pub fn constant_params(&self) -> Vec<f64> {
+        self.params
+            .iter()
+            .filter_map(|p| p.constant().map(|c| c.as_f64()))
+            .collect()
+    }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum OutputKind {
     Result,
     Bool,
@@ -405,15 +524,16 @@ pub enum OutputKind {
     Double,
     Tuple,
     Array,
+    TupleEnd,
+    ArrayEnd,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug)]
 pub enum Op {
     Gate(Gate),
     Measure {
         qubit: QubitId,
         result: ResultId,
-        dest: Option<ValueId>,
         span: Span,
     },
     Reset {
@@ -422,12 +542,14 @@ pub enum Op {
     },
     Assign {
         dest: ValueId,
+        ty: Scalar,
         expr: Expr,
         span: Span,
     },
     RecordOutput {
         kind: OutputKind,
         result: Option<ResultId>,
+        value: Option<Operand>,
         count: Option<i64>,
         label: Option<String>,
         span: Span,
@@ -444,18 +566,6 @@ pub enum Op {
 }
 
 impl Op {
-    pub fn span(&self) -> Span {
-        match self {
-            Op::Gate(g) => g.span,
-            Op::Measure { span, .. }
-            | Op::Reset { span, .. }
-            | Op::Assign { span, .. }
-            | Op::RecordOutput { span, .. }
-            | Op::Store { span, .. }
-            | Op::Message { span, .. } => *span,
-        }
-    }
-
     pub fn as_gate(&self) -> Option<&Gate> {
         match self {
             Op::Gate(g) => Some(g),
@@ -466,13 +576,24 @@ impl Op {
     pub fn defined_value(&self) -> Option<ValueId> {
         match self {
             Op::Assign { dest, .. } => Some(*dest),
-            Op::Measure { dest, .. } => *dest,
             _ => None,
+        }
+    }
+
+    pub fn operands(&self) -> Vec<Operand> {
+        match self {
+            Op::Gate(gate) => gate.params.clone(),
+            Op::Store { value, .. }
+            | Op::RecordOutput {
+                value: Some(value), ..
+            } => vec![*value],
+            Op::Assign { expr, .. } => expr.operands(),
+            _ => Vec::new(),
         }
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug)]
 pub enum Term {
     Ret(Option<Operand>),
     Br(BlockId),
@@ -504,9 +625,27 @@ impl Term {
             }
         }
     }
+
+    pub fn operand(&self) -> Option<Operand> {
+        match self {
+            Term::CondBr { cond, .. } => Some(*cond),
+            Term::Switch { scrutinee, .. } => Some(*scrutinee),
+            Term::Ret(operand) => *operand,
+            Term::Br(_) | Term::Unreachable => None,
+        }
+    }
+
+    pub fn operand_mut(&mut self) -> Option<&mut Operand> {
+        match self {
+            Term::CondBr { cond, .. } => Some(cond),
+            Term::Switch { scrutinee, .. } => Some(scrutinee),
+            Term::Ret(operand) => operand.as_mut(),
+            Term::Br(_) | Term::Unreachable => None,
+        }
+    }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Debug)]
 pub struct Block {
     pub id: BlockId,
     pub label: String,
@@ -521,7 +660,7 @@ impl Block {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Debug)]
 pub struct Program {
     pub name: String,
     pub profile: Profile,
@@ -548,7 +687,7 @@ impl Program {
     }
 
     pub fn block(&self, id: BlockId) -> &Block {
-        &self.blocks[id.0 as usize]
+        &self.blocks[id.index()]
     }
 
     pub fn ops(&self) -> impl Iterator<Item = &Op> {
@@ -606,7 +745,7 @@ impl Program {
         let mut stack = vec![self.entry];
 
         while let Some(id) = stack.pop() {
-            let index = id.0 as usize;
+            let index = id.index();
             if index >= seen.len() || seen[index] {
                 continue;
             }
@@ -617,12 +756,6 @@ impl Program {
         }
 
         seen
-    }
-
-    pub fn fresh_value(&mut self) -> ValueId {
-        let id = ValueId(self.next_value);
-        self.next_value += 1;
-        id
     }
 }
 
@@ -661,44 +794,40 @@ fn render_operand(operand: &Operand) -> String {
 fn render_op(op: &Op) -> String {
     match op {
         Op::Gate(gate) => {
-            let mut out = String::new();
-            if !gate.controls.is_empty() {
-                out.push_str(&"c".repeat(gate.controls.len()));
-            }
+            let mut out = "c".repeat(gate.controls.len());
             out.push_str(gate.kind.name());
             if !gate.params.is_empty() {
                 let params: Vec<String> = gate.params.iter().map(render_operand).collect();
                 out.push_str(&format!("({})", params.join(", ")));
             }
-            let wires: Vec<String> = gate
-                .controls
-                .iter()
-                .chain(gate.targets.iter())
+            let wires = gate
+                .wires()
                 .map(|q| format!("q{}", q.0))
-                .collect();
+                .collect::<Vec<_>>();
             out.push_str(&format!(" {}", wires.join(", ")));
             out
         }
-        Op::Measure {
-            qubit,
-            result,
-            dest,
-            ..
-        } => match dest {
-            Some(d) => format!("%{} = measure q{} -> r{}", d.0, qubit.0, result.0),
-            None => format!("measure q{} -> r{}", qubit.0, result.0),
-        },
+        Op::Measure { qubit, result, .. } => format!("measure q{} -> r{}", qubit.0, result.0),
         Op::Reset { qubit, .. } => format!("reset q{}", qubit.0),
+        Op::Assign {
+            dest,
+            ty,
+            expr: expr @ Expr::Cast { .. },
+            ..
+        } => format!("%{} = {} to {ty}", dest.0, render_expr(expr)),
         Op::Assign { dest, expr, .. } => format!("%{} = {}", dest.0, render_expr(expr)),
         Op::RecordOutput {
             kind,
             result,
+            value,
             label,
             ..
         } => {
-            let target = result
-                .map(|r| format!("r{}", r.0))
-                .unwrap_or_else(|| "-".into());
+            let target = match (result, value) {
+                (Some(r), _) => format!("r{}", r.0),
+                (None, Some(v)) => render_operand(v),
+                (None, None) => "-".into(),
+            };
             match label {
                 Some(l) => format!("record {kind:?} {target} as {l:?}"),
                 None => format!("record {kind:?} {target}"),
@@ -714,14 +843,13 @@ fn render_op(op: &Op) -> String {
 fn render_expr(expr: &Expr) -> String {
     match expr {
         Expr::Const(c) => render_operand(&Operand::Const(*c)),
-        Expr::Copy(o) => render_operand(o),
         Expr::Binary { op, lhs, rhs } => format!(
             "{} {} {}",
             op.keyword(),
             render_operand(lhs),
             render_operand(rhs)
         ),
-        Expr::ICmp { pred, lhs, rhs } => format!(
+        Expr::ICmp { pred, lhs, rhs, .. } => format!(
             "icmp {} {} {}",
             pred.keyword(),
             render_operand(lhs),
@@ -743,7 +871,7 @@ fn render_expr(expr: &Expr) -> String {
             render_operand(if_true),
             render_operand(if_false)
         ),
-        Expr::Cast { op, operand } => format!("{} {}", op.keyword(), render_operand(operand)),
+        Expr::Cast { op, operand, .. } => format!("{} {}", op.keyword(), render_operand(operand)),
         Expr::Phi(incoming) => {
             let parts: Vec<String> = incoming
                 .iter()
@@ -757,7 +885,7 @@ fn render_expr(expr: &Expr) -> String {
 }
 
 fn render_term(program: &Program, term: &Term) -> String {
-    let label = |id: &BlockId| program.blocks[id.0 as usize].label.clone();
+    let label = |id: &BlockId| program.block(*id).label.as_str();
 
     match term {
         Term::Ret(None) => "ret".into(),
@@ -790,5 +918,62 @@ fn render_term(program: &Program, term: &Term) -> String {
             )
         }
         Term::Unreachable => "unreachable".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adjoints() {
+        assert_eq!(GateKind::S.adjoint(), Some(GateKind::SDag));
+        assert_eq!(GateKind::SDag.adjoint(), Some(GateKind::S));
+        assert_eq!(GateKind::T.adjoint(), Some(GateKind::TDag));
+        assert_eq!(GateKind::H.adjoint(), Some(GateKind::H));
+        assert_eq!(GateKind::Rz.adjoint(), None);
+    }
+
+    #[test]
+    fn operands() {
+        let v = |i| Operand::Value(ValueId(i));
+        let two = Operand::Const(Const::Int(2));
+
+        let select = Expr::Select {
+            cond: v(0),
+            if_true: v(1),
+            if_false: two,
+        };
+        assert_eq!(select.operands(), [v(0), v(1), two]);
+
+        let phi = Op::Assign {
+            dest: ValueId(9),
+            ty: Scalar::Int(64),
+            expr: Expr::Phi(vec![(BlockId(0), v(3)), (BlockId(1), v(4))]),
+            span: Span::DUMMY,
+        };
+        assert_eq!(phi.operands(), [v(3), v(4)]);
+
+        assert_eq!(Term::Ret(Some(v(5))).operand(), Some(v(5)));
+        assert_eq!(Term::Br(BlockId(0)).operand(), None);
+    }
+
+    #[test]
+    fn constants() {
+        let known = HashMap::from([(ValueId(0), Const::Float(0.5))]);
+        assert_eq!(
+            Operand::Value(ValueId(0)).resolve(&known),
+            Some(Const::Float(0.5))
+        );
+        assert_eq!(Operand::Value(ValueId(1)).resolve(&known), None);
+
+        let gate = Gate {
+            kind: GateKind::Rz,
+            controls: Vec::new(),
+            targets: vec![QubitId(0)],
+            params: vec![Operand::Const(Const::Int(2)), Operand::Value(ValueId(0))],
+            span: Span::DUMMY,
+        };
+        assert_eq!(gate.constant_params(), [2.0]);
     }
 }

@@ -3,7 +3,7 @@ use std::fmt;
 
 use crate::ir::*;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Coupling {
     pub qubits: usize,
     pub edges: Vec<(usize, usize)>,
@@ -146,7 +146,7 @@ impl Coupling {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub struct RouteStats {
     pub swaps_inserted: usize,
     pub final_layout: Vec<usize>,
@@ -171,13 +171,15 @@ pub fn route(program: &mut Program, coupling: &Coupling) -> Result<RouteStats, S
     }
 
     if !program.is_straight_line() {
-        return Err("cannot route a program that branches on a measurement".into());
+        return Err("cannot route a program with control flow".into());
     }
 
     for gate in program.gates() {
-        if gate.wires().count() > 2 {
+        let wires = gate.wires().count();
+        if wires > 2 {
             return Err(format!(
-                "`{}` acts on more than two qubits, decompose it with --basis first",
+                "`{}{}` acts on {wires} qubits, the router only handles one and two qubit gates",
+                "c".repeat(gate.controls.len()),
                 gate.kind.name()
             ));
         }
@@ -189,7 +191,7 @@ pub fn route(program: &mut Program, coupling: &Coupling) -> Result<RouteStats, S
     let mut swaps = 0usize;
 
     let block = &mut program.blocks[0];
-    let mut rewritten: Vec<Op> = Vec::with_capacity(block.ops.len());
+    let mut rewritten = Vec::with_capacity(block.ops.len());
 
     for op in block.ops.drain(..) {
         match op {
@@ -197,7 +199,7 @@ pub fn route(program: &mut Program, coupling: &Coupling) -> Result<RouteStats, S
                 let wires: Vec<QubitId> = gate.wires().collect();
 
                 if wires.len() == 2 {
-                    let mut a = physical[wires[0].index()];
+                    let a = physical[wires[0].index()];
                     let b = physical[wires[1].index()];
 
                     if !coupling.connected(a, b) {
@@ -217,24 +219,16 @@ pub fn route(program: &mut Program, coupling: &Coupling) -> Result<RouteStats, S
                                 span: gate.span,
                             }));
 
-                            let (lx, ly) = (logical_at[x], logical_at[y]);
-                            logical_at[x] = ly;
-                            logical_at[y] = lx;
-                            physical[lx] = y;
-                            physical[ly] = x;
+                            logical_at.swap(x, y);
+                            physical[logical_at[x]] = x;
+                            physical[logical_at[y]] = y;
                             swaps += 1;
                         }
-
-                        a = physical[wires[0].index()];
-                        debug_assert!(coupling.connected(a, physical[wires[1].index()]));
                     }
                 }
 
-                for control in &mut gate.controls {
-                    *control = QubitId(physical[control.index()] as u32);
-                }
-                for target in &mut gate.targets {
-                    *target = QubitId(physical[target.index()] as u32);
+                for q in gate.controls.iter_mut().chain(&mut gate.targets) {
+                    *q = remap(&physical, *q);
                 }
 
                 rewritten.push(Op::Gate(gate));
@@ -243,17 +237,15 @@ pub fn route(program: &mut Program, coupling: &Coupling) -> Result<RouteStats, S
             Op::Measure {
                 qubit,
                 result,
-                dest,
                 span,
             } => rewritten.push(Op::Measure {
-                qubit: QubitId(physical[qubit.index()] as u32),
+                qubit: remap(&physical, qubit),
                 result,
-                dest,
                 span,
             }),
 
             Op::Reset { qubit, span } => rewritten.push(Op::Reset {
-                qubit: QubitId(physical[qubit.index()] as u32),
+                qubit: remap(&physical, qubit),
                 span,
             }),
 
@@ -268,6 +260,10 @@ pub fn route(program: &mut Program, coupling: &Coupling) -> Result<RouteStats, S
         swaps_inserted: swaps,
         final_layout: physical,
     })
+}
+
+fn remap(physical: &[usize], q: QubitId) -> QubitId {
+    QubitId(physical[q.index()] as u32)
 }
 
 pub fn respects(program: &Program, coupling: &Coupling) -> bool {
@@ -333,16 +329,14 @@ mod tests {
         let line = Coupling::line(5);
         assert_eq!(line.shortest_path(0, 4).unwrap(), vec![0, 1, 2, 3, 4]);
         assert_eq!(line.shortest_path(2, 2).unwrap(), vec![2]);
-        assert!(
-            Coupling::parse("0-1")
-                .unwrap()
-                .shortest_path(0, 1)
-                .is_some()
+        assert_eq!(
+            Coupling::parse("0-1").unwrap().shortest_path(0, 1),
+            Some(vec![0, 1])
         );
     }
 
     #[test]
-    fn no_swaps_needed() {
+    fn adjacent() {
         let mut program = line_program(&[(0, 1), (1, 2)], 3);
         let stats = route(&mut program, &Coupling::line(3)).unwrap();
         assert_eq!(stats.swaps_inserted, 0);
@@ -355,12 +349,12 @@ mod tests {
         let mut program = line_program(&[(0, 4)], 5);
 
         let stats = route(&mut program, &coupling).unwrap();
-        assert!(stats.swaps_inserted > 0);
+        assert_eq!(stats.swaps_inserted, 3);
         assert!(respects(&program, &coupling));
     }
 
     #[test]
-    fn rejects_branching() {
+    fn branching() {
         let mut program = line_program(&[(0, 1)], 2);
         program.blocks.push(Block {
             id: BlockId(1),
@@ -371,11 +365,15 @@ mod tests {
         });
         program.blocks[0].term = Term::Br(BlockId(1));
 
-        assert!(route(&mut program, &Coupling::line(2)).is_err());
+        assert!(
+            route(&mut program, &Coupling::line(2))
+                .unwrap_err()
+                .contains("control flow")
+        );
     }
 
     #[test]
-    fn rejects_three_qubit_gate() {
+    fn three_qubit_gate() {
         let mut program = Program::new("t", Profile::Unrestricted);
         program.num_qubits = 3;
         program.blocks.push(Block {
@@ -393,12 +391,16 @@ mod tests {
         });
 
         let message = route(&mut program, &Coupling::line(3)).unwrap_err();
-        assert!(message.contains("--basis"));
+        assert!(message.contains("acts on 3 qubits"), "{message}");
     }
 
     #[test]
-    fn rejects_small_device() {
+    fn small_device() {
         let mut program = line_program(&[(0, 1)], 4);
-        assert!(route(&mut program, &Coupling::line(2)).is_err());
+        assert!(
+            route(&mut program, &Coupling::line(2))
+                .unwrap_err()
+                .contains("needs 4 qubits")
+        );
     }
 }

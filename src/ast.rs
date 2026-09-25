@@ -33,13 +33,6 @@ pub enum Ty {
 }
 
 impl Ty {
-    pub fn is_float(&self) -> bool {
-        matches!(
-            self,
-            Ty::Half | Ty::Float | Ty::Double | Ty::X86Fp80 | Ty::Fp128
-        )
-    }
-
     pub fn pointee_name(&self) -> Option<&str> {
         match self {
             Ty::Ptr(Some(inner)) => match inner.as_ref() {
@@ -47,68 +40,6 @@ impl Ty {
                 _ => None,
             },
             _ => None,
-        }
-    }
-
-    pub fn render(&self) -> String {
-        match self {
-            Ty::Void => "void".into(),
-            Ty::Int(bits) => format!("i{bits}"),
-            Ty::Half => "half".into(),
-            Ty::Float => "float".into(),
-            Ty::Double => "double".into(),
-            Ty::X86Fp80 => "x86_fp80".into(),
-            Ty::Fp128 => "fp128".into(),
-            Ty::Ptr(None) => "ptr".into(),
-            Ty::Ptr(Some(inner)) => format!("{}*", inner.render()),
-            Ty::Array(len, elem) => format!("[{len} x {}]", elem.render()),
-            Ty::Vector {
-                len,
-                scalable,
-                elem,
-            } => {
-                if *scalable {
-                    format!("<vscale x {len} x {}>", elem.render())
-                } else {
-                    format!("<{len} x {}>", elem.render())
-                }
-            }
-            Ty::Struct { fields, packed } => {
-                let body = fields
-                    .iter()
-                    .map(|f| f.render())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if *packed {
-                    format!("<{{ {body} }}>")
-                } else {
-                    format!("{{ {body} }}")
-                }
-            }
-            Ty::Named(name) => format!("%{name}"),
-            Ty::Func {
-                ret,
-                params,
-                varargs,
-            } => {
-                let mut body = params
-                    .iter()
-                    .map(|p| p.render())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if *varargs {
-                    if body.is_empty() {
-                        body.push_str("...");
-                    } else {
-                        body.push_str(", ...");
-                    }
-                }
-                format!("{} ({body})", ret.render())
-            }
-            Ty::Label => "label".into(),
-            Ty::Metadata => "metadata".into(),
-            Ty::Token => "token".into(),
-            Ty::Opaque => "opaque".into(),
         }
     }
 }
@@ -130,7 +61,7 @@ pub enum Value {
     ConstExpr(Box<ConstExpr>),
     MetadataRef(String),
     MetadataString(String),
-    BlockAddress(String),
+    BlockAddress,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -434,8 +365,7 @@ pub enum Attribute {
 impl Attribute {
     pub fn key(&self) -> &str {
         match self {
-            Attribute::Flag(k) => k,
-            Attribute::KeyValue(k, _) => k,
+            Attribute::Flag(k) | Attribute::KeyValue(k, _) => k,
         }
     }
 

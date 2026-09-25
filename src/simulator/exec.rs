@@ -1,7 +1,6 @@
-use std::collections::BTreeMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::matrix::{Matrix2, matrix_for};
+use super::matrix::matrix_for;
 use super::state::{Rng, State};
 use crate::ir::*;
 
@@ -28,10 +27,20 @@ pub struct ExecOutcome {
     pub final_state: Option<State>,
     pub aborted: bool,
     pub counts: BTreeMap<String, u64>,
-    pub shots: u64,
+    pub returns: BTreeMap<String, u64>,
     pub messages: Vec<String>,
     pub outputs: Vec<String>,
     pub sampled: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Returned {
+    Open(OutputKind, Option<usize>),
+    Close,
+    Bit(bool),
+    Bool(bool),
+    Int(i64),
+    Double(f64),
 }
 
 pub fn needs_per_shot(program: &Program) -> bool {
@@ -39,7 +48,8 @@ pub fn needs_per_shot(program: &Program) -> bool {
         return true;
     }
 
-    let mut measured: HashSet<QubitId> = HashSet::new();
+    let mut measured = HashSet::new();
+    let mut recorded = HashSet::new();
 
     for op in program.ops() {
         match op {
@@ -47,9 +57,20 @@ pub fn needs_per_shot(program: &Program) -> bool {
             Op::Assign {
                 expr: Expr::ReadResult(_),
                 ..
+            }
+            | Op::RecordOutput {
+                value: Some(Operand::Value(_)),
+                ..
             } => return true,
+            Op::Measure { result, .. } if recorded.contains(result) => return true,
             Op::Measure { qubit, .. } => {
                 measured.insert(*qubit);
+            }
+            Op::RecordOutput {
+                result: Some(result),
+                ..
+            } => {
+                recorded.insert(*result);
             }
             Op::Gate(gate) if gate.wires().any(|wire| measured.contains(&wire)) => {
                 return true;
@@ -89,22 +110,22 @@ fn execute_sampled(program: &Program, config: ExecConfig) -> ExecOutcome {
     let mut state = State::new(program.num_qubits as usize);
     let mut messages = Vec::new();
     let mut outputs = Vec::new();
-    let mut values: HashMap<ValueId, Const> = HashMap::new();
-    let mut slots: Vec<Const> = vec![Const::Int(0); program.num_slots as usize];
+    let mut values = HashMap::new();
+    let mut slots = vec![Const::Int(0); program.num_slots as usize];
 
     for block in &program.blocks {
         for op in &block.ops {
             match op {
                 Op::Gate(gate) => apply_gate(&mut state, gate, &values),
                 Op::Store { slot, value, .. } => {
-                    if let Some(v) = resolve(value, &values)
+                    if let Some(v) = value.resolve(&values)
                         && let Some(cell) = slots.get_mut(slot.index())
                     {
                         *cell = v;
                     }
                 }
-                Op::Assign { dest, expr, .. } => {
-                    if let Some(value) = eval(expr, &values, &[], &slots, None) {
+                Op::Assign { dest, ty, expr, .. } => {
+                    if let Some(value) = eval(*ty, expr, &values, &[], &slots, None) {
                         values.insert(*dest, value);
                     }
                 }
@@ -122,20 +143,34 @@ fn execute_sampled(program: &Program, config: ExecConfig) -> ExecOutcome {
     }
 
     let plan = measurement_plan(program);
-    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    let records: Vec<&Op> = program
+        .ops()
+        .filter(|op| matches!(op, Op::RecordOutput { .. }))
+        .collect();
+    let mut counts = BTreeMap::new();
+    let mut returns = BTreeMap::new();
 
-    if config.shots > 0 && !plan.is_empty() {
+    if config.shots > 0 && !(plan.is_empty() && records.is_empty()) {
         let mut rng = Rng::new(config.seed);
         let sampler = state.sampler();
         for _ in 0..config.shots {
             let index = sampler.draw(&mut rng);
             let mut results = vec![false; program.num_results as usize];
             for (qubit, result) in &plan {
-                if (result.index()) < results.len() {
+                if result.index() < results.len() {
                     results[result.index()] = (index >> qubit.0) & 1 == 1;
                 }
             }
-            *counts.entry(format_results(&results)).or_insert(0) += 1;
+            if !plan.is_empty() {
+                *counts.entry(format_results(&results)).or_insert(0) += 1;
+            }
+            if !records.is_empty() {
+                let shot: Vec<Returned> = records
+                    .iter()
+                    .filter_map(|op| recorded(op, &values, &results))
+                    .collect();
+                *returns.entry(format_returned(&shot)).or_insert(0) += 1;
+            }
         }
     }
 
@@ -143,7 +178,7 @@ fn execute_sampled(program: &Program, config: ExecConfig) -> ExecOutcome {
         final_state: config.keep_state.then_some(state),
         aborted: false,
         counts,
-        shots: config.shots,
+        returns,
         messages,
         outputs,
         sampled: true,
@@ -153,11 +188,15 @@ fn execute_sampled(program: &Program, config: ExecConfig) -> ExecOutcome {
 fn execute_per_shot(program: &Program, config: ExecConfig) -> ExecOutcome {
     let shots = config.shots.max(1);
     let mut rng = Rng::new(config.seed);
-    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut counts = BTreeMap::new();
+    let mut returns = BTreeMap::new();
     let mut messages = Vec::new();
     let mut outputs = Vec::new();
     let mut last_state = None;
     let mut aborted = false;
+    let records = program
+        .ops()
+        .any(|op| matches!(op, Op::RecordOutput { .. }));
 
     for shot in 0..shots {
         let mut state = State::new(program.num_qubits as usize);
@@ -173,6 +212,9 @@ fn execute_per_shot(program: &Program, config: ExecConfig) -> ExecOutcome {
         }
 
         *counts.entry(format_results(&run.results)).or_insert(0) += 1;
+        if records {
+            *returns.entry(format_returned(&run.returned)).or_insert(0) += 1;
+        }
 
         if shot + 1 == shots && config.keep_state {
             last_state = Some(state);
@@ -183,7 +225,7 @@ fn execute_per_shot(program: &Program, config: ExecConfig) -> ExecOutcome {
         final_state: last_state,
         aborted,
         counts,
-        shots,
+        returns,
         messages,
         outputs,
         sampled: false,
@@ -195,18 +237,20 @@ struct ShotRun {
     results: Vec<bool>,
     messages: Vec<String>,
     outputs: Vec<String>,
+    returned: Vec<Returned>,
 }
 
 fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
     let mut results = vec![false; program.num_results as usize];
-    let mut values: HashMap<ValueId, Const> = HashMap::new();
-    let mut slots: Vec<Const> = vec![Const::Int(0); program.num_slots as usize];
+    let mut values = HashMap::new();
+    let mut slots = vec![Const::Int(0); program.num_slots as usize];
     let mut messages = Vec::new();
     let mut outputs = Vec::new();
+    let mut returned = Vec::new();
 
     let mut aborted = false;
     let mut current = program.entry;
-    let mut previous: Option<BlockId> = None;
+    let mut previous = None;
     let mut steps = 0usize;
 
     loop {
@@ -216,35 +260,46 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
             break;
         }
 
-        let index = current.0 as usize;
+        let index = current.index();
         if index >= program.blocks.len() {
             break;
         }
         let block = &program.blocks[index];
 
+        let phis: Vec<(ValueId, Const)> = block
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Assign {
+                    dest,
+                    ty,
+                    expr: expr @ Expr::Phi(_),
+                    ..
+                } => Some((*dest, eval(*ty, expr, &values, &results, &slots, previous)?)),
+                _ => None,
+            })
+            .collect();
+        values.extend(phis);
+
         for op in &block.ops {
             match op {
                 Op::Gate(gate) => apply_gate(state, gate, &values),
 
-                Op::Measure {
-                    qubit,
-                    result,
-                    dest,
-                    ..
-                } => {
+                Op::Measure { qubit, result, .. } => {
                     let outcome = state.measure(qubit.index(), rng);
                     if result.index() < results.len() {
                         results[result.index()] = outcome;
-                    }
-                    if let Some(dest) = dest {
-                        values.insert(*dest, Const::Bool(outcome));
                     }
                 }
 
                 Op::Reset { qubit, .. } => state.reset(qubit.index(), rng),
 
-                Op::Assign { dest, expr, .. } => {
-                    if let Some(value) = eval(expr, &values, &results, &slots, previous) {
+                Op::Assign {
+                    expr: Expr::Phi(_), ..
+                } => {}
+
+                Op::Assign { dest, ty, expr, .. } => {
+                    if let Some(value) = eval(*ty, expr, &values, &results, &slots, previous) {
                         values.insert(*dest, value);
                     }
                 }
@@ -252,7 +307,7 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
                 Op::Message { text, .. } => messages.push(text.clone()),
 
                 Op::Store { slot, value, .. } => {
-                    if let Some(v) = resolve(value, &values)
+                    if let Some(v) = value.resolve(&values)
                         && let Some(cell) = slots.get_mut(slot.index())
                     {
                         *cell = v;
@@ -265,7 +320,10 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
                     count,
                     label,
                     ..
-                } => outputs.push(render_output(*kind, *result, *count, label.as_deref())),
+                } => {
+                    outputs.push(render_output(*kind, *result, *count, label.as_deref()));
+                    returned.extend(recorded(op, &values, &results));
+                }
             }
         }
 
@@ -277,7 +335,7 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
                 if_true,
                 if_false,
             } => {
-                let taken = resolve(cond, &values).map(|c| c.truthy()).unwrap_or(false);
+                let taken = cond.resolve(&values).is_some_and(|c| c.truthy());
                 Some(if taken { *if_true } else { *if_false })
             }
             Term::Switch {
@@ -285,7 +343,7 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
                 cases,
                 default,
             } => {
-                let key = resolve(scrutinee, &values).map(|c| c.as_i64()).unwrap_or(0);
+                let key = scrutinee.resolve(&values).map_or(0, |c| c.as_i64());
                 Some(
                     cases
                         .iter()
@@ -310,7 +368,80 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
         results,
         messages,
         outputs,
+        returned,
     }
+}
+
+fn recorded(op: &Op, values: &HashMap<ValueId, Const>, results: &[bool]) -> Option<Returned> {
+    let Op::RecordOutput {
+        kind,
+        result,
+        value,
+        count,
+        ..
+    } = op
+    else {
+        return None;
+    };
+
+    let value = value.and_then(|v| v.resolve(values));
+    Some(match kind {
+        OutputKind::Tuple | OutputKind::Array => Returned::Open(
+            *kind,
+            count
+                .or(value.map(|v| v.as_i64()))
+                .map(|n| n.max(0) as usize),
+        ),
+        OutputKind::TupleEnd | OutputKind::ArrayEnd => Returned::Close,
+        OutputKind::Result => {
+            Returned::Bit(result.is_some_and(|r| results.get(r.index()).copied().unwrap_or(false)))
+        }
+        OutputKind::Bool => Returned::Bool(value?.truthy()),
+        OutputKind::Int => Returned::Int(value?.as_i64()),
+        OutputKind::Double => Returned::Double(value?.as_f64()),
+    })
+}
+
+fn format_returned(shot: &[Returned]) -> String {
+    let mut rest = shot;
+    let mut parts = Vec::new();
+    while !rest.is_empty() {
+        parts.extend(take_returned(&mut rest));
+    }
+    if parts.is_empty() {
+        return "(nothing)".into();
+    }
+    parts.join(", ")
+}
+
+fn take_returned(rest: &mut &[Returned]) -> Option<String> {
+    let (first, tail) = rest.split_first()?;
+    *rest = tail;
+
+    Some(match *first {
+        Returned::Open(kind, count) => {
+            let mut items = Vec::new();
+            while count.is_none_or(|n| items.len() < n) {
+                match rest.first() {
+                    None => break,
+                    Some(Returned::Close) if count.is_none() => {
+                        *rest = &rest[1..];
+                        break;
+                    }
+                    Some(_) => items.extend(take_returned(rest)),
+                }
+            }
+            match kind {
+                OutputKind::Array => format!("[{}]", items.join(", ")),
+                _ => format!("({})", items.join(", ")),
+            }
+        }
+        Returned::Close => return None,
+        Returned::Bit(bit) => u8::from(bit).to_string(),
+        Returned::Bool(flag) => flag.to_string(),
+        Returned::Int(number) => number.to_string(),
+        Returned::Double(number) => format!("{number:?}"),
+    })
 }
 
 fn apply_gate(state: &mut State, gate: &Gate, values: &HashMap<ValueId, Const>) {
@@ -326,24 +457,18 @@ fn apply_gate(state: &mut State, gate: &Gate, values: &HashMap<ValueId, Const>) 
     let params: Vec<f64> = gate
         .params
         .iter()
-        .map(|operand| resolve(operand, values).map(|c| c.as_f64()).unwrap_or(0.0))
+        .map(|operand| operand.resolve(values).map_or(0.0, |c| c.as_f64()))
         .collect();
 
-    let matrix: Matrix2 = matrix_for(gate.kind, &params);
+    let matrix = matrix_for(gate.kind, &params);
 
     for target in &gate.targets {
         state.apply(&matrix, target.index(), controls);
     }
 }
 
-fn resolve(operand: &Operand, values: &HashMap<ValueId, Const>) -> Option<Const> {
-    match operand {
-        Operand::Const(c) => Some(*c),
-        Operand::Value(id) => values.get(id).copied(),
-    }
-}
-
 fn eval(
+    ty: Scalar,
     expr: &Expr,
     values: &HashMap<ValueId, Const>,
     results: &[bool],
@@ -357,16 +482,16 @@ fn eval(
                 .iter()
                 .find(|(block, _)| *block == from)
                 .map(|(_, operand)| operand)?;
-            resolve(operand, values)
+            operand.resolve(values)
         }
 
         Expr::ReadResult(result) => Some(Const::Bool(
             results.get(result.index()).copied().unwrap_or(false),
         )),
 
-        Expr::Load(slot) => slots.get(slot.index()).copied(),
+        Expr::Load(slot) => slots.get(slot.index()).map(|c| ty.normalize(*c)),
 
-        other => other.fold(|operand| resolve(operand, values)),
+        other => other.fold(ty, |operand| operand.resolve(values)),
     }
 }
 
@@ -396,6 +521,8 @@ fn render_output(
             Some(n) => format!("ARRAY {n}"),
             None => "ARRAY".into(),
         },
+        OutputKind::TupleEnd => "TUPLE_END".into(),
+        OutputKind::ArrayEnd => "ARRAY_END".into(),
         OutputKind::Bool => "BOOL".into(),
         OutputKind::Int => "INT".into(),
         OutputKind::Double => "DOUBLE".into(),

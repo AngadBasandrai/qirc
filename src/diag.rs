@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::ops::Range;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Span {
     pub start: u32,
     pub end: u32,
@@ -17,10 +17,6 @@ impl Span {
         }
     }
 
-    pub fn at(offset: usize) -> Self {
-        Self::new(offset, offset)
-    }
-
     pub fn to(self, other: Span) -> Span {
         Span {
             start: self.start.min(other.start),
@@ -30,14 +26,6 @@ impl Span {
 
     pub fn range(self) -> Range<usize> {
         self.start as usize..self.end as usize
-    }
-
-    pub fn len(self) -> usize {
-        self.end.saturating_sub(self.start) as usize
-    }
-
-    pub fn is_empty(self) -> bool {
-        self.end <= self.start
     }
 }
 
@@ -95,19 +83,12 @@ impl SourceFile {
             .unwrap_or(self.text.len());
         self.text[start..end].trim_end_matches(['\n', '\r'])
     }
-
-    pub fn snippet(&self, span: Span) -> &str {
-        let start = (span.start as usize).min(self.text.len());
-        let end = (span.end as usize).min(self.text.len()).max(start);
-        &self.text[start..end]
-    }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Severity {
     Error,
     Warning,
-    Note,
 }
 
 impl Severity {
@@ -115,19 +96,17 @@ impl Severity {
         match self {
             Severity::Error => "error",
             Severity::Warning => "warning",
-            Severity::Note => "note",
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Label {
     pub span: Span,
     pub message: String,
-    pub primary: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub code: Option<&'static str>,
@@ -164,7 +143,6 @@ impl Diagnostic {
         self.labels.push(Label {
             span,
             message: message.into(),
-            primary: true,
         });
         self
     }
@@ -175,11 +153,7 @@ impl Diagnostic {
     }
 
     pub fn primary_span(&self) -> Option<Span> {
-        self.labels
-            .iter()
-            .find(|l| l.primary)
-            .or_else(|| self.labels.first())
-            .map(|l| l.span)
+        self.labels.first().map(|l| l.span)
     }
 
     pub fn render(&self, file: &SourceFile) -> String {
@@ -197,7 +171,6 @@ impl Diagnostic {
         let accent = match self.severity {
             Severity::Error => "1;31",
             Severity::Warning => "1;33",
-            Severity::Note => "1;36",
         };
         let blue = "1;34";
 
@@ -261,12 +234,7 @@ impl Diagnostic {
             let number = format!("{:>gutter$}", line_index + 1);
             writeln!(out, "{} {bar} {text}", paint(blue, &number)).unwrap();
 
-            let (marker, marker_color) = if label.primary {
-                ('^', accent)
-            } else {
-                ('-', blue)
-            };
-            let mut underline = marker.to_string().repeat(width_chars);
+            let mut underline = "^".repeat(width_chars);
             if !label.message.is_empty() {
                 underline.push(' ');
                 underline.push_str(&label.message);
@@ -275,7 +243,7 @@ impl Diagnostic {
                 out,
                 "{pad} {bar} {}{}",
                 " ".repeat(prefix_chars),
-                paint(marker_color, &underline)
+                paint(accent, &underline)
             )
             .unwrap();
         }
@@ -288,64 +256,6 @@ impl Diagnostic {
         }
 
         out
-    }
-}
-
-#[derive(Default)]
-pub struct Diagnostics {
-    items: Vec<Diagnostic>,
-}
-
-impl Diagnostics {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn push(&mut self, diagnostic: Diagnostic) {
-        self.items.push(diagnostic);
-    }
-
-    pub fn extend(&mut self, other: Diagnostics) {
-        self.items.extend(other.items);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    pub fn has_errors(&self) -> bool {
-        self.items.iter().any(|d| d.severity == Severity::Error)
-    }
-
-    pub fn error_count(&self) -> usize {
-        self.items
-            .iter()
-            .filter(|d| d.severity == Severity::Error)
-            .count()
-    }
-
-    pub fn warning_count(&self) -> usize {
-        self.items
-            .iter()
-            .filter(|d| d.severity == Severity::Warning)
-            .count()
-    }
-
-    pub fn iter(&self) -> std::slice::Iter<'_, Diagnostic> {
-        self.items.iter()
-    }
-}
-
-impl IntoIterator for Diagnostics {
-    type Item = Diagnostic;
-    type IntoIter = std::vec::IntoIter<Diagnostic>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.items.into_iter()
     }
 }
 
@@ -374,14 +284,6 @@ mod tests {
         let f = file();
         assert_eq!(f.line_text(1), "entry:");
         assert_eq!(f.line_text(0), "define void @main() {");
-    }
-
-    #[test]
-    fn snippets() {
-        let f = file();
-        let start = SRC.find("@__quantum__qis__foo").unwrap();
-        let span = Span::new(start, start + "@__quantum__qis__foo".len());
-        assert_eq!(f.snippet(span), "@__quantum__qis__foo");
     }
 
     #[test]
@@ -414,20 +316,5 @@ mod tests {
             caret_line.matches('^').count(),
             "@__quantum__qis__foo".len()
         );
-    }
-
-    #[test]
-    fn counts() {
-        let mut bag = Diagnostics::new();
-        assert!(!bag.has_errors());
-
-        bag.push(Diagnostic::warning("unused qubit"));
-        assert!(!bag.has_errors());
-        assert_eq!(bag.warning_count(), 1);
-
-        bag.push(Diagnostic::error("bad"));
-        assert!(bag.has_errors());
-        assert_eq!(bag.error_count(), 1);
-        assert_eq!(bag.len(), 2);
     }
 }

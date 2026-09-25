@@ -1,90 +1,743 @@
-use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::collections::{HashMap, HashSet};
+use std::f64::consts::PI;
+use std::fmt::{self, Write as _};
+use std::mem;
 
 use crate::ir::*;
 use crate::simulator::matrix::Matrix2;
+use crate::transpile::{self, Basis};
+use crate::verify;
 
-pub fn emit_qasm3(program: &Program) -> String {
-    let mut out = String::new();
+pub fn emit_qasm3(program: &Program) -> Result<String, String> {
+    QasmWriter::new(program)?.emit()
+}
 
-    out.push_str("OPENQASM 3.0;\n");
-    out.push_str("include \"stdgates.inc\";\n\n");
+struct QasmWriter<'a> {
+    program: &'a Program,
+    out: String,
+    types: Types,
+    reads: HashMap<ValueId, ResultId>,
+    incoming: HashMap<BlockId, Vec<(ValueId, Operand)>>,
+    post: Option<HashMap<BlockId, HashSet<BlockId>>>,
+    outputs: HashMap<(BlockId, usize), usize>,
+    written: HashSet<BlockId>,
+    repeated: bool,
+}
 
-    if program.num_qubits > 0 {
-        writeln!(out, "qubit[{}] q;", program.num_qubits).unwrap();
-    }
-    if program.num_results > 0 {
-        writeln!(out, "bit[{}] c;", program.num_results).unwrap();
-    }
-    out.push('\n');
+impl<'a> QasmWriter<'a> {
+    fn new(program: &'a Program) -> Result<Self, String> {
+        let mut operands = Vec::new();
+        let mut incoming: HashMap<BlockId, Vec<(ValueId, Operand)>> = HashMap::new();
+        let mut measured: HashMap<ResultId, usize> = HashMap::new();
 
-    let branching = !program.is_straight_line();
-
-    for block in &program.blocks {
-        if branching {
-            writeln!(out, "// block {}", block.label).unwrap();
-        }
-
-        for op in &block.ops {
+        for op in program.ops() {
+            operands.extend(op.operands());
             match op {
-                Op::Gate(gate) => {
-                    if let Some(line) = qasm_gate(gate) {
-                        writeln!(out, "{line}").unwrap();
-                    } else if gate.is_parameterised() && gate.constant_angle().is_none() {
-                        writeln!(
-                            out,
-                            "// omitted {} on {}: angle is only known at run time",
-                            gate.kind.name(),
-                            qasm_wires(gate)
-                        )
-                        .unwrap();
-                    } else {
-                        writeln!(out, "// unsupported gate {}", gate.kind.name()).unwrap();
+                Op::Assign {
+                    dest,
+                    expr: Expr::Phi(edges),
+                    ..
+                } => {
+                    for (block, operand) in edges {
+                        incoming.entry(*block).or_default().push((*dest, *operand));
                     }
                 }
-                Op::Measure { qubit, result, .. } => {
-                    writeln!(out, "c[{}] = measure q[{}];", result.0, qubit.0).unwrap();
-                }
-                Op::Reset { qubit, .. } => {
-                    writeln!(out, "reset q[{}];", qubit.0).unwrap();
-                }
-                Op::Assign { .. }
-                | Op::RecordOutput { .. }
-                | Op::Store { .. }
-                | Op::Message { .. } => {}
+                Op::Assign {
+                    expr: Expr::Const(c),
+                    ..
+                } => operands.push(Operand::Const(*c)),
+                Op::Measure { result, .. } => *measured.entry(*result).or_default() += 1,
+                _ => {}
             }
         }
 
-        if branching && let Term::CondBr { .. } = block.term {
-            writeln!(out, "// conditional branch elided").unwrap();
+        if operands
+            .iter()
+            .any(|o| matches!(o, Operand::Const(Const::Float(f)) if !f.is_finite()))
+        {
+            return Err("an infinite or NaN constant cannot be written as OpenQASM 3".into());
+        }
+
+        let has_switch = program
+            .blocks
+            .iter()
+            .any(|b| matches!(b.term, Term::Switch { .. }));
+        let post = if has_switch {
+            None
+        } else {
+            post_dominators(program)
+        };
+
+        let looping = looping_blocks(program);
+        if program.blocks.iter().any(|block| {
+            looping.contains(&block.id)
+                && block.ops.iter().any(|op| {
+                    matches!(
+                        op,
+                        Op::RecordOutput {
+                            value: Some(_),
+                            kind: OutputKind::Bool | OutputKind::Int | OutputKind::Double,
+                            ..
+                        }
+                    )
+                })
+        }) {
+            return Err("a value recorded inside a loop cannot be written as OpenQASM 3".into());
+        }
+
+        let idom = verify::immediate_dominators(program);
+        let mut sites = HashMap::new();
+        let mut reads = HashMap::new();
+        for block in &program.blocks {
+            for (index, op) in block.ops.iter().enumerate() {
+                match op {
+                    Op::Measure { result, .. } => {
+                        sites.insert(*result, (block.id, index));
+                    }
+                    Op::Assign {
+                        dest,
+                        expr: Expr::ReadResult(result),
+                        ..
+                    } if measured.get(result) == Some(&1) => {
+                        let before = match sites.get(result) {
+                            Some(&(site, _)) if site != block.id => {
+                                looping.is_empty() && verify::dominates(&idom, site, block.id)
+                            }
+                            Some(&(_, at)) => at < index,
+                            None => false,
+                        };
+                        if before {
+                            reads.insert(*dest, *result);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(Self {
+            program,
+            out: String::new(),
+            types: Types::new(program),
+            reads,
+            incoming,
+            post,
+            outputs: HashMap::new(),
+            written: HashSet::new(),
+            repeated: false,
+        })
+    }
+
+    fn emit(mut self) -> Result<String, String> {
+        let program = self.program;
+        self.out
+            .push_str("OPENQASM 3.0;\ninclude \"stdgates.inc\";\n");
+        if program.gates().any(|g| g.kind == GateKind::SXDag) {
+            self.out.push_str("gate sxdg a { inv @ sx a; }\n");
+        }
+        if program
+            .gates()
+            .any(|g| g.kind == GateKind::Z && g.controls.len() == 2)
+        {
+            self.out
+                .push_str("gate ccz a, b, c { h c; ccx a, b, c; h c; }\n");
+        }
+        self.out.push('\n');
+        if program.num_qubits > 0 {
+            writeln!(self.out, "qubit[{}] q;", program.num_qubits).unwrap();
+        }
+        if program.num_results > 0 {
+            writeln!(self.out, "bit[{}] c;", program.num_results).unwrap();
+        }
+        self.declare();
+        self.out.push('\n');
+
+        if program.blocks.is_empty() {
+            return Ok(self.out);
+        }
+        let start = self.out.len();
+        if self.post.is_some() {
+            self.region(program.entry, None, 0)?;
+        }
+        if self.post.is_none() || self.repeated {
+            self.out.truncate(start);
+            self.dispatch()?;
+        }
+        Ok(self.out)
+    }
+
+    fn declare(&mut self) {
+        for op in self.program.ops() {
+            let Op::Assign { dest, ty, expr, .. } = op else {
+                continue;
+            };
+            if self.reads.contains_key(dest) {
+                continue;
+            }
+            declare_var(&mut self.out, *ty, format_args!("v{}", dest.0));
+            if matches!(expr, Expr::Phi(_)) {
+                declare_var(&mut self.out, *ty, format_args!("v{}_in", dest.0));
+            }
+        }
+
+        let mut slots: Vec<_> = self.types.slots.iter().collect();
+        slots.sort_by_key(|(slot, _)| slot.0);
+        for (slot, ty) in slots {
+            declare_var(&mut self.out, *ty, format_args!("s{}", slot.0));
+        }
+
+        for block in &self.program.blocks {
+            for (index, op) in block.ops.iter().enumerate() {
+                if let Op::RecordOutput {
+                    kind: kind @ (OutputKind::Bool | OutputKind::Int | OutputKind::Double),
+                    value: Some(_),
+                    ..
+                } = op
+                {
+                    let number = self.outputs.len();
+                    self.outputs.insert((block.id, index), number);
+                    let ty = match kind {
+                        OutputKind::Bool => "bool",
+                        OutputKind::Double => "float[64]",
+                        _ => "int[64]",
+                    };
+                    writeln!(self.out, "output {ty} out{number};").unwrap();
+                }
+            }
         }
     }
 
-    out
+    fn region(
+        &mut self,
+        start: BlockId,
+        stop: Option<BlockId>,
+        depth: usize,
+    ) -> Result<(), String> {
+        let program = self.program;
+        let indent = "    ".repeat(depth);
+        let mut current = start;
+
+        while Some(current) != stop {
+            if !self.written.insert(current) {
+                self.repeated = true;
+                return Ok(());
+            }
+            self.body(current, &indent)?;
+
+            match &program.block(current).term {
+                Term::Ret(_) | Term::Unreachable | Term::Switch { .. } => return Ok(()),
+                Term::Br(next) => current = *next,
+                Term::CondBr {
+                    cond,
+                    if_true,
+                    if_false,
+                } => {
+                    let join = self.join(current);
+                    let condition = self.condition(cond);
+                    let taken = self.nested(*if_true, join, depth + 1)?;
+                    let skipped = self.nested(*if_false, join, depth + 1)?;
+                    match (taken.is_empty(), skipped.is_empty()) {
+                        (true, true) => Ok(()),
+                        (false, true) => {
+                            write!(self.out, "{indent}if ({condition}) {{\n{taken}{indent}}}\n")
+                        }
+                        (true, false) => write!(
+                            self.out,
+                            "{indent}if (!({condition})) {{\n{skipped}{indent}}}\n"
+                        ),
+                        (false, false) => write!(
+                            self.out,
+                            "{indent}if ({condition}) {{\n{taken}{indent}}} else {{\n{skipped}{indent}}}\n"
+                        ),
+                    }
+                    .unwrap();
+                    match join {
+                        Some(next) => current = next,
+                        None => return Ok(()),
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn nested(
+        &mut self,
+        start: BlockId,
+        stop: Option<BlockId>,
+        depth: usize,
+    ) -> Result<String, String> {
+        let outer = mem::take(&mut self.out);
+        let done = self.region(start, stop, depth);
+        let inner = mem::replace(&mut self.out, outer);
+        done.map(|()| inner)
+    }
+
+    fn dispatch(&mut self) -> Result<(), String> {
+        let program = self.program;
+        let number = |id: &BlockId| id.0 + 1;
+
+        writeln!(self.out, "uint[32] block = {};", number(&program.entry)).unwrap();
+        writeln!(self.out, "while (block != 0) {{").unwrap();
+        for block in &program.blocks {
+            writeln!(self.out, "    if (block == {}) {{", number(&block.id)).unwrap();
+            self.body(block.id, "        ")?;
+            let jump = match &block.term {
+                Term::Ret(_) | Term::Unreachable => "block = 0;".to_string(),
+                Term::Br(next) => format!("block = {};", number(next)),
+                Term::CondBr {
+                    cond,
+                    if_true,
+                    if_false,
+                } => format!(
+                    "if ({}) {{ block = {}; }} else {{ block = {}; }}",
+                    self.condition(cond),
+                    number(if_true),
+                    number(if_false)
+                ),
+                Term::Switch {
+                    scrutinee,
+                    cases,
+                    default,
+                } => {
+                    let key = self.value(scrutinee);
+                    let mut text = String::new();
+                    for (case, target) in cases {
+                        write!(
+                            text,
+                            "if ({key} == {case}) {{ block = {}; }} else ",
+                            number(target)
+                        )
+                        .unwrap();
+                    }
+                    format!("{text}{{ block = {}; }}", number(default))
+                }
+            };
+            writeln!(self.out, "        {jump}\n    }}").unwrap();
+        }
+        writeln!(self.out, "}}").unwrap();
+        Ok(())
+    }
+
+    fn body(&mut self, id: BlockId, indent: &str) -> Result<(), String> {
+        let block = self.program.block(id);
+        for op in &block.ops {
+            if let Op::Assign {
+                dest,
+                expr: Expr::Phi(_),
+                ..
+            } = op
+            {
+                writeln!(self.out, "{indent}v{0} = v{0}_in;", dest.0).unwrap();
+            }
+        }
+        for (index, op) in block.ops.iter().enumerate() {
+            self.op(op, indent)?;
+            if let (Some(number), Op::RecordOutput { value: Some(v), .. }) =
+                (self.outputs.get(&(id, index)), op)
+            {
+                let value = self.value(v);
+                writeln!(self.out, "{indent}out{number} = {value};").unwrap();
+            }
+        }
+        if let Some(edges) = self.incoming.get(&id) {
+            for (dest, operand) in edges {
+                let value = self.value(operand);
+                writeln!(self.out, "{indent}v{}_in = {value};", dest.0).unwrap();
+            }
+        }
+        Ok(())
+    }
+
+    fn op(&mut self, op: &Op, indent: &str) -> Result<(), String> {
+        match op {
+            Op::Gate(gate) => {
+                let params: Vec<String> = gate.params.iter().map(|p| self.angle(p)).collect();
+                writeln!(self.out, "{indent}{}", qasm_gate(gate, &params)).unwrap();
+            }
+            Op::Measure { qubit, result, .. } => {
+                writeln!(
+                    self.out,
+                    "{indent}c[{}] = measure q[{}];",
+                    result.0, qubit.0
+                )
+                .unwrap();
+            }
+            Op::Reset { qubit, .. } => {
+                writeln!(self.out, "{indent}reset q[{}];", qubit.0).unwrap();
+            }
+            Op::Assign { dest, ty, expr, .. } => self.assign(*dest, *ty, expr, indent)?,
+            Op::Store { slot, value, .. } => {
+                let value = self.value(value);
+                writeln!(self.out, "{indent}s{} = {value};", slot.0).unwrap();
+            }
+            Op::RecordOutput { .. } | Op::Message { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn assign(
+        &mut self,
+        dest: ValueId,
+        ty: Scalar,
+        expr: &Expr,
+        indent: &str,
+    ) -> Result<(), String> {
+        if self.reads.contains_key(&dest) {
+            return Ok(());
+        }
+        let name = format!("v{}", dest.0);
+        let rhs = match expr {
+            Expr::Phi(_) => return Ok(()),
+            Expr::Const(c) => self.value(&Operand::Const(*c)),
+            Expr::ReadResult(result) => format!("bool(c[{}])", result.0),
+            Expr::Load(slot) => format!("s{}", slot.0),
+            Expr::Binary { op, lhs, rhs } => self.binary(*op, ty, lhs, rhs)?,
+            Expr::ICmp { pred, ty, lhs, rhs } => self.icmp(*pred, *ty, lhs, rhs),
+            Expr::FCmp { pred, lhs, rhs } => self.fcmp(*pred, lhs, rhs),
+            Expr::Cast { op, from, operand } => self.cast(*op, *from, ty, operand)?,
+            Expr::Select {
+                cond,
+                if_true,
+                if_false,
+            } => {
+                let condition = self.condition(cond);
+                let (a, b) = (self.value(if_true), self.value(if_false));
+                writeln!(
+                    self.out,
+                    "{indent}if ({condition}) {{ {name} = {a}; }} else {{ {name} = {b}; }}"
+                )
+                .unwrap();
+                return Ok(());
+            }
+        };
+        writeln!(self.out, "{indent}{name} = {rhs};").unwrap();
+        Ok(())
+    }
+
+    fn binary(
+        &self,
+        op: BinOp,
+        ty: Scalar,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) -> Result<String, String> {
+        let (a, b) = (self.value(lhs), self.value(rhs));
+
+        if ty == Scalar::Bool {
+            return match op {
+                BinOp::And | BinOp::Mul => Ok(format!("{a} && {b}")),
+                BinOp::Or => Ok(format!("{a} || {b}")),
+                BinOp::Xor | BinOp::Add | BinOp::Sub => Ok(format!("{a} != {b}")),
+                _ => Err(format!(
+                    "`{}` on booleans cannot be written as OpenQASM 3",
+                    op.keyword()
+                )),
+            };
+        }
+
+        let unsigned = |symbol: &str| {
+            let (a, b) = (unsigned(&a, ty), unsigned(&b, ty));
+            wrapped(&format!("int[64]({a} {symbol} {b})"), ty)
+        };
+        Ok(match op {
+            BinOp::FAdd => format!("{a} + {b}"),
+            BinOp::FSub => format!("{a} - {b}"),
+            BinOp::FMul => format!("{a} * {b}"),
+            BinOp::FDiv => format!("{a} / {b}"),
+            BinOp::Add => wrapped(&format!("{a} + {b}"), ty),
+            BinOp::Sub => wrapped(&format!("{a} - {b}"), ty),
+            BinOp::Mul => wrapped(&format!("{a} * {b}"), ty),
+            BinOp::SDiv => wrapped(&format!("{a} / {b}"), ty),
+            BinOp::SRem => format!("{a} % {b}"),
+            BinOp::Shl => wrapped(&format!("{a} << {b}"), ty),
+            BinOp::AShr => format!("{a} >> {b}"),
+            BinOp::And => format!("{a} & {b}"),
+            BinOp::Or => format!("{a} | {b}"),
+            BinOp::Xor => format!("{a} ^ {b}"),
+            BinOp::UDiv => unsigned("/"),
+            BinOp::URem => unsigned("%"),
+            BinOp::LShr => unsigned(">>"),
+            BinOp::FRem => {
+                return Err("a floating point remainder cannot be written as OpenQASM 3".into());
+            }
+        })
+    }
+
+    fn icmp(&self, pred: IntPredicate, ty: Scalar, lhs: &Operand, rhs: &Operand) -> String {
+        let (a, b) = (self.value(lhs), self.value(rhs));
+        let (symbol, signed) = match pred {
+            IntPredicate::Eq => return format!("{a} == {b}"),
+            IntPredicate::Ne => return format!("{a} != {b}"),
+            IntPredicate::Slt => ("<", true),
+            IntPredicate::Sle => ("<=", true),
+            IntPredicate::Sgt => (">", true),
+            IntPredicate::Sge => (">=", true),
+            IntPredicate::Ult => ("<", false),
+            IntPredicate::Ule => ("<=", false),
+            IntPredicate::Ugt => (">", false),
+            IntPredicate::Uge => (">=", false),
+        };
+        let side = |x: &str| match (ty, signed) {
+            (Scalar::Bool, true) => format!("-int[64]({x})"),
+            (Scalar::Bool, false) => format!("int[64]({x})"),
+            (_, true) => x.to_string(),
+            (_, false) => unsigned(x, ty),
+        };
+        format!("{} {symbol} {}", side(&a), side(&b))
+    }
+
+    fn fcmp(&self, pred: FloatPredicate, lhs: &Operand, rhs: &Operand) -> String {
+        let (a, b) = (self.value(lhs), self.value(rhs));
+        match pred {
+            FloatPredicate::True => "true".into(),
+            FloatPredicate::False => "false".into(),
+            FloatPredicate::Oeq => format!("{a} == {b}"),
+            FloatPredicate::Une => format!("{a} != {b}"),
+            FloatPredicate::Ogt => format!("{a} > {b}"),
+            FloatPredicate::Oge => format!("{a} >= {b}"),
+            FloatPredicate::Olt => format!("{a} < {b}"),
+            FloatPredicate::Ole => format!("{a} <= {b}"),
+            FloatPredicate::One => format!("({a} < {b} || {a} > {b})"),
+            FloatPredicate::Ueq => format!("!({a} < {b} || {a} > {b})"),
+            FloatPredicate::Ugt => format!("!({a} <= {b})"),
+            FloatPredicate::Uge => format!("!({a} < {b})"),
+            FloatPredicate::Ult => format!("!({a} >= {b})"),
+            FloatPredicate::Ule => format!("!({a} > {b})"),
+            FloatPredicate::Ord => format!("({a} == {a} && {b} == {b})"),
+            FloatPredicate::Uno => format!("({a} != {a} || {b} != {b})"),
+        }
+    }
+
+    fn cast(
+        &self,
+        op: CastOp,
+        from: Scalar,
+        to: Scalar,
+        operand: &Operand,
+    ) -> Result<String, String> {
+        let x = self.value(operand);
+        let integer = |x: String| match to {
+            Scalar::Bool => format!("({x} & 1) == 1"),
+            _ => wrapped(&x, to),
+        };
+        Ok(match (op, from) {
+            _ if from == to && !matches!(op, CastOp::FPTrunc) => x,
+            (CastOp::ZExt | CastOp::SExt | CastOp::UIToFP, Scalar::Bool) => {
+                let widened = match op {
+                    CastOp::SExt => format!("-int[64]({x})"),
+                    _ => format!("int[64]({x})"),
+                };
+                match to {
+                    Scalar::Double => format!("float[64]({widened})"),
+                    _ => widened,
+                }
+            }
+            (CastOp::SIToFP, Scalar::Bool) => format!("float[64](-int[64]({x}))"),
+            (CastOp::Trunc | CastOp::SExt, _) => integer(x),
+            (CastOp::ZExt, _) => integer(format!("int[64]({})", unsigned(&x, from))),
+            (CastOp::SIToFP, _) => format!("float[64]({x})"),
+            (CastOp::UIToFP, _) => format!("float[64]({})", unsigned(&x, from)),
+            (CastOp::FPToSI | CastOp::FPToUI, _) => integer(format!("int[64]({x})")),
+            (CastOp::FPExt, _) => x,
+            (CastOp::FPTrunc, _) => format!("float[64](float[32]({x}))"),
+            (CastOp::PtrToInt | CastOp::IntToPtr | CastOp::BitCast | CastOp::AddrSpaceCast, _) => {
+                return Err(format!(
+                    "`{}` cannot be written as OpenQASM 3",
+                    op.keyword()
+                ));
+            }
+        })
+    }
+
+    fn condition(&self, cond: &Operand) -> String {
+        let value = self.value(cond);
+        if self.type_of(cond) == Scalar::Bool {
+            value
+        } else {
+            format!("{value} != 0")
+        }
+    }
+
+    fn angle(&self, operand: &Operand) -> String {
+        match operand {
+            Operand::Const(c) => c.as_f64().to_string(),
+            Operand::Value(_) if self.type_of(operand) == Scalar::Double => self.value(operand),
+            Operand::Value(_) => format!("float[64]({})", self.value(operand)),
+        }
+    }
+
+    fn value(&self, operand: &Operand) -> String {
+        match operand {
+            Operand::Const(Const::Bool(b)) => b.to_string(),
+            Operand::Const(Const::Int(i)) if *i < 0 => format!("({i})"),
+            Operand::Const(Const::Int(i)) => i.to_string(),
+            Operand::Const(Const::Float(f)) if *f < 0.0 => format!("({f:?})"),
+            Operand::Const(Const::Float(f)) => format!("{f:?}"),
+            Operand::Value(id) => match self.reads.get(id) {
+                Some(result) => format!("c[{}]", result.0),
+                None => format!("v{}", id.0),
+            },
+        }
+    }
+
+    fn type_of(&self, operand: &Operand) -> Scalar {
+        self.types.of(operand)
+    }
+
+    fn join(&self, block: BlockId) -> Option<BlockId> {
+        let post = self.post.as_ref()?;
+        let own = &post[&block];
+        own.iter()
+            .copied()
+            .filter(|&other| other != block)
+            .find(|other| post[other].len() == own.len() - 1)
+    }
 }
 
-fn qasm_name(kind: GateKind, controls: usize) -> Option<String> {
+fn declare_var(out: &mut String, ty: Scalar, name: fmt::Arguments) {
+    let (qasm, zero) = match ty {
+        Scalar::Bool => ("bool", "false"),
+        Scalar::Double => ("float[64]", "0.0"),
+        Scalar::Int(_) => ("int[64]", "0"),
+    };
+    writeln!(out, "{qasm} {name} = {zero};").unwrap();
+}
+
+fn wrapped(x: &str, ty: Scalar) -> String {
+    match ty {
+        Scalar::Int(bits) if bits < 64 => {
+            let shift = 64 - bits;
+            format!("(({x}) << {shift}) >> {shift}")
+        }
+        _ => x.to_string(),
+    }
+}
+
+fn unsigned(x: &str, ty: Scalar) -> String {
+    match ty {
+        Scalar::Int(bits) if bits < 64 => format!("(uint[64]({x}) & {})", (1u64 << bits) - 1),
+        _ => format!("uint[64]({x})"),
+    }
+}
+
+fn looping_blocks(program: &Program) -> HashSet<BlockId> {
+    program
+        .blocks
+        .iter()
+        .filter(|block| {
+            let mut stack = block.term.successors();
+            let mut seen = HashSet::new();
+            while let Some(next) = stack.pop() {
+                if next == block.id {
+                    return true;
+                }
+                if seen.insert(next) {
+                    stack.extend(program.block(next).term.successors());
+                }
+            }
+            false
+        })
+        .map(|block| block.id)
+        .collect()
+}
+
+struct Types {
+    values: HashMap<ValueId, Scalar>,
+    slots: HashMap<SlotId, Scalar>,
+}
+
+impl Types {
+    fn new(program: &Program) -> Types {
+        let mut values = HashMap::new();
+        let mut slots = HashMap::new();
+        for op in program.ops() {
+            if let Op::Assign { dest, ty, expr, .. } = op {
+                values.insert(*dest, *ty);
+                if let Expr::Load(slot) = expr {
+                    slots.insert(*slot, *ty);
+                }
+            }
+        }
+        let mut types = Types { values, slots };
+        for op in program.ops() {
+            if let Op::Store { slot, value, .. } = op
+                && !types.slots.contains_key(slot)
+            {
+                let ty = types.of(value);
+                types.slots.insert(*slot, ty);
+            }
+        }
+        types
+    }
+
+    fn of(&self, operand: &Operand) -> Scalar {
+        match operand {
+            Operand::Const(Const::Bool(_)) => Scalar::Bool,
+            Operand::Const(Const::Int(_)) => Scalar::Int(64),
+            Operand::Const(Const::Float(_)) => Scalar::Double,
+            Operand::Value(id) => self.values.get(id).copied().unwrap_or(Scalar::Int(64)),
+        }
+    }
+}
+
+fn post_dominators(program: &Program) -> Option<HashMap<BlockId, HashSet<BlockId>>> {
+    if program.blocks.is_empty() {
+        return Some(HashMap::new());
+    }
+    let mut order = Vec::new();
+    let mut open = HashSet::from([program.entry]);
+    let mut seen = HashSet::from([program.entry]);
+    let mut stack = vec![(program.entry, 0)];
+
+    while let Some(top) = stack.last_mut() {
+        let (block, index) = *top;
+        match program.block(block).term.successors().get(index) {
+            Some(&next) => {
+                top.1 += 1;
+                if open.contains(&next) {
+                    return None;
+                }
+                if seen.insert(next) {
+                    open.insert(next);
+                    stack.push((next, 0));
+                }
+            }
+            None => {
+                stack.pop();
+                open.remove(&block);
+                order.push(block);
+            }
+        }
+    }
+
+    let mut post: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
+    for block in order {
+        let mut shared: Option<HashSet<BlockId>> = None;
+        for next in program.block(block).term.successors() {
+            let theirs = &post[&next];
+            shared = Some(match shared {
+                Some(set) => set.intersection(theirs).copied().collect(),
+                None => theirs.clone(),
+            });
+        }
+        let mut set = shared.unwrap_or_default();
+        set.insert(block);
+        post.insert(block, set);
+    }
+
+    Some(post)
+}
+
+fn qasm_name(kind: GateKind, controls: usize) -> String {
     let base = match kind {
         GateKind::I => "id",
-        GateKind::X => "x",
-        GateKind::Y => "y",
-        GateKind::Z => "z",
-        GateKind::H => "h",
-        GateKind::S => "s",
-        GateKind::SDag => "sdg",
-        GateKind::T => "t",
-        GateKind::TDag => "tdg",
-        GateKind::SX => "sx",
-        GateKind::SXDag => "sxdg",
-        GateKind::Rx => "rx",
-        GateKind::Ry => "ry",
-        GateKind::Rz => "rz",
         GateKind::R1 => "p",
-        GateKind::Swap => "swap",
-        GateKind::Unitary(_) => return None,
+        other => other.name(),
     };
 
-    Some(match (controls, base) {
+    match (controls, base) {
         (0, _) => base.to_string(),
         (1, "x") => "cx".into(),
         (1, "y") => "cy".into(),
@@ -98,46 +751,33 @@ fn qasm_name(kind: GateKind, controls: usize) -> Option<String> {
         (2, "x") => "ccx".into(),
         (2, "z") => "ccz".into(),
         (n, _) => format!("{}{base}", "ctrl @ ".repeat(n)),
-    })
+    }
 }
 
-fn qasm_gate(gate: &Gate) -> Option<String> {
-    if let GateKind::Unitary(m) = gate.kind {
-        let matrix = Matrix2::from_ir(m);
-        let (theta, phi, lambda) = zyz_angles(&matrix);
-        let wires = qasm_wires(gate);
-        return Some(format!("U({theta}, {phi}, {lambda}) {wires};"));
-    }
-
-    let name = qasm_name(gate.kind, gate.controls.len())?;
+fn qasm_gate(gate: &Gate, params: &[String]) -> String {
     let wires = qasm_wires(gate);
-
-    if gate.params.is_empty() {
-        return Some(format!("{name} {wires};"));
+    if let GateKind::Unitary(m) = gate.kind {
+        let (theta, phi, lambda) = zyz_angles(&Matrix2::from_ir(m));
+        return format!("U({theta}, {phi}, {lambda}) {wires};");
     }
+    let name = qasm_name(gate.kind, gate.controls.len());
 
-    let mut params = Vec::with_capacity(gate.params.len());
-    for parameter in &gate.params {
-        params.push(format!("{}", parameter.constant()?.as_f64()));
+    if params.is_empty() {
+        format!("{name} {wires};")
+    } else {
+        format!("{name}({}) {wires};", params.join(", "))
     }
-
-    Some(format!("{name}({}) {wires};", params.join(", ")))
 }
 
 fn qasm_wires(gate: &Gate) -> String {
-    gate.controls
-        .iter()
-        .chain(gate.targets.iter())
+    gate.wires()
         .map(|q| format!("q[{}]", q.0))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 pub fn zyz_angles(m: &Matrix2) -> (f64, f64, f64) {
-    let a = m.a;
-    let b = m.b;
-    let c = m.c;
-    let d = m.d;
+    let Matrix2 { a, b, c, d } = *m;
 
     let theta = 2.0 * a.norm().clamp(-1.0, 1.0).acos();
 
@@ -147,7 +787,7 @@ pub fn zyz_angles(m: &Matrix2) -> (f64, f64, f64) {
     }
 
     if a.norm() < 1e-12 {
-        return (std::f64::consts::PI, (c / (-b)).arg(), 0.0);
+        return (PI, (c / -b).arg(), 0.0);
     }
 
     let phi = (c / a).arg();
@@ -156,7 +796,7 @@ pub fn zyz_angles(m: &Matrix2) -> (f64, f64, f64) {
     (theta, phi, lambda)
 }
 
-pub fn emit_qir(program: &Program) -> String {
+pub fn emit_qir(program: &Program) -> Result<String, String> {
     QirEmitter::new(program).emit()
 }
 
@@ -164,19 +804,75 @@ struct QirEmitter<'a> {
     program: &'a Program,
     out: String,
     declarations: Vec<(String, String)>,
-    values: HashMap<ValueId, (String, &'static str)>,
-    slot_types: HashMap<SlotId, &'static str>,
+    types: Types,
+    constants: HashMap<ValueId, Const>,
+    blocks: Vec<String>,
+    labels: Vec<String>,
+    prefix: &'static str,
+    legacy: bool,
 }
 
 impl<'a> QirEmitter<'a> {
     fn new(program: &'a Program) -> Self {
+        let constants = program
+            .ops()
+            .filter_map(|op| match op {
+                Op::Assign {
+                    dest,
+                    expr: Expr::Const(c),
+                    ..
+                } => Some((*dest, *c)),
+                _ => None,
+            })
+            .collect();
+        let legacy = program.ops().any(|op| {
+            matches!(
+                op,
+                Op::RecordOutput {
+                    kind: OutputKind::TupleEnd | OutputKind::ArrayEnd,
+                    ..
+                } | Op::RecordOutput {
+                    kind: OutputKind::Tuple | OutputKind::Array,
+                    count: None,
+                    value: None,
+                    ..
+                }
+            )
+        });
+
         Self {
             program,
             out: String::new(),
             declarations: Vec::new(),
-            values: HashMap::new(),
-            slot_types: HashMap::new(),
+            types: Types::new(program),
+            constants,
+            blocks: block_names(program),
+            labels: Vec::new(),
+            prefix: if program.name.starts_with("label") {
+                "output"
+            } else {
+                "label"
+            },
+            legacy,
         }
+    }
+
+    fn label_ref(&mut self, label: Option<&str>) -> String {
+        let Some(label) = label.filter(|l| !l.is_empty()) else {
+            return "i8* null".into();
+        };
+        let index = match self.labels.iter().position(|l| l == label) {
+            Some(index) => index,
+            None => {
+                self.labels.push(label.to_string());
+                self.labels.len() - 1
+            }
+        };
+        let size = label.len() + 1;
+        format!(
+            "i8* getelementptr inbounds ([{size} x i8], [{size} x i8]* @{}{index}, i64 0, i64 0)",
+            self.prefix
+        )
     }
 
     fn declare(&mut self, name: &str, params: &str) {
@@ -186,55 +882,80 @@ impl<'a> QirEmitter<'a> {
         }
     }
 
-    fn operand(&self, operand: &Operand) -> (String, &'static str) {
-        match operand {
-            Operand::Const(Const::Bool(b)) => (b.to_string(), "i1"),
-            Operand::Const(Const::Int(i)) => (i.to_string(), "i64"),
-            Operand::Const(Const::Float(f)) => (format_double(*f), "double"),
-            Operand::Value(id) => self
-                .values
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| ("0".to_string(), "i64")),
+    fn operand(&self, operand: &Operand, ty: Scalar) -> String {
+        let constant = match operand {
+            Operand::Const(c) => *c,
+            Operand::Value(id) => match self.constants.get(id) {
+                Some(c) => *c,
+                None if self.types.values.contains_key(id) => return format!("%v{}", id.0),
+                None => return "undef".into(),
+            },
+        };
+        match ty.normalize(constant) {
+            Const::Bool(b) => b.to_string(),
+            Const::Int(i) => i.to_string(),
+            Const::Float(f) => format_double(f),
         }
     }
 
-    fn emit(mut self) -> String {
+    fn block(&self, id: BlockId) -> &str {
+        &self.blocks[id.index()]
+    }
+
+    fn emit(mut self) -> Result<String, String> {
         let program = self.program;
 
         writeln!(self.out, "; ModuleID = '{}'", program.name).unwrap();
-        writeln!(self.out, "source_filename = \"{}\"", program.name).unwrap();
+        writeln!(
+            self.out,
+            "source_filename = \"{}\"",
+            c_string(&program.name)
+        )
+        .unwrap();
         self.out.push('\n');
         self.out
             .push_str("%Result = type opaque\n%Qubit = type opaque\n\n");
 
-        for block in &program.blocks {
-            for op in &block.ops {
-                if let Op::Store { slot, value, .. } = op {
-                    let (_, ty) = self.operand(value);
-                    self.slot_types.insert(*slot, ty);
-                }
-            }
-        }
-
         let mut body = String::new();
         for (index, block) in program.blocks.iter().enumerate() {
+            writeln!(body, "{}:", self.block(block.id)).unwrap();
             if index == 0 {
-                writeln!(body, "{}:", block.label).unwrap();
                 for slot in 0..program.num_slots {
-                    let ty = self.slot_types.get(&SlotId(slot)).copied().unwrap_or("i64");
+                    let ty = self
+                        .types
+                        .slots
+                        .get(&SlotId(slot))
+                        .copied()
+                        .unwrap_or(Scalar::Int(64));
                     writeln!(body, "  %slot{slot} = alloca {ty}").unwrap();
                 }
-                for op in &block.ops {
-                    self.emit_op(op, &mut body);
-                }
-                self.emit_terminator(&block.term, &mut body);
-            } else {
-                self.emit_block(block, &mut body);
             }
+            for op in &block.ops {
+                self.emit_op(op, &mut body)?;
+            }
+            self.emit_terminator(&block.term, &mut body);
         }
 
-        writeln!(self.out, "define void @{}() #0 {{", program.name).unwrap();
+        for (index, label) in self.labels.iter().enumerate() {
+            writeln!(
+                self.out,
+                "@{}{index} = internal constant [{} x i8] c\"{}\\00\"",
+                self.prefix,
+                label.len() + 1,
+                c_string(label)
+            )
+            .unwrap();
+        }
+        if !self.labels.is_empty() {
+            self.out.push('\n');
+        }
+
+        writeln!(
+            self.out,
+            "define void @{}() #0 {{",
+            llvm_name(&program.name)
+        )
+        .unwrap();
         self.out.push_str(&body);
         self.out.push_str("}\n\n");
 
@@ -263,22 +984,12 @@ impl<'a> QirEmitter<'a> {
         self.out
             .push_str("!3 = !{i32 1, !\"dynamic_result_management\", i1 false}\n");
 
-        self.out
+        Ok(self.out)
     }
 
-    fn emit_block(&mut self, block: &Block, body: &mut String) {
-        writeln!(body, "{}:", block.label).unwrap();
-
-        for op in &block.ops {
-            self.emit_op(op, body);
-        }
-
-        self.emit_terminator(&block.term, body);
-    }
-
-    fn emit_op(&mut self, op: &Op, body: &mut String) {
+    fn emit_op(&mut self, op: &Op, body: &mut String) -> Result<(), String> {
         match op {
-            Op::Gate(gate) => self.emit_gate(gate, body),
+            Op::Gate(gate) => self.emit_gate(gate, body)?,
 
             Op::Measure { qubit, result, .. } => {
                 writeln!(
@@ -307,52 +1018,77 @@ impl<'a> QirEmitter<'a> {
             Op::RecordOutput {
                 kind,
                 result,
+                value,
                 count,
+                label,
                 ..
             } => {
+                let open = count.is_none() && value.is_none();
                 let name = match kind {
                     OutputKind::Result => "__quantum__rt__result_record_output",
+                    OutputKind::Tuple if open => "__quantum__rt__tuple_start_record_output",
+                    OutputKind::Array if open => "__quantum__rt__array_start_record_output",
                     OutputKind::Tuple => "__quantum__rt__tuple_record_output",
                     OutputKind::Array => "__quantum__rt__array_record_output",
+                    OutputKind::TupleEnd => "__quantum__rt__tuple_end_record_output",
+                    OutputKind::ArrayEnd => "__quantum__rt__array_end_record_output",
                     OutputKind::Bool => "__quantum__rt__bool_record_output",
                     OutputKind::Int => "__quantum__rt__int_record_output",
                     OutputKind::Double => "__quantum__rt__double_record_output",
                 };
 
-                match result {
-                    Some(r) => {
-                        writeln!(body, "  call void @{name}({}, i8* null)", result_ref(*r))
-                            .unwrap();
-                        self.declare(&format!("void @{name}"), "%Result*, i8*");
+                let mut args = Vec::new();
+                let mut params = Vec::new();
+                match (result, value, count) {
+                    (Some(r), _, _) => {
+                        args.push(result_ref(*r));
+                        params.push("%Result*".to_string());
                     }
-                    None => {
-                        writeln!(
-                            body,
-                            "  call void @{name}(i64 {}, i8* null)",
-                            count.unwrap_or(0)
-                        )
-                        .unwrap();
-                        self.declare(&format!("void @{name}"), "i64, i8*");
+                    (None, Some(v), _) => {
+                        let ty = match kind {
+                            OutputKind::Bool => Scalar::Bool,
+                            OutputKind::Double => Scalar::Double,
+                            _ => Scalar::Int(64),
+                        };
+                        args.push(format!("{ty} {}", self.operand(v, ty)));
+                        params.push(ty.to_string());
                     }
+                    (None, None, Some(n)) => {
+                        args.push(format!("i64 {n}"));
+                        params.push("i64".into());
+                    }
+                    (None, None, None) => {}
                 }
+                if !self.legacy {
+                    args.push(self.label_ref(label.as_deref()));
+                    params.push("i8*".into());
+                }
+                writeln!(body, "  call void @{name}({})", args.join(", ")).unwrap();
+                self.declare(&format!("void @{name}"), &params.join(", "));
             }
 
-            Op::Assign { dest, expr, .. } => self.emit_assign(*dest, expr, body),
+            Op::Assign { dest, ty, expr, .. } => self.emit_assign(*dest, *ty, expr, body),
 
             Op::Store { slot, value, .. } => {
-                let (rendered, ty) = self.operand(value);
-                writeln!(body, "  store {ty} {rendered}, ptr %slot{}", slot.0).unwrap();
+                let ty = self
+                    .types
+                    .slots
+                    .get(slot)
+                    .copied()
+                    .unwrap_or(self.types.of(value));
+                let value = self.operand(value, ty);
+                writeln!(body, "  store {ty} {value}, ptr %slot{}", slot.0).unwrap();
             }
 
             Op::Message { .. } => {}
         }
+        Ok(())
     }
 
-    fn emit_gate(&mut self, gate: &Gate, body: &mut String) {
-        if let GateKind::Unitary(matrix) = gate.kind {
-            debug_assert!(gate.controls.is_empty());
-            debug_assert_eq!(gate.targets.len(), 1);
-
+    fn emit_gate(&mut self, gate: &Gate, body: &mut String) -> Result<(), String> {
+        if let GateKind::Unitary(matrix) = gate.kind
+            && gate.controls.is_empty()
+        {
             let (theta, phi, lambda) = zyz_angles(&Matrix2::from_ir(matrix));
             for (kind, angle) in [
                 (GateKind::Rz, lambda),
@@ -361,43 +1097,58 @@ impl<'a> QirEmitter<'a> {
             ] {
                 let rotation = Gate {
                     kind,
-                    controls: gate.controls.clone(),
+                    controls: Vec::new(),
                     targets: gate.targets.clone(),
                     params: vec![Operand::Const(Const::Float(angle))],
                     span: gate.span,
                 };
-                self.emit_native_gate(&rotation, body);
+                self.emit_gate(&rotation, body)?;
             }
-            return;
+            return Ok(());
         }
 
-        self.emit_native_gate(gate, body);
+        if let Some(name) = intrinsic(gate) {
+            let mut args = Vec::new();
+            let mut params = Vec::new();
+            for param in &gate.params {
+                args.push(format!("double {}", self.operand(param, Scalar::Double)));
+                params.push("double");
+            }
+            for qubit in gate.wires() {
+                args.push(qubit_ref(qubit));
+                params.push("%Qubit*");
+            }
+            writeln!(body, "  call void @{name}({})", args.join(", ")).unwrap();
+            self.declare(&format!("void @{name}"), &params.join(", "));
+            return Ok(());
+        }
+
+        let name = format!("{}{}", "c".repeat(gate.controls.len()), gate.kind.name());
+        if gate.params.iter().any(|p| p.constant().is_none()) {
+            return Err(format!(
+                "`{name}` with a runtime angle has no QIR intrinsic"
+            ));
+        }
+        let parts = transpile::decompose(gate, Basis::RzSxCx);
+        if parts.iter().any(|part| intrinsic(part).is_none()) {
+            return Err(format!(
+                "`{name}` has no QIR intrinsic and cannot be decomposed into one"
+            ));
+        }
+        for part in &parts {
+            self.emit_gate(part, body)?;
+        }
+        Ok(())
     }
 
-    fn emit_native_gate(&mut self, gate: &Gate, body: &mut String) {
-        let (name, params, args) = self.gate_call(gate);
-        writeln!(body, "  call void @{name}({args})").unwrap();
-        self.declare(&format!("void @{name}"), &params);
-    }
-
-    fn emit_assign(&mut self, dest: ValueId, expr: &Expr, body: &mut String) {
+    fn emit_assign(&mut self, dest: ValueId, ty: Scalar, expr: &Expr, body: &mut String) {
         let name = format!("%v{}", dest.0);
 
         match expr {
-            Expr::Const(c) => {
-                let rendered = self.operand(&Operand::Const(*c));
-                self.values.insert(dest, rendered);
-            }
-
-            Expr::Copy(operand) => {
-                let rendered = self.operand(operand);
-                self.values.insert(dest, rendered);
-            }
+            Expr::Const(_) => {}
 
             Expr::Load(slot) => {
-                let ty = self.slot_types.get(slot).copied().unwrap_or("i64");
                 writeln!(body, "  {name} = load {ty}, ptr %slot{}", slot.0).unwrap();
-                self.values.insert(dest, (name, ty));
             }
 
             Expr::ReadResult(result) => {
@@ -408,29 +1159,32 @@ impl<'a> QirEmitter<'a> {
                 )
                 .unwrap();
                 self.declare("i1 @__quantum__qis__read_result__body", "%Result*");
-                self.values.insert(dest, (name, "i1"));
             }
 
             Expr::Binary { op, lhs, rhs } => {
-                let (a, ty) = self.operand(lhs);
-                let (b, _) = self.operand(rhs);
-                let ty = if op.is_float() { "double" } else { ty };
+                let (a, b) = (self.operand(lhs, ty), self.operand(rhs, ty));
                 writeln!(body, "  {name} = {} {ty} {a}, {b}", op.keyword()).unwrap();
-                self.values.insert(dest, (name, ty));
             }
 
-            Expr::ICmp { pred, lhs, rhs } => {
-                let (a, ty) = self.operand(lhs);
-                let (b, _) = self.operand(rhs);
-                writeln!(body, "  {name} = icmp {} {ty} {a}, {b}", pred.keyword()).unwrap();
-                self.values.insert(dest, (name, "i1"));
+            Expr::ICmp {
+                pred,
+                ty: operands,
+                lhs,
+                rhs,
+            } => {
+                let (a, b) = (self.operand(lhs, *operands), self.operand(rhs, *operands));
+                writeln!(
+                    body,
+                    "  {name} = icmp {} {operands} {a}, {b}",
+                    pred.keyword()
+                )
+                .unwrap();
             }
 
             Expr::FCmp { pred, lhs, rhs } => {
-                let (a, _) = self.operand(lhs);
-                let (b, _) = self.operand(rhs);
+                let a = self.operand(lhs, Scalar::Double);
+                let b = self.operand(rhs, Scalar::Double);
                 writeln!(body, "  {name} = fcmp {} double {a}, {b}", pred.keyword()).unwrap();
-                self.values.insert(dest, (name, "i1"));
             }
 
             Expr::Select {
@@ -438,57 +1192,40 @@ impl<'a> QirEmitter<'a> {
                 if_true,
                 if_false,
             } => {
-                let (c, _) = self.operand(cond);
-                let (a, ty) = self.operand(if_true);
-                let (b, _) = self.operand(if_false);
+                let c = self.operand(cond, Scalar::Bool);
+                let (a, b) = (self.operand(if_true, ty), self.operand(if_false, ty));
                 writeln!(body, "  {name} = select i1 {c}, {ty} {a}, {ty} {b}").unwrap();
-                self.values.insert(dest, (name, ty));
             }
 
-            Expr::Cast { op, operand } => {
-                let (value, from) = self.operand(operand);
-                let to = match op {
-                    CastOp::SIToFP | CastOp::UIToFP | CastOp::FPExt => "double",
-                    CastOp::FPToSI | CastOp::FPToUI | CastOp::ZExt | CastOp::SExt => "i64",
-                    CastOp::Trunc => "i1",
-                    _ => from,
-                };
-                writeln!(body, "  {name} = {} {from} {value} to {to}", op.keyword()).unwrap();
-                self.values.insert(dest, (name, to));
+            Expr::Cast { op, from, operand } => {
+                let value = self.operand(operand, *from);
+                match cast_instruction(*op, *from, ty) {
+                    Some(keyword) => {
+                        writeln!(body, "  {name} = {keyword} {from} {value} to {ty}").unwrap();
+                    }
+                    None if *op == CastOp::FPTrunc => {
+                        writeln!(body, "  {name}.f = fptrunc double {value} to float").unwrap();
+                        writeln!(body, "  {name} = fpext float {name}.f to double").unwrap();
+                    }
+                    None => {
+                        writeln!(body, "  {name} = bitcast {ty} {value} to {ty}").unwrap();
+                    }
+                }
             }
 
             Expr::Phi(incoming) => {
-                let rendered: Vec<(String, String)> = incoming
+                let parts: Vec<String> = incoming
                     .iter()
                     .map(|(block, operand)| {
-                        let (value, ty) = self.operand(operand);
-                        (
-                            format!("[ {value}, %{} ]", self.program.block(*block).label),
-                            ty.to_string(),
-                        )
+                        format!("[ {}, %{} ]", self.operand(operand, ty), self.block(*block))
                     })
                     .collect();
-
-                let ty = rendered
-                    .first()
-                    .map(|(_, ty)| ty.clone())
-                    .unwrap_or_else(|| "i64".into());
-                let parts: Vec<String> = rendered.into_iter().map(|(text, _)| text).collect();
-
                 writeln!(body, "  {name} = phi {ty} {}", parts.join(", ")).unwrap();
-                let leaked: &'static str = if ty == "i1" {
-                    "i1"
-                } else if ty == "double" {
-                    "double"
-                } else {
-                    "i64"
-                };
-                self.values.insert(dest, (name, leaked));
             }
         }
     }
 
-    fn emit_terminator(&mut self, term: &Term, body: &mut String) {
+    fn emit_terminator(&self, term: &Term, body: &mut String) {
         match term {
             Term::Ret(_) => {
                 writeln!(body, "  ret void").unwrap();
@@ -497,24 +1234,19 @@ impl<'a> QirEmitter<'a> {
                 writeln!(body, "  unreachable").unwrap();
             }
             Term::Br(target) => {
-                writeln!(body, "  br label %{}", self.program.block(*target).label).unwrap();
+                writeln!(body, "  br label %{}", self.block(*target)).unwrap();
             }
             Term::CondBr {
                 cond,
                 if_true,
                 if_false,
             } => {
-                let (value, ty) = self.operand(cond);
-                let condition = if ty == "i1" {
-                    value
-                } else {
-                    format!("icmp ne {ty} {value}, 0")
-                };
                 writeln!(
                     body,
-                    "  br i1 {condition}, label %{}, label %{}",
-                    self.program.block(*if_true).label,
-                    self.program.block(*if_false).label
+                    "  br i1 {}, label %{}, label %{}",
+                    self.operand(cond, Scalar::Bool),
+                    self.block(*if_true),
+                    self.block(*if_false)
                 )
                 .unwrap();
             }
@@ -523,78 +1255,120 @@ impl<'a> QirEmitter<'a> {
                 cases,
                 default,
             } => {
-                let (value, ty) = self.operand(scrutinee);
+                let ty = self.types.of(scrutinee);
                 writeln!(
                     body,
-                    "  switch {ty} {value}, label %{} [",
-                    self.program.block(*default).label
+                    "  switch {ty} {}, label %{} [",
+                    self.operand(scrutinee, ty),
+                    self.block(*default)
                 )
                 .unwrap();
                 for (key, target) in cases {
-                    writeln!(
-                        body,
-                        "    {ty} {key}, label %{}",
-                        self.program.block(*target).label
-                    )
-                    .unwrap();
+                    let key = self.operand(&Operand::Const(Const::Int(*key)), ty);
+                    writeln!(body, "    {ty} {key}, label %{}", self.block(*target)).unwrap();
                 }
                 writeln!(body, "  ]").unwrap();
             }
         }
     }
+}
 
-    fn gate_call(&self, gate: &Gate) -> (&'static str, String, String) {
-        let name: &'static str = match (gate.kind, gate.controls.len()) {
-            (GateKind::I, 0) => "__quantum__qis__i__body",
-            (GateKind::X, 0) => "__quantum__qis__x__body",
-            (GateKind::Y, 0) => "__quantum__qis__y__body",
-            (GateKind::Z, 0) => "__quantum__qis__z__body",
-            (GateKind::H, 0) => "__quantum__qis__h__body",
-            (GateKind::S, 0) => "__quantum__qis__s__body",
-            (GateKind::SDag, 0) => "__quantum__qis__s__adj",
-            (GateKind::T, 0) => "__quantum__qis__t__body",
-            (GateKind::TDag, 0) => "__quantum__qis__t__adj",
-            (GateKind::SX, 0) => "__quantum__qis__sx__body",
-            (GateKind::SXDag, 0) => "__quantum__qis__sx__adj",
-            (GateKind::Rx, 0) => "__quantum__qis__rx__body",
-            (GateKind::Ry, 0) => "__quantum__qis__ry__body",
-            (GateKind::Rz, 0) => "__quantum__qis__rz__body",
-            (GateKind::R1, 0) => "__quantum__qis__r1__body",
-            (GateKind::Swap, 0) => "__quantum__qis__swap__body",
-            (GateKind::X, 1) => "__quantum__qis__cx__body",
-            (GateKind::Y, 1) => "__quantum__qis__cy__body",
-            (GateKind::Z, 1) => "__quantum__qis__cz__body",
-            (GateKind::H, 1) => "__quantum__qis__ch__body",
-            (GateKind::Rx, 1) => "__quantum__qis__crx__body",
-            (GateKind::Ry, 1) => "__quantum__qis__cry__body",
-            (GateKind::Rz, 1) => "__quantum__qis__crz__body",
-            (GateKind::R1, 1) => "__quantum__qis__cr1__body",
-            (GateKind::X, 2) => "__quantum__qis__ccx__body",
-            (GateKind::Z, 2) => "__quantum__qis__ccz__body",
-            (GateKind::Swap, 1) => "__quantum__qis__cswap__body",
-            (GateKind::Unitary(_), _) => {
-                unreachable!("fused unitaries must be synthesized before QIR emission")
-            }
-            _ => "__quantum__qis__unitary__body",
-        };
+fn intrinsic(gate: &Gate) -> Option<&'static str> {
+    Some(match (gate.kind, gate.controls.len()) {
+        (GateKind::I, 0) => "__quantum__qis__i__body",
+        (GateKind::X, 0) => "__quantum__qis__x__body",
+        (GateKind::Y, 0) => "__quantum__qis__y__body",
+        (GateKind::Z, 0) => "__quantum__qis__z__body",
+        (GateKind::H, 0) => "__quantum__qis__h__body",
+        (GateKind::S, 0) => "__quantum__qis__s__body",
+        (GateKind::SDag, 0) => "__quantum__qis__s__adj",
+        (GateKind::T, 0) => "__quantum__qis__t__body",
+        (GateKind::TDag, 0) => "__quantum__qis__t__adj",
+        (GateKind::SX, 0) => "__quantum__qis__sx__body",
+        (GateKind::SXDag, 0) => "__quantum__qis__sx__adj",
+        (GateKind::Rx, 0) => "__quantum__qis__rx__body",
+        (GateKind::Ry, 0) => "__quantum__qis__ry__body",
+        (GateKind::Rz, 0) => "__quantum__qis__rz__body",
+        (GateKind::R1, 0) => "__quantum__qis__r1__body",
+        (GateKind::Swap, 0) => "__quantum__qis__swap__body",
+        (GateKind::X, 1) => "__quantum__qis__cx__body",
+        (GateKind::Y, 1) => "__quantum__qis__cy__body",
+        (GateKind::Z, 1) => "__quantum__qis__cz__body",
+        (GateKind::H, 1) => "__quantum__qis__ch__body",
+        (GateKind::Rx, 1) => "__quantum__qis__crx__body",
+        (GateKind::Ry, 1) => "__quantum__qis__cry__body",
+        (GateKind::Rz, 1) => "__quantum__qis__crz__body",
+        (GateKind::R1, 1) => "__quantum__qis__cr1__body",
+        (GateKind::X, 2) => "__quantum__qis__ccx__body",
+        (GateKind::Z, 2) => "__quantum__qis__ccz__body",
+        (GateKind::Swap, 1) => "__quantum__qis__cswap__body",
+        _ => return None,
+    })
+}
 
-        let mut args = Vec::new();
-        let mut types = Vec::new();
-
-        for param in &gate.params {
-            let (value, ty) = self.operand(param);
-            debug_assert_eq!(ty, "double", "QIS rotation parameters must be doubles");
-            args.push(format!("double {value}"));
-            types.push("double".to_string());
-        }
-
-        for qubit in gate.controls.iter().chain(gate.targets.iter()) {
-            args.push(qubit_ref(*qubit));
-            types.push("%Qubit*".to_string());
-        }
-
-        (name, types.join(", "), args.join(", "))
+fn cast_instruction(op: CastOp, from: Scalar, to: Scalar) -> Option<&'static str> {
+    if from == to {
+        return None;
     }
+    Some(match (from, to) {
+        (Scalar::Double, _) if op == CastOp::BitCast && to == Scalar::Int(64) => "bitcast",
+        (Scalar::Double, _) if op == CastOp::FPToUI => "fptoui",
+        (Scalar::Double, _) => "fptosi",
+        (_, Scalar::Double) if op == CastOp::BitCast && from == Scalar::Int(64) => "bitcast",
+        (_, Scalar::Double) if op == CastOp::UIToFP => "uitofp",
+        (_, Scalar::Double) => "sitofp",
+        _ if to.bits() < from.bits() => "trunc",
+        _ if op == CastOp::SExt => "sext",
+        _ => "zext",
+    })
+}
+
+fn block_names(program: &Program) -> Vec<String> {
+    let mut used = HashSet::new();
+    program
+        .blocks
+        .iter()
+        .map(|block| {
+            let mut name = block.label.clone();
+            if name.is_empty() || generated(&name) || used.contains(&name) {
+                name = format!("{}.{}", block.label, block.id.0);
+            }
+            used.insert(name.clone());
+            llvm_name(&name)
+        })
+        .collect()
+}
+
+fn generated(name: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = name.strip_prefix("slot") {
+        return digits(rest);
+    }
+    name.strip_prefix('v')
+        .is_some_and(|rest| digits(rest.strip_suffix(".f").unwrap_or(rest)))
+}
+
+fn llvm_name(name: &str) -> String {
+    let plain = name.bytes().next().is_some_and(|b| !b.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-$._".contains(&b));
+    if plain {
+        name.to_string()
+    } else {
+        format!("\"{}\"", c_string(name))
+    }
+}
+
+fn c_string(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b' '..=b'~' if byte != b'"' && byte != b'\\' => out.push(byte as char),
+            _ => write!(out, "\\{byte:02X}").unwrap(),
+        }
+    }
+    out
 }
 
 fn format_double(value: f64) -> String {
@@ -657,7 +1431,7 @@ fn json_op(op: &Op) -> Option<String> {
                 .params
                 .iter()
                 .map(|p| match p.constant() {
-                    Some(c) => format!("{}", c.as_f64()),
+                    Some(c) => c.as_f64().to_string(),
                     None => "null".into(),
                 })
                 .collect();
@@ -769,13 +1543,7 @@ pub fn emit_circuit(program: &Program) -> String {
 
     for column in &columns {
         for (wire_index, cell) in column.iter().enumerate() {
-            let filler = if cell == "-" || cell == "|" {
-                cell
-            } else {
-                "-"
-            };
-            let padded = center(cell, cell_width, filler);
-            wires[wire_index].push_str(&padded);
+            wires[wire_index].push_str(&center(cell, cell_width));
             wires[wire_index].push('-');
         }
     }
@@ -795,7 +1563,7 @@ fn fill_vertical(column: &mut [String], gate: &Gate) {
     };
 
     for index in (*low + 1)..*high {
-        if column.get(index).map(|c| c == "-").unwrap_or(false) {
+        if column.get(index).is_some_and(|c| c == "-") {
             column[index] = "|".into();
         }
     }
@@ -806,29 +1574,19 @@ fn gate_symbol(gate: &Gate) -> String {
         GateKind::X if !gate.controls.is_empty() => "+".into(),
         GateKind::Swap => "x".into(),
         GateKind::Unitary(_) => "U".into(),
-        other => {
-            let name = other.name();
-            let mut symbol = name.to_uppercase();
-            if other.param_count() > 0
-                && let Some(angle) = gate.constant_angle()
-            {
-                symbol = format!("{}({:.2})", name.to_uppercase(), angle);
+        other => match gate.constant_angle() {
+            Some(angle) if other.param_count() > 0 => {
+                format!("{}({angle:.2})", other.name().to_uppercase())
             }
-            symbol
-        }
+            _ => other.name().to_uppercase(),
+        },
     }
 }
 
-fn center(text: &str, width: usize, filler: &str) -> String {
-    if text.len() >= width {
-        return text.to_string();
-    }
-
-    let total = width - text.len();
+fn center(text: &str, width: usize) -> String {
+    let total = width.saturating_sub(text.len());
     let left = total / 2;
-    let right = total - left;
-
-    format!("{}{}{}", filler.repeat(left), text, filler.repeat(right))
+    format!("{}{text}{}", "-".repeat(left), "-".repeat(total - left))
 }
 
 #[cfg(test)]

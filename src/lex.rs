@@ -61,7 +61,7 @@ impl TokenKind {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
@@ -170,70 +170,41 @@ impl<'a> Lexer<'a> {
             return Ok(self.token(TokenKind::Eof, start));
         };
 
+        let punct = match b {
+            b'(' => Some(TokenKind::LParen),
+            b')' => Some(TokenKind::RParen),
+            b'{' => Some(TokenKind::LBrace),
+            b'}' => Some(TokenKind::RBrace),
+            b'[' => Some(TokenKind::LBracket),
+            b']' => Some(TokenKind::RBracket),
+            b'<' => Some(TokenKind::Less),
+            b'>' => Some(TokenKind::Greater),
+            b',' => Some(TokenKind::Comma),
+            b'*' => Some(TokenKind::Star),
+            b'=' => Some(TokenKind::Equal),
+            b':' => Some(TokenKind::Colon),
+            _ => None,
+        };
+        if let Some(kind) = punct {
+            self.pos += 1;
+            return Ok(self.token(kind, start));
+        }
+
         match b {
-            b'(' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::LParen, start))
-            }
-            b')' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::RParen, start))
-            }
-            b'{' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::LBrace, start))
-            }
-            b'}' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::RBrace, start))
-            }
-            b'[' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::LBracket, start))
-            }
-            b']' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::RBracket, start))
-            }
-            b'<' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::Less, start))
-            }
-            b'>' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::Greater, start))
-            }
-            b',' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::Comma, start))
-            }
-            b'*' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::Star, start))
-            }
-            b'=' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::Equal, start))
-            }
-            b':' => {
-                self.pos += 1;
-                Ok(self.token(TokenKind::Colon, start))
-            }
             b'.' => {
                 if self.peek_at(1) == Some(b'.') && self.peek_at(2) == Some(b'.') {
                     self.pos += 3;
                     return Ok(self.token(TokenKind::Ellipsis, start));
                 }
-                self.lex_bare_ident(start)
+                Ok(self.lex_bare_ident(start))
             }
-            b'%' | b'@' => {
+            b'%' => {
                 self.pos += 1;
-                let kind = if b == b'%' {
-                    TokenKind::LocalIdent
-                } else {
-                    TokenKind::GlobalIdent
-                };
-                self.lex_sigil_name(start, kind)
+                self.lex_sigil_name(start, TokenKind::LocalIdent)
+            }
+            b'@' => {
+                self.pos += 1;
+                self.lex_sigil_name(start, TokenKind::GlobalIdent)
             }
             b'!' => {
                 self.pos += 1;
@@ -274,13 +245,13 @@ impl<'a> Lexer<'a> {
                 if self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) {
                     self.lex_number(start)
                 } else {
-                    self.lex_bare_ident(start)
+                    Ok(self.lex_bare_ident(start))
                 }
             }
             b'0'..=b'9' => self.lex_number(start),
-            _ if is_ident_start(b) => self.lex_bare_ident(start),
+            _ if is_ident_start(b) => Ok(self.lex_bare_ident(start)),
             _ => {
-                self.pos += 1;
+                self.pos += self.src[start..].chars().next().map_or(1, char::len_utf8);
                 Err(Diagnostic::error(format!(
                     "unexpected character `{}` in LLVM IR",
                     self.src[start..self.pos].escape_debug()
@@ -299,20 +270,16 @@ impl<'a> Lexer<'a> {
         self.peek_at(i) == Some(b'"')
     }
 
-    fn lex_bare_ident(&mut self, start: usize) -> Result<Token, Diagnostic> {
+    fn lex_bare_ident(&mut self, start: usize) -> Token {
         if matches!(self.peek(), Some(b'-' | b'+')) {
             self.pos += 1;
         }
 
-        while self.peek().is_some_and(is_ident_continue) {
+        while self.peek().is_some_and(is_name_byte) {
             self.pos += 1;
         }
 
-        if self.pos == start {
-            self.pos += 1;
-        }
-
-        Ok(self.token(TokenKind::Ident, start))
+        self.token(TokenKind::Ident, start)
     }
 
     fn lex_sigil_name(&mut self, start: usize, kind: TokenKind) -> Result<Token, Diagnostic> {
@@ -330,7 +297,7 @@ impl<'a> Lexer<'a> {
             return Err(Diagnostic::error("expected a name after the sigil")
                 .with_code("QIR0002")
                 .primary(
-                    Span::new(start, self.pos.max(start + 1)),
+                    Span::new(start, self.pos),
                     "a `%` or `@` must be followed by a name",
                 ));
         }
@@ -394,7 +361,6 @@ impl<'a> Lexer<'a> {
                 probe += 1;
             }
             if self.bytes.get(probe).is_some_and(|c| c.is_ascii_digit()) {
-                is_float = true;
                 self.pos = probe;
                 while self.peek().is_some_and(|c| c.is_ascii_digit()) {
                     self.pos += 1;
@@ -417,21 +383,12 @@ fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || matches!(b, b'$' | b'.' | b'_' | b'-')
 }
 
-fn is_ident_continue(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'$' | b'.' | b'_' | b'-')
-}
-
 fn is_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'$' | b'.' | b'_' | b'-')
 }
 
 pub fn decode_name(raw: &str) -> Cow<'_, str> {
-    let body = raw
-        .strip_prefix('%')
-        .or_else(|| raw.strip_prefix('@'))
-        .or_else(|| raw.strip_prefix('!'))
-        .or_else(|| raw.strip_prefix('#'))
-        .unwrap_or(raw);
+    let body = raw.strip_prefix(['%', '@', '!', '#']).unwrap_or(raw);
 
     if !body.starts_with('"') {
         return Cow::Borrowed(body);
@@ -493,10 +450,6 @@ fn decode_escapes(s: &str) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
-pub fn parse_int(raw: &str) -> Option<i128> {
-    raw.parse::<i128>().ok()
-}
-
 pub fn parse_float(raw: &str) -> Option<f64> {
     if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
         if let Some(rest) = hex.strip_prefix('H') {
@@ -546,13 +499,13 @@ mod tests {
             .collect()
     }
 
-    fn texts(src: &str) -> Vec<String> {
+    fn texts(src: &str) -> Vec<&str> {
         let (tokens, errors) = tokenize(src);
         assert!(errors.is_empty(), "unexpected lex errors: {errors:?}");
         tokens
             .into_iter()
             .filter(|t| t.kind != TokenKind::Eof)
-            .map(|t| t.text(src).to_string())
+            .map(|t| t.text(src))
             .collect()
     }
 
@@ -644,7 +597,6 @@ mod tests {
         assert!((pi - std::f64::consts::PI).abs() < 1e-15);
         assert_eq!(parse_float("1.000000e+00"), Some(1.0));
         assert_eq!(parse_float("-5.000000e-01"), Some(-0.5));
-        assert_eq!(parse_int("-1"), Some(-1));
     }
 
     #[test]
@@ -708,7 +660,7 @@ line */ ret"
     }
 
     #[test]
-    fn float_needs_point() {
+    fn float_point() {
         assert_eq!(kinds("1e10"), vec![TokenKind::IntLit, TokenKind::Ident]);
         assert_eq!(kinds("1.0e10"), vec![TokenKind::FloatLit]);
         assert_eq!(texts("1e10"), vec!["1", "e10"]);
@@ -764,13 +716,6 @@ line */ ret"
             assert!(errors.is_empty(), "{name} produced lex errors: {errors:#?}");
             assert!(tokens.len() > 50, "{name} produced too few tokens");
             assert_eq!(tokens.last().unwrap().kind, TokenKind::Eof);
-
-            let covered: usize = tokens
-                .iter()
-                .filter(|t| t.kind != TokenKind::Eof)
-                .map(|t| t.span.len())
-                .sum();
-            assert!(covered > 0, "{name} covered nothing");
         }
     }
 

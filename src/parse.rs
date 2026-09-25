@@ -10,32 +10,6 @@ pub fn parse_module(src: &str) -> (Module, Vec<Diagnostic>) {
     (module, parser.diagnostics)
 }
 
-const TYPE_KEYWORDS: &[&str] = &[
-    "void",
-    "half",
-    "bfloat",
-    "float",
-    "double",
-    "x86_fp80",
-    "fp128",
-    "ppc_fp128",
-    "ptr",
-    "label",
-    "metadata",
-    "token",
-    "opaque",
-];
-
-const VALUE_KEYWORDS: &[&str] = &[
-    "null",
-    "none",
-    "undef",
-    "poison",
-    "zeroinitializer",
-    "true",
-    "false",
-];
-
 const TERMINATOR_KEYWORDS: &[&str] = &[
     "ret",
     "br",
@@ -49,19 +23,48 @@ const TERMINATOR_KEYWORDS: &[&str] = &[
     "catchswitch",
 ];
 
-fn is_int_type_keyword(text: &str) -> bool {
-    let Some(rest) = text.strip_prefix('i') else {
-        return false;
-    };
-    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+fn keyword_type(text: &str) -> Option<Ty> {
+    if let Some(rest) = text.strip_prefix('i')
+        && !rest.is_empty()
+        && rest.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Some(Ty::Int(rest.parse().unwrap_or(32)));
+    }
+    Some(match text {
+        "void" => Ty::Void,
+        "half" | "bfloat" => Ty::Half,
+        "float" => Ty::Float,
+        "double" => Ty::Double,
+        "x86_fp80" => Ty::X86Fp80,
+        "fp128" | "ppc_fp128" => Ty::Fp128,
+        "ptr" => Ty::Ptr(None),
+        "label" => Ty::Label,
+        "metadata" => Ty::Metadata,
+        "token" => Ty::Token,
+        "opaque" => Ty::Opaque,
+        _ => return None,
+    })
 }
 
 fn is_type_keyword(text: &str) -> bool {
-    TYPE_KEYWORDS.contains(&text) || is_int_type_keyword(text)
+    keyword_type(text).is_some()
+}
+
+fn keyword_value(text: &str) -> Option<Value> {
+    Some(match text {
+        "null" => Value::Null,
+        "none" => Value::NoneValue,
+        "undef" => Value::Undef,
+        "poison" => Value::Poison,
+        "zeroinitializer" => Value::ZeroInit,
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        _ => return None,
+    })
 }
 
 fn is_value_keyword(text: &str) -> bool {
-    VALUE_KEYWORDS.contains(&text)
+    keyword_value(text).is_some()
         || CastOp::from_keyword(text).is_some()
         || BinOp::from_keyword(text).is_some()
         || matches!(
@@ -236,7 +239,7 @@ impl<'a> Parser<'a> {
                 }
                 "target" => {
                     self.bump();
-                    let which = self.cur_text().to_string();
+                    let which = self.cur_text();
                     self.bump();
                     self.eat(TokenKind::Equal);
                     if let Some(t) = self.expect(TokenKind::StringLit) {
@@ -320,29 +323,25 @@ impl<'a> Parser<'a> {
         let mut linkage = Vec::new();
         let mut is_constant = false;
 
-        loop {
-            if self.at(TokenKind::Ident) {
-                let text = self.cur_text();
-                if text == "constant" {
-                    is_constant = true;
-                    self.bump();
-                    break;
-                }
-                if text == "global" {
-                    self.bump();
-                    break;
-                }
-                if is_type_keyword(text) {
-                    break;
-                }
-                linkage.push(text.to_string());
+        while self.at(TokenKind::Ident) {
+            let text = self.cur_text();
+            if text == "constant" {
+                is_constant = true;
                 self.bump();
-                if self.at(TokenKind::LParen) {
-                    self.skip_balanced(TokenKind::LParen, TokenKind::RParen);
-                }
-                continue;
+                break;
             }
-            break;
+            if text == "global" {
+                self.bump();
+                break;
+            }
+            if is_type_keyword(text) {
+                break;
+            }
+            linkage.push(text.to_string());
+            self.bump();
+            if self.at(TokenKind::LParen) {
+                self.skip_balanced(TokenKind::LParen, TokenKind::RParen);
+            }
         }
 
         let ty = self.parse_type()?;
@@ -660,12 +659,9 @@ impl<'a> Parser<'a> {
 
         self.next_unnamed = 0;
 
-        let sig = match self.parse_signature() {
-            Some(sig) => sig,
-            None => {
-                self.skip_to_next_line();
-                return None;
-            }
+        let Some(sig) = self.parse_signature() else {
+            self.skip_to_next_line();
+            return None;
         };
 
         for param in &sig.params {
@@ -681,9 +677,7 @@ impl<'a> Parser<'a> {
         let mut blocks = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at_eof() {
             let before = self.pos;
-            if let Some(block) = self.parse_block() {
-                blocks.push(block);
-            }
+            blocks.push(self.parse_block());
             if self.pos == before {
                 self.pos += 1;
             }
@@ -707,21 +701,23 @@ impl<'a> Parser<'a> {
         if !self.starts_new_line(self.pos) {
             return false;
         }
-        matches!(self.peek().kind, TokenKind::Ident | TokenKind::IntLit)
-            && self.peek_at(1).kind == TokenKind::Colon
+        matches!(
+            self.peek().kind,
+            TokenKind::Ident | TokenKind::IntLit | TokenKind::StringLit
+        ) && self.peek_at(1).kind == TokenKind::Colon
     }
 
     fn at_terminator(&self) -> bool {
         self.peek().kind == TokenKind::Ident && TERMINATOR_KEYWORDS.contains(&self.cur_text())
     }
 
-    fn parse_block(&mut self) -> Option<BasicBlock> {
+    fn parse_block(&mut self) -> BasicBlock {
         let start = self.peek().span;
 
         let label = if self.at_label() {
             let token = self.bump();
             self.bump();
-            let name = self.text(token).to_string();
+            let name = self.name(token);
             self.note_number(&name);
             name
         } else {
@@ -748,19 +744,19 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Some(BasicBlock {
+        BasicBlock {
             label,
             instructions,
             terminator: terminator.unwrap_or(Terminator::Unreachable),
             span: start.to(self.prev_span()),
-        })
+        }
     }
 
     fn parse_terminator(&mut self) -> Option<Terminator> {
-        let keyword = self.cur_text().to_string();
+        let keyword = self.cur_text();
         self.bump();
 
-        let term = match keyword.as_str() {
+        let term = match keyword {
             "unreachable" => Terminator::Unreachable,
             "ret" => {
                 if self.at_keyword("void") {
@@ -893,18 +889,15 @@ impl<'a> Parser<'a> {
             return None;
         }
 
-        let opcode = self.cur_text().to_string();
-
-        if matches!(opcode.as_str(), "tail" | "musttail" | "notail") {
+        let tail = matches!(self.cur_text(), "tail" | "musttail" | "notail");
+        if tail {
             self.bump();
-            return self.parse_opcode(true);
         }
-
-        self.parse_opcode(false)
+        self.parse_opcode(tail)
     }
 
     fn parse_opcode(&mut self, tail: bool) -> Option<InstKind> {
-        let opcode = self.cur_text().to_string();
+        let opcode = self.cur_text();
         let opcode_span = self.peek().span;
 
         if opcode == "call" {
@@ -912,7 +905,7 @@ impl<'a> Parser<'a> {
             return self.parse_call(tail, opcode_span).map(InstKind::Call);
         }
 
-        if let Some(op) = BinOp::from_keyword(&opcode) {
+        if let Some(op) = BinOp::from_keyword(opcode) {
             self.bump();
             while self.at(TokenKind::Ident) && !is_type_keyword(self.cur_text()) {
                 self.bump();
@@ -924,7 +917,7 @@ impl<'a> Parser<'a> {
             return Some(InstKind::Binary { op, ty, lhs, rhs });
         }
 
-        if let Some(op) = CastOp::from_keyword(&opcode) {
+        if let Some(op) = CastOp::from_keyword(opcode) {
             self.bump();
             let operand = self.parse_typed_value()?;
             self.eat_keyword("to");
@@ -932,7 +925,7 @@ impl<'a> Parser<'a> {
             return Some(InstKind::Cast { op, operand, to });
         }
 
-        match opcode.as_str() {
+        match opcode {
             "icmp" => {
                 self.bump();
                 let pred_token = self.bump();
@@ -1084,7 +1077,9 @@ impl<'a> Parser<'a> {
             _ => {
                 self.bump();
                 self.skip_to_next_line();
-                Some(InstKind::Unsupported { opcode })
+                Some(InstKind::Unsupported {
+                    opcode: opcode.to_string(),
+                })
             }
         }
     }
@@ -1151,32 +1146,11 @@ impl<'a> Parser<'a> {
 
         let mut ty = match token.kind {
             TokenKind::Ident => {
-                let text = self.cur_text();
-                if let Some(rest) = text.strip_prefix('i') {
-                    if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
-                        self.bump();
-                        Ty::Int(rest.parse().unwrap_or(32))
-                    } else {
-                        return self.type_error(token);
-                    }
-                } else {
-                    let ty = match text {
-                        "void" => Ty::Void,
-                        "half" | "bfloat" => Ty::Half,
-                        "float" => Ty::Float,
-                        "double" => Ty::Double,
-                        "x86_fp80" => Ty::X86Fp80,
-                        "fp128" | "ppc_fp128" => Ty::Fp128,
-                        "ptr" => Ty::Ptr(None),
-                        "label" => Ty::Label,
-                        "metadata" => Ty::Metadata,
-                        "token" => Ty::Token,
-                        "opaque" => Ty::Opaque,
-                        _ => return self.type_error(token),
-                    };
-                    self.bump();
-                    ty
-                }
+                let Some(ty) = keyword_type(self.cur_text()) else {
+                    return self.type_error(token);
+                };
+                self.bump();
+                ty
             }
             TokenKind::LocalIdent => {
                 self.bump();
@@ -1320,7 +1294,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::IntLit => {
                 self.bump();
-                Some(Value::Int(lex::parse_int(self.text(token)).unwrap_or(0)))
+                Some(Value::Int(self.text(token).parse::<i128>().unwrap_or(0)))
             }
             TokenKind::FloatLit => {
                 self.bump();
@@ -1364,36 +1338,9 @@ impl<'a> Parser<'a> {
             TokenKind::Ident => {
                 let text = self.cur_text();
 
-                match text {
-                    "null" => {
-                        self.bump();
-                        return Some(Value::Null);
-                    }
-                    "none" => {
-                        self.bump();
-                        return Some(Value::NoneValue);
-                    }
-                    "undef" => {
-                        self.bump();
-                        return Some(Value::Undef);
-                    }
-                    "poison" => {
-                        self.bump();
-                        return Some(Value::Poison);
-                    }
-                    "zeroinitializer" => {
-                        self.bump();
-                        return Some(Value::ZeroInit);
-                    }
-                    "true" => {
-                        self.bump();
-                        return Some(Value::Bool(true));
-                    }
-                    "false" => {
-                        self.bump();
-                        return Some(Value::Bool(false));
-                    }
-                    _ => {}
+                if let Some(v) = keyword_value(text) {
+                    self.bump();
+                    return Some(v);
                 }
 
                 if let Some(op) = CastOp::from_keyword(text) {
@@ -1450,7 +1397,7 @@ impl<'a> Parser<'a> {
                 if text == "blockaddress" {
                     self.bump();
                     self.skip_balanced(TokenKind::LParen, TokenKind::RParen);
-                    return Some(Value::BlockAddress(String::new()));
+                    return Some(Value::BlockAddress);
                 }
 
                 self.error(

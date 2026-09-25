@@ -1,4 +1,6 @@
-use qirc::diag::SourceFile;
+use std::f64::consts::FRAC_PI_4;
+
+use qirc::diag::{Severity, SourceFile};
 use qirc::ir::*;
 use qirc::lower::lower;
 use qirc::parse::parse_module;
@@ -16,7 +18,7 @@ fn compile(name: &str, src: &str) -> Program {
     let hard_errors: Vec<_> = lowered
         .diagnostics
         .iter()
-        .filter(|d| d.severity == qirc::diag::Severity::Error)
+        .filter(|d| d.severity == Severity::Error)
         .collect();
 
     if !hard_errors.is_empty() {
@@ -115,7 +117,7 @@ fn teleport_angle() {
         .find(|g| g.kind == GateKind::Ry)
         .expect("an ry gate");
     let angle = ry.constant_angle().expect("a constant angle");
-    assert!((angle - std::f64::consts::FRAC_PI_4).abs() < 1e-15);
+    assert!((angle - FRAC_PI_4).abs() < 1e-15);
 }
 
 #[test]
@@ -159,17 +161,8 @@ fn swap() {
 
 #[test]
 fn inlining() {
-    let (module, errors) = parse_module(DYNAMIC);
-    assert!(errors.is_empty());
-    let lowered = lower(&module);
-
-    let rz_gates: Vec<&Gate> = lowered
-        .program
-        .gates()
-        .filter(|g| g.kind == GateKind::Rz)
-        .collect();
-
-    assert!(!rz_gates.is_empty());
+    let program = compile("dynamic", DYNAMIC);
+    assert!(program.gates().any(|g| g.kind == GateKind::Rz));
 }
 
 #[test]
