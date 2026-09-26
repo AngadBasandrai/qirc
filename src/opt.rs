@@ -3,11 +3,13 @@ use std::fmt;
 
 use crate::ir::*;
 use crate::simulator::matrix::{Matrix2, matrix_for};
+use crate::synth;
 use crate::verify;
 
 const ANGLE_EPSILON: f64 = 1e-12;
 const MATRIX_EPSILON: f64 = 1e-12;
 const MAX_FIXPOINT_ROUNDS: usize = 16;
+const SCAN: usize = 32;
 
 #[derive(Debug, Default)]
 pub struct OptStats {
@@ -128,14 +130,6 @@ fn schedule(level: u8) -> Vec<(&'static str, Pass)> {
     schedule
 }
 
-fn op_wires(op: &Op) -> Vec<QubitId> {
-    match op {
-        Op::Gate(gate) => gate.wires().collect(),
-        Op::Measure { qubit, .. } | Op::Reset { qubit, .. } => vec![*qubit],
-        _ => Vec::new(),
-    }
-}
-
 fn signature(gate: &Gate) -> (Vec<QubitId>, Vec<QubitId>) {
     let mut controls = gate.controls.clone();
     controls.sort();
@@ -146,13 +140,6 @@ fn signature(gate: &Gate) -> (Vec<QubitId>, Vec<QubitId>) {
     }
 
     (controls, targets)
-}
-
-fn next_on_shared_wire(ops: &[Op], from: usize, wires: &[QubitId]) -> Option<usize> {
-    ops[from + 1..]
-        .iter()
-        .position(|op| op_wires(op).iter().any(|w| wires.contains(w)))
-        .map(|i| from + 1 + i)
 }
 
 fn are_inverse(a: &Gate, b: &Gate) -> bool {
@@ -190,44 +177,62 @@ fn rewrite_pairs(
     let mut hits = 0;
 
     for block in &mut program.blocks {
-        let mut changed = true;
+        let mut index = 0;
 
-        while changed {
-            changed = false;
+        while index < block.ops.len() {
+            let Some((partner, crossed, rewrite)) = pair_at(&block.ops, index, &mut decide) else {
+                index += 1;
+                continue;
+            };
 
-            for index in 0..block.ops.len() {
-                let Some(gate) = block.ops[index].as_gate() else {
-                    continue;
-                };
-                let wires: Vec<QubitId> = gate.wires().collect();
-
-                let Some(partner) = next_on_shared_wire(&block.ops, index, &wires) else {
-                    continue;
-                };
-
-                let Some(other) = block.ops[partner].as_gate() else {
-                    continue;
-                };
-
-                let Some(rewrite) = decide(gate, other) else {
-                    continue;
-                };
-
-                block.ops.remove(partner);
-                match rewrite {
-                    Rewrite::Replace(gate) => block.ops[index] = Op::Gate(gate),
-                    Rewrite::Drop => {
-                        block.ops.remove(index);
-                    }
+            match rewrite {
+                Rewrite::Replace(gate) if crossed => {
+                    block.ops[partner] = Op::Gate(gate);
+                    block.ops.remove(index);
                 }
-                hits += 1;
-                changed = true;
-                break;
+                Rewrite::Replace(gate) => {
+                    block.ops.remove(partner);
+                    block.ops[index] = Op::Gate(gate);
+                }
+                Rewrite::Drop => {
+                    block.ops.remove(partner);
+                    block.ops.remove(index);
+                }
             }
+            hits += 1;
+            index = index.saturating_sub(SCAN);
         }
     }
 
     hits
+}
+
+fn pair_at(
+    ops: &[Op],
+    index: usize,
+    decide: &mut impl FnMut(&Gate, &Gate) -> Option<Rewrite>,
+) -> Option<(usize, bool, Rewrite)> {
+    let gate = ops[index].as_gate()?;
+    let wires: Vec<QubitId> = gate.wires().collect();
+    let mut crossed = false;
+    let mut seen = 0;
+
+    for (offset, op) in ops[index + 1..].iter().enumerate() {
+        if !op.qubits().iter().any(|q| wires.contains(q)) {
+            continue;
+        }
+        seen += 1;
+        let other = op.as_gate()?;
+        if let Some(rewrite) = decide(gate, other) {
+            return Some((index + 1 + offset, crossed, rewrite));
+        }
+        if seen == SCAN || !synth::commute(gate, other) {
+            return None;
+        }
+        crossed = true;
+    }
+
+    None
 }
 
 fn cancel_inverses(program: &mut Program) -> usize {

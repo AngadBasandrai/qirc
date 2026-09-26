@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::codegen;
 use crate::diag::{Diagnostic, Severity, SourceFile};
+use crate::equiv;
 use crate::ir::Program;
 use crate::lower;
 use crate::opt::{self, OptStats};
@@ -15,8 +16,11 @@ use crate::sema;
 use crate::simulator::exec::{self, ExecConfig};
 use crate::simulator::simd;
 use crate::simulator::state;
-use crate::transpile::{self, Basis, TranspileStats};
+use crate::synth;
+use crate::transpile::{self, GateSet, TranspileStats};
 use crate::verify;
+
+const DIFF_QUBITS: usize = 20;
 
 #[derive(PartialEq, Debug)]
 pub enum Emit {
@@ -102,9 +106,12 @@ pub struct Options {
     pub verbose: bool,
     pub output: Option<PathBuf>,
     pub verify_each: bool,
-    pub basis: Option<Basis>,
+    pub gates: Option<GateSet>,
+    pub resynth: Option<usize>,
     pub coupling: Option<Coupling>,
     pub color: Color,
+    pub diff: bool,
+    pub other: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -119,9 +126,12 @@ impl Default for Options {
             verbose: false,
             output: None,
             verify_each: false,
-            basis: None,
+            gates: None,
+            resynth: None,
             coupling: None,
             color: Color::Auto,
+            diff: false,
+            other: None,
         }
     }
 }
@@ -131,6 +141,9 @@ qirc: a QIR compiler and state vector simulator
 
 usage:
   qirc <input.ll> [options]
+  qirc diff <a.ll> [b.ll] [options]
+                    check that b.ll, or a.ll compiled with the options,
+                    behaves exactly like a.ll at -O0
 
 options:
   --emit <kind>     run | ir | qasm3 | qir | json | circuit | check   (default: run)
@@ -140,7 +153,11 @@ options:
   --no-state        do not print the final state vector
   -o <path>         write emitted output to a file
   --color <when>    auto | always | never                              (default: auto)
-  --basis <name>    decompose into a target gate set: rz-sx-cx | rz-ry-cz
+  --gates <set>     target gate set: rz-sx-cx | rz-ry-cz or a list like rz,sx,cx
+  --exclude <list>  leave gates out of the target set, such as h,t
+  --basis <name>    same as --gates
+  --resynth <n>     replace runs of gates by at most n gates, 1 to 6
+                    (default 1 from -O2)
   --coupling <map>  route onto hardware: line:N | ring:N | grid:RxC | full:N
                     or an explicit edge list such as 0-1,1-2,2-3
   --verify-each     run the IR verifier after lowering and after every pass
@@ -151,7 +168,12 @@ options:
 pub fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut options = Options::default();
     let mut input: Option<PathBuf> = None;
+    let mut excluded: Option<&str> = None;
     let mut args = args.iter();
+    if args.as_slice().first().is_some_and(|a| a == "diff") {
+        args.next();
+        options.diff = true;
+    }
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -184,10 +206,19 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
                 options.output = Some(PathBuf::from(value));
             }
 
-            "--basis" => {
-                let value = value(&mut args, "--basis needs a name")?;
-                options.basis =
-                    Some(Basis::parse(value).ok_or_else(|| format!("unknown basis `{value}`"))?);
+            "--gates" | "--basis" => {
+                let value = value(&mut args, "--gates needs a gate set")?;
+                options.gates = Some(GateSet::parse(value)?);
+            }
+
+            "--exclude" => excluded = Some(value(&mut args, "--exclude needs a list of gates")?),
+
+            "--resynth" => {
+                let value = value(&mut args, "--resynth needs a length")?;
+                options.resynth = match value.parse() {
+                    Ok(n @ 1..=6) => Some(n),
+                    _ => return Err(format!("resynthesis length `{value}` must be 1 to 6")),
+                };
             }
 
             "--coupling" => {
@@ -226,14 +257,25 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
 
             arg if arg.starts_with('-') => return Err(format!("unknown option `{arg}`")),
 
-            path => {
-                if input.replace(PathBuf::from(path)).is_some() {
-                    return Err("expected exactly one input file".into());
-                }
+            path if input.is_none() => input = Some(PathBuf::from(path)),
+
+            path if options.diff && options.other.is_none() => {
+                options.other = Some(PathBuf::from(path));
             }
+
+            _ => return Err("too many input files".into()),
         }
     }
 
+    if let Some(list) = excluded {
+        options.gates = Some(
+            options
+                .gates
+                .take()
+                .unwrap_or_else(GateSet::native)
+                .without(list)?,
+        );
+    }
     options.input = input.ok_or_else(|| "no input file given".to_string())?;
     Ok(options)
 }
@@ -246,8 +288,9 @@ fn value<'a>(args: &mut slice::Iter<'a, String>, missing: &str) -> Result<&'a st
 
 #[derive(Default)]
 pub struct Target {
-    pub basis: Option<Basis>,
+    pub gates: Option<GateSet>,
     pub coupling: Option<Coupling>,
+    pub resynth: Option<usize>,
 }
 
 pub struct Compilation {
@@ -297,20 +340,34 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     stats.violations = lowering_violations;
 
     let transpiled = target
-        .basis
-        .map(|basis| transpile::transpile(&mut program, basis));
+        .gates
+        .as_ref()
+        .map(|set| transpile::transpile(&mut program, set));
     if let Some(stats) = &transpiled
-        && stats.leftover > 0
+        && !stats.leftover.is_empty()
     {
-        let noun = if stats.leftover == 1 { "gate" } else { "gates" };
         diagnostics.push(
             Diagnostic::warning(format!(
-                "{} {noun} left untranslated, with no exact form in basis {}",
-                stats.leftover,
-                stats.basis.name()
+                "no exact form in gate set {} for {}, left as written",
+                stats.set,
+                stats.leftover.join(", ")
             ))
             .with_code("QIR0401"),
         );
+    }
+
+    let native = GateSet::native();
+    let limit = target.resynth.unwrap_or(usize::from(opt_level >= 2));
+    let removed = synth::resynthesize(
+        &mut program,
+        target.gates.as_ref().unwrap_or(&native),
+        limit,
+    );
+    if removed > 0 {
+        stats.applied.push(("resynthesize", removed));
+        stats.gates_after = program.gate_count();
+        stats.depth_after = program.depth();
+        stats.ops_after = program.op_count();
     }
 
     let mut routed = None;
@@ -322,6 +379,9 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
                     .with_code("QIR0400"),
             ),
         }
+    }
+    if let (Some(_), Some(set)) = (&routed, &target.gates) {
+        transpile::transpile(&mut program, set);
     }
 
     if verify_each && (transpiled.is_some() || routed.is_some()) {
@@ -342,34 +402,32 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     }
 }
 
-pub fn run(options: Options) -> i32 {
-    let source = match std::fs::read_to_string(&options.input) {
-        Ok(text) => text,
+fn read(path: &PathBuf) -> Option<SourceFile> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(SourceFile::new(path.display().to_string(), text)),
         Err(error) => {
-            eprintln!("error: cannot read {}: {error}", options.input.display());
-            return 1;
+            eprintln!("error: cannot read {}: {error}", path.display());
+            None
         }
-    };
+    }
+}
 
-    let file = SourceFile::new(options.input.display().to_string(), source);
-    let compilation = compile_for(
-        &file.text,
-        options.opt_level,
-        options.verify_each,
-        &Target {
-            basis: options.basis,
-            coupling: options.coupling.clone(),
-        },
-    );
+fn target(options: &Options) -> Target {
+    Target {
+        gates: options.gates.clone(),
+        coupling: options.coupling.clone(),
+        resynth: options.resynth,
+    }
+}
 
+fn report(file: &SourceFile, compilation: &Compilation, color: bool) -> bool {
     for violation in &compilation.stats.violations {
         eprintln!("internal error: verifier: {violation}");
     }
 
-    let color = options.color.enabled();
     let mut errors = 0;
     for diagnostic in &compilation.diagnostics {
-        eprintln!("{}", diagnostic.render_styled(&file, color));
+        eprintln!("{}", diagnostic.render_styled(file, color));
         if diagnostic.severity == Severity::Error {
             errors += 1;
         }
@@ -380,7 +438,7 @@ pub fn run(options: Options) -> i32 {
             "error: aborting after {} verifier violation(s)",
             compilation.stats.violations.len()
         );
-        return 1;
+        return false;
     }
 
     if errors > 0 {
@@ -388,6 +446,93 @@ pub fn run(options: Options) -> i32 {
             "error: aborting due to {errors} previous error{}",
             if errors == 1 { "" } else { "s" }
         );
+        return false;
+    }
+
+    true
+}
+
+fn diff(options: &Options) -> i32 {
+    let color = options.color.enabled();
+    let Some(left) = read(&options.input) else {
+        return 1;
+    };
+    let Some(right) = read(options.other.as_ref().unwrap_or(&options.input)) else {
+        return 1;
+    };
+
+    let reference = compile_for(&left.text, 0, false, &Target::default());
+    let candidate = compile_for(
+        &right.text,
+        options.opt_level,
+        options.verify_each,
+        &target(options),
+    );
+    if !report(&left, &reference, color) || !report(&right, &candidate, color) {
+        return 1;
+    }
+
+    for program in [&reference.program, &candidate.program] {
+        if program.num_qubits as usize > DIFF_QUBITS {
+            eprintln!("error: diff follows every branch and supports at most {DIFF_QUBITS} qubits");
+            return 1;
+        }
+    }
+
+    let states = options.coupling.is_none();
+    let (a, b) = (
+        equiv::explore(&reference.program),
+        equiv::explore(&candidate.program),
+    );
+    let differences = equiv::compare(&a, &b, states);
+
+    if differences.is_empty() {
+        let checked = if states {
+            "probability and final state"
+        } else {
+            "probability"
+        };
+        let count = a.branches.len();
+        let noun = if count == 1 {
+            "outcome agrees"
+        } else {
+            "outcomes agree"
+        };
+        println!("equivalent: {count} {noun} in {checked}");
+    } else {
+        println!("different:");
+        for difference in differences.iter().take(8) {
+            println!("  {difference}");
+        }
+    }
+    if !states {
+        println!("note: final states are not compared because --coupling moves qubits");
+    }
+    let unexplored = a.unexplored.max(b.unexplored);
+    if unexplored > 1e-9 {
+        println!("note: {unexplored:.2e} of the probability was not explored");
+    }
+
+    i32::from(!differences.is_empty())
+}
+
+pub fn run(options: Options) -> i32 {
+    if options.diff {
+        return diff(&options);
+    }
+
+    let Some(file) = read(&options.input) else {
+        return 1;
+    };
+    let compilation = compile_for(
+        &file.text,
+        options.opt_level,
+        options.verify_each,
+        &target(&options),
+    );
+
+    let color = options.color.enabled();
+    if !report(&file, &compilation, color) {
         return 1;
     }
 

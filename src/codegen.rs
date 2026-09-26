@@ -5,7 +5,8 @@ use std::mem;
 
 use crate::ir::*;
 use crate::simulator::matrix::Matrix2;
-use crate::transpile::{self, Basis};
+use crate::synth::Synth;
+use crate::transpile::{self, GateSet};
 use crate::verify;
 
 pub fn emit_qasm3(program: &Program) -> Result<String, String> {
@@ -810,6 +811,7 @@ struct QirEmitter<'a> {
     labels: Vec<String>,
     prefix: &'static str,
     legacy: bool,
+    native: Option<(GateSet, Synth)>,
 }
 
 impl<'a> QirEmitter<'a> {
@@ -854,6 +856,7 @@ impl<'a> QirEmitter<'a> {
                 "label"
             },
             legacy,
+            native: None,
         }
     }
 
@@ -1129,12 +1132,16 @@ impl<'a> QirEmitter<'a> {
                 "`{name}` with a runtime angle has no QIR intrinsic"
             ));
         }
-        let parts = transpile::decompose(gate, Basis::RzSxCx);
-        if parts.iter().any(|part| intrinsic(part).is_none()) {
-            return Err(format!(
-                "`{name}` has no QIR intrinsic and cannot be decomposed into one"
-            ));
-        }
+        let (set, synth) = self.native.get_or_insert_with(|| {
+            let set = GateSet::native();
+            let synth = Synth::new(&set);
+            (set, synth)
+        });
+        let parts = transpile::translate(gate, set, synth)
+            .filter(|parts| parts.iter().all(|part| intrinsic(part).is_some()))
+            .ok_or_else(|| {
+                format!("`{name}` has no QIR intrinsic and cannot be decomposed into one")
+            })?;
         for part in &parts {
             self.emit_gate(part, body)?;
         }

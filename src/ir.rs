@@ -573,6 +573,14 @@ impl Op {
         }
     }
 
+    pub fn qubits(&self) -> Vec<QubitId> {
+        match self {
+            Op::Gate(gate) => gate.wires().collect(),
+            Op::Measure { qubit, .. } | Op::Reset { qubit, .. } => vec![*qubit],
+            _ => Vec::new(),
+        }
+    }
+
     pub fn defined_value(&self) -> Option<ValueId> {
         match self {
             Op::Assign { dest, .. } => Some(*dest),

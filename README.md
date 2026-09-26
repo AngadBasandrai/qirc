@@ -51,10 +51,13 @@ The only direct dependency is `num-complex`.
 
 ```
 qirc <input.ll> [options]
+qirc diff <a.ll> [b.ll] [options]
 
   --emit <kind>     run | ir | qasm3 | qir | json | circuit | check   (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
-  --basis <name>    decompose into rz-sx-cx or rz-ry-cz
+  --gates <set>     target gate set: rz-sx-cx, rz-ry-cz or a list such as rz,sx,cx
+  --exclude <list>  leave gates out of the target set, such as h,t
+  --resynth <n>     replace runs of gates by at most n gates, 1 to 6
   --coupling <map>  route onto line:N, ring:N, grid:RxC, full:N or 0-1,1-2,...
   --shots <n>       sample n measurement outcomes
   --seed <n>        seed the random number generator
@@ -146,14 +149,29 @@ The profile comes from the `qir_profiles` attribute on the entry point. Qubit an
 | --- | --- |
 | `-O0` | none |
 | `-O1` | identity removal, inverse cancellation, rotation merging, constant folding, dead code elimination |
-| `-O2` | `-O1` plus peephole rewrites and CFG simplification, repeated until nothing changes |
+| `-O2` | `-O1` plus peephole rewrites and CFG simplification, repeated until nothing changes, then window resynthesis |
 | `-O3` | `-O2` plus single qubit gate fusion |
+
+Cancellation, merging and fusion look past gates that commute with the pair, so `rz` on a control qubit cancels across a CNOT. Commutation is checked on the exact matrices of the gates involved.
+
+Window resynthesis multiplies out every run of gates on one or two qubits and replaces the run with anything shorter that has the same matrix up to global phase. By default the replacement must be a single gate, so `t t` becomes `s` and three alternating CNOTs become `swap`. `--resynth n` allows replacements of up to `n` gates: single qubit runs use exact Euler angles, and two qubit runs use a meet in the middle search over the target gate set. Every replacement is checked against the original matrix before it is applied.
 
 On `tests/corpus/pyqir_simple.ll`, `-O3` takes the circuit from 12 gates at depth 7 to 8 gates at depth 4.
 
 ## Targeting hardware
 
-`--basis` decomposes every gate into a native set: `rz-sx-cx` for IBM style devices, or `rz-ry-cz`. Controlled rotations use the ABC decomposition, and Toffoli gates use the standard 6 CNOT construction.
+`--gates` rebuilds every gate from a target set: a preset such as `rz-sx-cx` for IBM style devices or `rz-ry-cz`, or any list of gates such as `rx,ry,cy`. `--exclude` removes gates from the full QIR set instead, and `--basis` is kept as a name for `--gates`. Multi qubit gates reduce to CNOTs and single qubit matrices first. The CNOT is then mapped onto whichever entangler the set has, and each single qubit matrix is rebuilt from Euler angles over two rotation axes, from one axis plus a fixed gate, or by an exact search over fixed gates such as `h,s,t`. A gate the set cannot express exactly is reported and left as written.
+
+```
+$ qirc tests/corpus/base_profile_bell.ll --exclude h,cx --emit ir
+  x q0
+  ry(-1.5707963267948966) q0
+  x q1
+  ry(-1.5707963267948966) q1
+  cz q0, q1
+  x q1
+  ry(-1.5707963267948966) q1
+```
 
 `--coupling` inserts SWAPs so that every two qubit gate lands on a physical edge, and remaps measurements so results come back under their original labels.
 
@@ -179,6 +197,17 @@ c[2] = measure q[2];
 c[3] = measure q[3];
 ```
 
+## Checking a compile
+
+`qirc diff a.ll` compiles `a.ll` twice, once at `-O0` and once with the given options, and compares them branch by branch. Every measurement splits the run into both outcomes, and each outcome must have the same probability, the same recorded values and the same final state up to global phase. `qirc diff a.ll b.ll` compares two different programs the same way.
+
+```
+$ qirc diff tests/corpus/qsharp_teleport.ll -O3 --gates rz-sx-cx --resynth 4
+equivalent: 8 outcomes agree in probability and final state
+```
+
+Branches below a probability of 1e-12 are pruned and the search stops after 4096 paths, so loops that repeat until success are checked up to a stated remainder. With `--coupling` only the outcome probabilities are compared, because routing moves qubits.
+
 ## Simulator
 
 The state vector is stored as separate real and imaginary arrays, so a single qubit gate is a 2x2 complex matrix applied to every pair of amplitudes at once. On x86_64 with AVX2 and FMA, four amplitudes are processed per instruction.
@@ -201,7 +230,8 @@ The tests include:
 - A differential test that checks the AVX2 kernel against a naive reference simulator on random circuits.
 - Random unitary, measurement and memory programs compared across every optimisation level.
 - Round trips through the QIR emitter and back through the frontend.
-- Decomposition checks against the exact Toffoli, controlled unitary and swap matrices.
+- Decomposition checks against the exact Toffoli, controlled unitary and swap matrices for several gate sets.
+- Random programs compiled for several gate sets, with and without resynthesis, checked branch by branch against `-O0`.
 
 ## Limitations
 

@@ -125,7 +125,7 @@ impl State {
             .sqrt()
     }
 
-    fn collapse(&mut self, qubit: usize, outcome: bool) {
+    pub(crate) fn collapse(&mut self, qubit: usize, outcome: bool) {
         if qubit >= self.n {
             return;
         }
@@ -160,12 +160,6 @@ impl State {
         let outcome = rng.next_unit() < probability_one;
         self.collapse(qubit, outcome);
         outcome
-    }
-
-    pub fn reset(&mut self, qubit: usize, rng: &mut Rng) {
-        if self.measure(qubit, rng) {
-            self.apply(&Matrix2::x(), qubit, 0);
-        }
     }
 
     pub fn sampler(&self) -> Sampler {
@@ -313,19 +307,6 @@ mod tests {
             (observed - expected).abs() < 0.03,
             "expected about {expected}, observed {observed}"
         );
-    }
-
-    #[test]
-    fn resets() {
-        let mut rng = Rng::new(99);
-        for _ in 0..50 {
-            let mut state = State::new(2);
-            state.apply(&Matrix2::h(), 0, 0);
-            state.apply(&Matrix2::x(), 1, 1 << 0);
-            state.reset(0, &mut rng);
-            assert!(state.qubit_probability(0) < 1e-12);
-            assert!((state.norm() - 1.0).abs() < 1e-12);
-        }
     }
 
     #[test]

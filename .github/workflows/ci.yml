@@ -52,4 +52,14 @@ jobs:
               ./target/release/qirc "$file" --emit qir -O$level -o out.ll
               clang -x ir -S -emit-llvm -o /dev/null out.ll
             done
+            ./target/release/qirc "$file" --emit qir -O3 --gates rx,ry,cy -o out.ll
+            clang -x ir -S -emit-llvm -o /dev/null out.ll
+          done
+      - name: compiled programs behave like the originals
+        run: |
+          for file in tests/corpus/*.ll; do
+            case "$file" in *syntax_stress*) continue ;; esac
+            for options in "-O3" "-O3 --gates rz-sx-cx --resynth 4" "-O2 --gates rz-ry-cz"; do
+              ./target/release/qirc diff "$file" $options
+            done
           done

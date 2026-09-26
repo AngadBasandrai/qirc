@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::matrix::matrix_for;
+use super::matrix::{Matrix2, matrix_for};
 use super::state::{Rng, State};
 use crate::ir::*;
 
@@ -34,7 +34,7 @@ pub struct ExecOutcome {
 }
 
 #[derive(Clone, Copy)]
-enum Returned {
+pub(crate) enum Returned {
     Open(OutputKind, Option<usize>),
     Close,
     Bit(bool),
@@ -200,7 +200,9 @@ fn execute_per_shot(program: &Program, config: ExecConfig) -> ExecOutcome {
 
     for shot in 0..shots {
         let mut state = State::new(program.num_qubits as usize);
-        let run = run_once(program, &mut state, &mut rng);
+        let run = run_with(program, &mut state, &mut |state, qubit| {
+            Some(state.measure(qubit, &mut rng))
+        });
         if run.aborted {
             aborted = true;
             break;
@@ -232,15 +234,19 @@ fn execute_per_shot(program: &Program, config: ExecConfig) -> ExecOutcome {
     }
 }
 
-struct ShotRun {
-    aborted: bool,
-    results: Vec<bool>,
+pub(crate) struct ShotRun {
+    pub(crate) aborted: bool,
+    pub(crate) results: Vec<bool>,
     messages: Vec<String>,
     outputs: Vec<String>,
-    returned: Vec<Returned>,
+    pub(crate) returned: Vec<Returned>,
 }
 
-fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
+pub(crate) fn run_with(
+    program: &Program,
+    state: &mut State,
+    measure: &mut dyn FnMut(&mut State, usize) -> Option<bool>,
+) -> ShotRun {
     let mut results = vec![false; program.num_results as usize];
     let mut values = HashMap::new();
     let mut slots = vec![Const::Int(0); program.num_slots as usize];
@@ -253,7 +259,7 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
     let mut previous = None;
     let mut steps = 0usize;
 
-    loop {
+    'run: loop {
         steps += 1;
         if steps > MAX_STEPS {
             aborted = true;
@@ -286,13 +292,23 @@ fn run_once(program: &Program, state: &mut State, rng: &mut Rng) -> ShotRun {
                 Op::Gate(gate) => apply_gate(state, gate, &values),
 
                 Op::Measure { qubit, result, .. } => {
-                    let outcome = state.measure(qubit.index(), rng);
+                    let Some(outcome) = measure(state, qubit.index()) else {
+                        aborted = true;
+                        break 'run;
+                    };
                     if result.index() < results.len() {
                         results[result.index()] = outcome;
                     }
                 }
 
-                Op::Reset { qubit, .. } => state.reset(qubit.index(), rng),
+                Op::Reset { qubit, .. } => match measure(state, qubit.index()) {
+                    Some(true) => state.apply(&Matrix2::x(), qubit.index(), 0),
+                    Some(false) => {}
+                    None => {
+                        aborted = true;
+                        break 'run;
+                    }
+                },
 
                 Op::Assign {
                     expr: Expr::Phi(_), ..
@@ -402,7 +418,7 @@ fn recorded(op: &Op, values: &HashMap<ValueId, Const>, results: &[bool]) -> Opti
     })
 }
 
-fn format_returned(shot: &[Returned]) -> String {
+pub(crate) fn format_returned(shot: &[Returned]) -> String {
     let mut rest = shot;
     let mut parts = Vec::new();
     while !rest.is_empty() {
@@ -495,7 +511,7 @@ fn eval(
     }
 }
 
-fn format_results(results: &[bool]) -> String {
+pub(crate) fn format_results(results: &[bool]) -> String {
     if results.is_empty() {
         return "(no measurements)".into();
     }

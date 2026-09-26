@@ -10,7 +10,7 @@ use qirc::ir::*;
 use qirc::route::{self, Coupling};
 use qirc::simulator::exec::{self, ExecConfig};
 use qirc::simulator::state::{self, State};
-use qirc::transpile::Basis;
+use qirc::transpile::GateSet;
 
 const BELL: &str = include_str!("corpus/base_profile_bell.ll");
 const TELEPORT: &str = include_str!("corpus/adaptive_teleport.ll");
@@ -890,13 +890,14 @@ fn compile_for_target(source: &str, level: u8, target: driver::Target) -> Progra
 #[test]
 fn transpile_state() {
     let baseline = final_state(&compile(TARGET_SOURCE, 0));
-    for basis in [Basis::RzSxCx, Basis::RzRyCz] {
+    for set in ["rz-sx-cx", "rz-ry-cz"].map(|s| GateSet::parse(s).unwrap()) {
         let targeted = final_state(&compile_for_target(
             TARGET_SOURCE,
             0,
             driver::Target {
-                basis: Some(basis),
+                gates: Some(set.clone()),
                 coupling: None,
+                resynth: None,
             },
         ));
         assert_same_state(&baseline, &targeted);
@@ -905,21 +906,22 @@ fn transpile_state() {
 
 #[test]
 fn transpile_basis_only() {
-    for basis in [Basis::RzSxCx, Basis::RzRyCz] {
+    for set in ["rz-sx-cx", "rz-ry-cz"].map(|s| GateSet::parse(s).unwrap()) {
         let program = compile_for_target(
             TARGET_SOURCE,
             0,
             driver::Target {
-                basis: Some(basis),
+                gates: Some(set.clone()),
                 coupling: None,
+                resynth: None,
             },
         );
 
         for gate in program.gates() {
             assert!(
-                basis.allows(gate),
+                set.allows(gate),
                 "{} left {:?} with {} controls behind",
-                basis.name(),
+                set.name(),
                 gate.kind,
                 gate.controls.len()
             );
@@ -951,8 +953,8 @@ attributes #0 = { \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_n
             source,
             0,
             driver::Target {
-                basis: None,
                 coupling: Some(Coupling::line(4)),
+                ..Default::default()
             },
         ),
         2000,
@@ -981,8 +983,8 @@ attributes #0 = { \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_n
         source,
         0,
         driver::Target {
-            basis: None,
             coupling: Some(coupling.clone()),
+            ..Default::default()
         },
     );
 
@@ -997,18 +999,16 @@ fn transpile_then_route() {
         TARGET_SOURCE,
         1,
         driver::Target {
-            basis: Some(Basis::RzSxCx),
+            gates: Some(GateSet::parse("rz-sx-cx").unwrap()),
             coupling: Some(coupling.clone()),
+            resynth: None,
         },
     );
 
     assert!(route::respects(&program, &coupling));
+    let set = GateSet::parse("rz-sx-cx").unwrap();
     for gate in program.gates() {
-        assert!(
-            gate.kind == GateKind::Swap || Basis::RzSxCx.allows(gate),
-            "{:?} survived both passes",
-            gate.kind
-        );
+        assert!(set.allows(gate), "{:?} survived both passes", gate.kind);
     }
 }
 

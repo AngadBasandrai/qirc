@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use qirc::diag::Severity;
 use qirc::driver::{self, Compilation};
 use qirc::ir::Program;

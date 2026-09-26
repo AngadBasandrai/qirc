@@ -4,7 +4,7 @@ use common::{compile, errors, run};
 use qirc::codegen;
 use qirc::driver;
 use qirc::ir::*;
-use qirc::transpile::{self, Basis};
+use qirc::transpile::{self, GateSet};
 
 fn module(body: &str) -> String {
     format!(
@@ -251,7 +251,7 @@ fn ccz_basis() {
 ",
     );
     let mut program = compile(&source, 0);
-    transpile::transpile(&mut program, Basis::RzSxCx);
+    transpile::transpile(&mut program, &GateSet::parse("rz-sx-cx").unwrap());
     let counts = run(&program, 100, 3).counts;
     assert_eq!(counts.into_keys().collect::<Vec<_>>(), ["1"]);
 }
@@ -376,12 +376,12 @@ fn runtime_basis() {
   call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 2 to %Result*), i8* null)
 ",
     );
-    for basis in [Basis::RzSxCx, Basis::RzRyCz] {
+    for basis in ["rz-sx-cx", "rz-ry-cz"] {
         let mut program = compile(&source, 1);
-        let stats = transpile::transpile(&mut program, basis);
-        assert_eq!(stats.leftover, 0);
+        let stats = transpile::transpile(&mut program, &GateSet::parse(basis).unwrap());
+        assert!(stats.leftover.is_empty());
         let keys: Vec<_> = run(&program, 50, 2).returns.into_keys().collect();
-        assert_eq!(keys, ["1, 1"], "{}", basis.name());
+        assert_eq!(keys, ["1, 1"], "{basis}");
     }
 }
 
@@ -396,8 +396,8 @@ fn cswap_basis() {
 ",
     );
     let mut program = compile(&source, 0);
-    let stats = transpile::transpile(&mut program, Basis::RzSxCx);
-    assert_eq!(stats.leftover, 0);
+    let stats = transpile::transpile(&mut program, &GateSet::parse("rz-sx-cx").unwrap());
+    assert!(stats.leftover.is_empty());
     let counts = run(&program, 50, 2).counts;
     assert_eq!(counts.into_keys().collect::<Vec<_>>(), ["01"]);
 }

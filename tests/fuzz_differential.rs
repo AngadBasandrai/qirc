@@ -3,10 +3,13 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::{compile, final_state, run};
+use qirc::driver::{self, Target};
+use qirc::equiv;
 use qirc::ir::*;
 use qirc::simulator::exec;
 use qirc::simulator::matrix::{C64, matrix_for};
 use qirc::simulator::state::Rng;
+use qirc::transpile::GateSet;
 
 struct Gen(Rng);
 
@@ -420,6 +423,46 @@ fn verifier_accepts() {
                 violations.is_empty(),
                 "-O{level} produced invalid IR: {violations:?}\n{source}"
             );
+        }
+    }
+}
+
+#[test]
+fn targets_equivalent() {
+    let mut rng = Gen::new(59);
+    let sets = [
+        None,
+        Some("rz-sx-cx"),
+        Some("rz-ry-cz"),
+        Some("rx,ry,cy"),
+        Some("h,s,t,cx"),
+    ];
+
+    for trial in 0..24 {
+        let qubits = 2 + rng.below(3);
+        let source = if trial % 2 == 0 {
+            let depth = 4 + rng.below(10);
+            random_unitary_circuit(&mut rng, qubits, depth)
+        } else {
+            random_measured_circuit(&mut rng, qubits)
+        };
+        let reference = equiv::explore(&compile(&source, 0));
+
+        for set in sets {
+            for resynth in [None, Some(3)] {
+                let target = Target {
+                    gates: set.map(|s| GateSet::parse(s).unwrap()),
+                    resynth,
+                    ..Default::default()
+                };
+                let program = driver::compile_for(&source, 2, false, &target).program;
+                let differences = equiv::compare(&reference, &equiv::explore(&program), true);
+                assert!(
+                    differences.is_empty(),
+                    "trial {trial} {set:?} {resynth:?}: {differences:?}
+{source}"
+                );
+            }
         }
     }
 }
