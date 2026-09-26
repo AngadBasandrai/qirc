@@ -396,7 +396,7 @@ impl<'a> QasmWriter<'a> {
             Expr::Load(slot) => format!("s{}", slot.0),
             Expr::Binary { op, lhs, rhs } => self.binary(*op, ty, lhs, rhs)?,
             Expr::ICmp { pred, ty, lhs, rhs } => self.icmp(*pred, *ty, lhs, rhs),
-            Expr::FCmp { pred, lhs, rhs } => self.fcmp(*pred, lhs, rhs),
+            Expr::FCmp { pred, lhs, rhs, .. } => self.fcmp(*pred, lhs, rhs),
             Expr::Cast { op, from, operand } => self.cast(*op, *from, ty, operand)?,
             Expr::Select {
                 cond,
@@ -523,26 +523,22 @@ impl<'a> QasmWriter<'a> {
             Scalar::Bool => format!("({x} & 1) == 1"),
             _ => wrapped(&x, to),
         };
+        let float = |x: String| format!("{}({x})", qasm_type(to));
         Ok(match (op, from) {
-            _ if from == to && !matches!(op, CastOp::FPTrunc) => x,
-            (CastOp::ZExt | CastOp::SExt | CastOp::UIToFP, Scalar::Bool) => {
-                let widened = match op {
-                    CastOp::SExt => format!("-int[64]({x})"),
-                    _ => format!("int[64]({x})"),
-                };
-                match to {
-                    Scalar::Double => format!("float[64]({widened})"),
-                    _ => widened,
-                }
+            _ if from == to => x,
+            (CastOp::ZExt | CastOp::UIToFP, Scalar::Bool) if to.is_float() => {
+                float(format!("int[64]({x})"))
             }
-            (CastOp::SIToFP, Scalar::Bool) => format!("float[64](-int[64]({x}))"),
+            (CastOp::SExt | CastOp::SIToFP, Scalar::Bool) if to.is_float() => {
+                float(format!("-int[64]({x})"))
+            }
+            (CastOp::ZExt | CastOp::UIToFP, Scalar::Bool) => format!("int[64]({x})"),
+            (CastOp::SExt | CastOp::SIToFP, Scalar::Bool) => format!("-int[64]({x})"),
             (CastOp::Trunc | CastOp::SExt, _) => integer(x),
             (CastOp::ZExt, _) => integer(format!("int[64]({})", unsigned(&x, from))),
-            (CastOp::SIToFP, _) => format!("float[64]({x})"),
-            (CastOp::UIToFP, _) => format!("float[64]({})", unsigned(&x, from)),
+            (CastOp::SIToFP | CastOp::FPExt | CastOp::FPTrunc, _) => float(x),
+            (CastOp::UIToFP, _) => float(unsigned(&x, from)),
             (CastOp::FPToSI | CastOp::FPToUI, _) => integer(format!("int[64]({x})")),
-            (CastOp::FPExt, _) => x,
-            (CastOp::FPTrunc, _) => format!("float[64](float[32]({x}))"),
             (CastOp::PtrToInt | CastOp::IntToPtr | CastOp::BitCast | CastOp::AddrSpaceCast, _) => {
                 return Err(format!(
                     "`{}` cannot be written as OpenQASM 3",
@@ -597,28 +593,34 @@ impl<'a> QasmWriter<'a> {
     }
 }
 
+fn qasm_type(ty: Scalar) -> &'static str {
+    match ty {
+        Scalar::Bool => "bool",
+        Scalar::Int(_) => "int[64]",
+        Scalar::Float => "float[32]",
+        Scalar::Double => "float[64]",
+    }
+}
+
 fn declare_var(out: &mut String, ty: Scalar, name: fmt::Arguments) {
-    let (qasm, zero) = match ty {
-        Scalar::Bool => ("bool", "false"),
-        Scalar::Double => ("float[64]", "0.0"),
-        Scalar::Int(_) => ("int[64]", "0"),
+    let zero = match ty {
+        Scalar::Bool => "false",
+        Scalar::Int(_) => "0",
+        _ => "0.0",
     };
-    writeln!(out, "{qasm} {name} = {zero};").unwrap();
+    writeln!(out, "{} {name} = {zero};", qasm_type(ty)).unwrap();
 }
 
 fn wrapped(x: &str, ty: Scalar) -> String {
     match ty {
-        Scalar::Int(bits) if bits < 64 => {
-            let shift = 64 - bits;
-            format!("(({x}) << {shift}) >> {shift}")
-        }
+        Scalar::Int(bits) if bits < 64 => format!("int[64](int[{bits}]({x}))"),
         _ => x.to_string(),
     }
 }
 
 fn unsigned(x: &str, ty: Scalar) -> String {
     match ty {
-        Scalar::Int(bits) if bits < 64 => format!("(uint[64]({x}) & {})", (1u64 << bits) - 1),
+        Scalar::Int(bits) if bits < 64 => format!("uint[{bits}]({x})"),
         _ => format!("uint[64]({x})"),
     }
 }
@@ -908,7 +910,7 @@ impl<'a> QirEmitter<'a> {
     fn emit(mut self) -> Result<String, String> {
         let program = self.program;
 
-        writeln!(self.out, "; ModuleID = '{}'", program.name).unwrap();
+        writeln!(self.out, "; ModuleID = '{}'", c_string(&program.name)).unwrap();
         writeln!(
             self.out,
             "source_filename = \"{}\"",
@@ -1188,10 +1190,19 @@ impl<'a> QirEmitter<'a> {
                 .unwrap();
             }
 
-            Expr::FCmp { pred, lhs, rhs } => {
-                let a = self.operand(lhs, Scalar::Double);
-                let b = self.operand(rhs, Scalar::Double);
-                writeln!(body, "  {name} = fcmp {} double {a}, {b}", pred.keyword()).unwrap();
+            Expr::FCmp {
+                pred,
+                ty: operands,
+                lhs,
+                rhs,
+            } => {
+                let (a, b) = (self.operand(lhs, *operands), self.operand(rhs, *operands));
+                writeln!(
+                    body,
+                    "  {name} = fcmp {} {operands} {a}, {b}",
+                    pred.keyword()
+                )
+                .unwrap();
             }
 
             Expr::Select {
@@ -1209,10 +1220,6 @@ impl<'a> QirEmitter<'a> {
                 match cast_instruction(*op, *from, ty) {
                     Some(keyword) => {
                         writeln!(body, "  {name} = {keyword} {from} {value} to {ty}").unwrap();
-                    }
-                    None if *op == CastOp::FPTrunc => {
-                        writeln!(body, "  {name}.f = fptrunc double {value} to float").unwrap();
-                        writeln!(body, "  {name} = fpext float {name}.f to double").unwrap();
                     }
                     None => {
                         writeln!(body, "  {name} = bitcast {ty} {value} to {ty}").unwrap();
@@ -1317,13 +1324,16 @@ fn cast_instruction(op: CastOp, from: Scalar, to: Scalar) -> Option<&'static str
     if from == to {
         return None;
     }
-    Some(match (from, to) {
-        (Scalar::Double, _) if op == CastOp::BitCast && to == Scalar::Int(64) => "bitcast",
-        (Scalar::Double, _) if op == CastOp::FPToUI => "fptoui",
-        (Scalar::Double, _) => "fptosi",
-        (_, Scalar::Double) if op == CastOp::BitCast && from == Scalar::Int(64) => "bitcast",
-        (_, Scalar::Double) if op == CastOp::UIToFP => "uitofp",
-        (_, Scalar::Double) => "sitofp",
+    let same_size = from.bits() == to.bits();
+    Some(match (from.is_float(), to.is_float()) {
+        (true, true) if to.bits() < from.bits() => "fptrunc",
+        (true, true) => "fpext",
+        (true, false) if op == CastOp::BitCast && same_size => "bitcast",
+        (true, false) if op == CastOp::FPToUI => "fptoui",
+        (true, false) => "fptosi",
+        (false, true) if op == CastOp::BitCast && same_size => "bitcast",
+        (false, true) if op == CastOp::UIToFP => "uitofp",
+        (false, true) => "sitofp",
         _ if to.bits() < from.bits() => "trunc",
         _ if op == CastOp::SExt => "sext",
         _ => "zext",
@@ -1394,7 +1404,7 @@ pub fn emit_json(program: &Program) -> String {
     let mut out = String::new();
 
     out.push_str("{\n");
-    writeln!(out, "  \"name\": {:?},", program.name).unwrap();
+    writeln!(out, "  \"name\": {},", json_string(&program.name)).unwrap();
     writeln!(out, "  \"profile\": {:?},", program.profile.name()).unwrap();
     writeln!(out, "  \"qubits\": {},", program.num_qubits).unwrap();
     writeln!(out, "  \"results\": {},", program.num_results).unwrap();
@@ -1404,7 +1414,7 @@ pub fn emit_json(program: &Program) -> String {
 
     for (index, block) in program.blocks.iter().enumerate() {
         out.push_str("    {\n");
-        writeln!(out, "      \"label\": {:?},", block.label).unwrap();
+        writeln!(out, "      \"label\": {},", json_string(&block.label)).unwrap();
         out.push_str("      \"ops\": [\n");
 
         let lines: Vec<String> = block.ops.iter().filter_map(json_op).collect();
@@ -1416,8 +1426,8 @@ pub fn emit_json(program: &Program) -> String {
         out.push_str("      ],\n");
         writeln!(
             out,
-            "      \"terminator\": {:?}",
-            json_term(program, &block.term)
+            "      \"terminator\": {}",
+            json_string(&json_term(program, &block.term))
         )
         .unwrap();
         out.push_str("    }");
@@ -1431,15 +1441,29 @@ pub fn emit_json(program: &Program) -> String {
     out
 }
 
+fn json_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if u32::from(c) < 0x20 => write!(out, "\\u{:04x}", u32::from(c)).unwrap(),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn json_op(op: &Op) -> Option<String> {
     match op {
         Op::Gate(gate) => {
             let params: Vec<String> = gate
                 .params
                 .iter()
-                .map(|p| match p.constant() {
-                    Some(c) => c.as_f64().to_string(),
-                    None => "null".into(),
+                .map(|p| match p.constant().map(|c| c.as_f64()) {
+                    Some(angle) if angle.is_finite() => angle.to_string(),
+                    _ => "null".into(),
                 })
                 .collect();
 

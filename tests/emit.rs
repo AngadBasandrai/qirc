@@ -427,7 +427,7 @@ fn qasm_widths() {
     ));
     assert_eq!(returns(&source, 0), ["0"]);
     let qasm = codegen::emit_qasm3(&compile(&source, 0)).unwrap();
-    assert!(qasm.contains("((v2) << 32) >> 32"), "{qasm}");
+    assert!(qasm.contains("int[64](int[32](v2))"), "{qasm}");
     assert!(!qasm.contains("bool v3"), "{qasm}");
 }
 
@@ -444,4 +444,59 @@ fn qasm_unordered() {
     let qasm = codegen::emit_qasm3(&compile(&source, 0)).unwrap();
     assert!(qasm.contains("= !(v1 < 0.0 || v1 > 0.0);"), "{qasm}");
     assert!(qasm.contains("= (v1 != v1 || v1 != v1);"), "{qasm}");
+}
+
+#[test]
+fn single_precision() {
+    let source = module(&format!(
+        "{MEASURED_ONE}  %a = select i1 %r, float 0.1, float 0.2
+  %b = fadd float %a, 0.2
+  %c = fpext float %b to double
+  %d = fptrunc double 0.1 to float
+  %e = fpext float %d to double
+  call void @__quantum__rt__double_record_output(double %c, i8* null)
+  call void @__quantum__rt__double_record_output(double %e, i8* null)
+"
+    ));
+    let sum = f64::from(0.1f32 + 0.2f32);
+    let expected = format!("{sum:?}, {:?}", f64::from(0.1f32));
+    assert_eq!(returns(&source, 0), [expected.as_str()]);
+    assert_eq!(returns(&source, 3), [expected.as_str()]);
+    assert_eq!(returns(&qir(&source), 0), [expected.as_str()]);
+}
+
+#[test]
+fn deep_nesting() {
+    let mut value = String::from("i64 0");
+    for _ in 0..5000 {
+        value = format!("i64 add (i64 1, {value})");
+    }
+    let source = module(&format!("  %x = add {value}, 1\n"));
+    let found = errors(&driver::compile(&source, 0))
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        found.iter().any(|e| e.contains("nested too deeply")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn escaped_names() {
+    let source = r#"%Qubit = type opaque
+define void @"m\22a\5Cin\0A\07"() #0 {
+entry:
+  call void @__quantum__qis__rx__body(double 0x7FF8000000000000, %Qubit* null)
+  ret void
+}
+declare void @__quantum__qis__rx__body(double, %Qubit*)
+attributes #0 = { "entry_point" "qir_profiles"="adaptive_profile" "required_num_qubits"="1" }
+"#;
+    let program = compile(source, 0);
+    let json = codegen::emit_json(&program);
+    assert!(json.contains(r#""name": "m\"a\\in\u000a\u0007""#), "{json}");
+    assert!(json.contains(r#""params": [null]"#), "{json}");
+    let qir = codegen::emit_qir(&program).unwrap();
+    assert!(qir.lines().next().unwrap().ends_with(r"\0A\07'"), "{qir}");
 }

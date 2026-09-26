@@ -9,6 +9,7 @@ use crate::transpile::GateSet;
 
 const EPSILON: f64 = 1e-9;
 const MAX_WINDOW: usize = 12;
+const MAX_REACH: usize = 64;
 const MAX_WORDS: usize = 50_000;
 const SHORT_WORDS: usize = 2_000;
 const WORD_DEPTH: usize = 8;
@@ -29,6 +30,7 @@ const FIXED: [GateKind; 10] = [
 const ZERO: C64 = C64::new(0.0, 0.0);
 const ONE: C64 = C64::new(1.0, 0.0);
 
+#[derive(Clone)]
 pub struct Unitary {
     dim: usize,
     cells: Vec<C64>,
@@ -71,7 +73,8 @@ impl Unitary {
         let mut cells = vec![ZERO; dim * dim];
 
         for column in 0..dim {
-            let mut v = vec![ZERO; dim];
+            let mut buffer = [ZERO; 8];
+            let v = &mut buffer[..dim];
             v[column] = ONE;
             match (gate.kind, targets.as_slice()) {
                 (GateKind::Swap, &[a, b]) => {
@@ -94,8 +97,8 @@ impl Unitary {
                     }
                 }
             }
-            for (row, value) in v.into_iter().enumerate() {
-                cells[row * dim + column] = value;
+            for (row, value) in v.iter().enumerate() {
+                cells[row * dim + column] = *value;
             }
         }
 
@@ -118,6 +121,20 @@ impl Unitary {
             }
         }
         Unitary { dim: 4, cells }
+    }
+
+    fn widen(&self, qubits: usize) -> Unitary {
+        let dim = 1 << qubits;
+        let mut cells = vec![ZERO; dim * dim];
+        for row in 0..dim {
+            for column in 0..dim {
+                if row / self.dim == column / self.dim {
+                    cells[row * dim + column] =
+                        self.cells[(row % self.dim) * self.dim + column % self.dim];
+                }
+            }
+        }
+        Unitary { dim, cells }
     }
 
     fn matrix2(&self) -> Matrix2 {
@@ -864,27 +881,28 @@ impl Search {
         found
     }
 
-    fn window(&mut self, ops: &[Op], start: usize) -> Option<(Vec<usize>, Vec<Gate>)> {
-        let Op::Gate(first) = &ops[start] else {
+    fn window(&mut self, ops: &[Op]) -> Option<(Vec<usize>, Vec<Gate>)> {
+        let last = ops.len().checked_sub(1)?;
+        let Op::Gate(newest) = &ops[last] else {
             return None;
         };
-        let mut wires = distinct(first.wires());
-        if wires.len() > 2 || first.params.iter().any(|p| p.constant().is_none()) {
+        let mut wires = distinct(newest.wires());
+        if wires.len() > 2 || newest.params.iter().any(|p| p.constant().is_none()) {
             return None;
         }
 
-        let mut picked = vec![start];
+        let mut suffixes = vec![(last, wires.clone(), Unitary::gate(newest, &wires)?)];
         let mut skipped = Vec::new();
-        for (index, op) in ops.iter().enumerate().skip(start + 1) {
-            if picked.len() == MAX_WINDOW {
+        for index in (last.saturating_sub(MAX_REACH)..last).rev() {
+            if suffixes.len() == MAX_WINDOW {
                 break;
             }
-            let qubits = op.qubits();
+            let qubits = ops[index].qubits();
             if !qubits.iter().any(|q| wires.contains(q)) {
                 skipped.extend(qubits);
                 continue;
             }
-            let Op::Gate(gate) = op else {
+            let Op::Gate(gate) = &ops[index] else {
                 break;
             };
             let grown = distinct(wires.iter().copied().chain(gate.wires()));
@@ -896,27 +914,30 @@ impl Search {
             {
                 break;
             }
+            let (_, _, later) = &suffixes[suffixes.len() - 1];
+            let step = Unitary::gate(gate, &grown)?;
+            let product = if grown.len() > wires.len() {
+                later.widen(grown.len()).after(&step)
+            } else {
+                later.after(&step)
+            };
             wires = grown;
-            picked.push(index);
+            suffixes.push((index, wires.clone(), product));
         }
 
-        for n in (2..=picked.len()).rev() {
-            let gates: Vec<Gate> = picked[..n]
-                .iter()
-                .filter_map(|&i| ops[i].as_gate().cloned())
-                .collect();
-            let local = distinct(gates.iter().flat_map(|g| g.wires()));
-            let u = Unitary::of(&gates, &local)?;
-            let Some(found) = self.best(&u, local.len()) else {
+        for n in (2..=suffixes.len()).rev() {
+            let (_, local, u) = &suffixes[n - 1];
+            let Some(found) = self.best(u, local.len()) else {
                 continue;
             };
             if found.len() < n && found.len() <= self.limit {
-                let span = gates[0].span;
                 let placed = found
                     .into_iter()
-                    .map(|g| relabel(g, &local, span))
+                    .map(|g| relabel(g, local, newest.span))
                     .collect();
-                return Some((picked[..n].to_vec(), placed));
+                let mut picked: Vec<usize> = suffixes[..n].iter().map(|(i, _, _)| *i).collect();
+                picked.reverse();
+                return Some((picked, placed));
             }
         }
         None
@@ -949,21 +970,18 @@ pub fn resynthesize(program: &mut Program, set: &GateSet, limit: usize) -> usize
     let before = program.gate_count();
 
     for block in &mut program.blocks {
-        let mut start = 0;
-        while start < block.ops.len() {
-            let Some((picked, replacement)) = search.window(&block.ops, start) else {
-                start += 1;
-                continue;
-            };
-            let at = picked[0];
-            for &i in picked.iter().rev() {
-                block.ops.remove(i);
+        let mut pending: Vec<Op> = block.ops.drain(..).rev().collect();
+        let mut out = Vec::with_capacity(pending.len());
+        while let Some(op) = pending.pop() {
+            out.push(op);
+            if let Some((picked, replacement)) = search.window(&out) {
+                for &i in picked.iter().rev() {
+                    out.remove(i);
+                }
+                pending.extend(replacement.into_iter().rev().map(Op::Gate));
             }
-            block
-                .ops
-                .splice(at..at, replacement.into_iter().map(Op::Gate));
-            start = at.saturating_sub(MAX_WINDOW);
         }
+        block.ops = out;
     }
 
     before.saturating_sub(program.gate_count())

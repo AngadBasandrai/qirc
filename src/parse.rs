@@ -73,12 +73,15 @@ fn is_value_keyword(text: &str) -> bool {
         )
 }
 
+const MAX_DEPTH: usize = 256;
+
 struct Parser<'a> {
     src: &'a str,
     tokens: &'a [Token],
     pos: usize,
     diagnostics: Vec<Diagnostic>,
     next_unnamed: u32,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -89,6 +92,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             diagnostics: Vec::new(),
             next_unnamed: 0,
+            depth: 0,
         }
     }
 
@@ -1141,7 +1145,27 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn nested<T>(&mut self, parse: fn(&mut Self) -> Option<T>) -> Option<T> {
+        if self.depth == MAX_DEPTH {
+            let span = self.peek().span;
+            self.error(
+                "this is nested too deeply",
+                span,
+                format!("more than {MAX_DEPTH} levels"),
+            );
+            return None;
+        }
+        self.depth += 1;
+        let parsed = parse(self);
+        self.depth -= 1;
+        parsed
+    }
+
     fn parse_type(&mut self) -> Option<Ty> {
+        self.nested(Self::type_body)
+    }
+
+    fn type_body(&mut self) -> Option<Ty> {
         let token = self.peek();
 
         let mut ty = match token.kind {
@@ -1281,6 +1305,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_value(&mut self) -> Option<Value> {
+        self.nested(Self::value_body)
+    }
+
+    fn value_body(&mut self) -> Option<Value> {
         let token = self.peek();
 
         match token.kind {

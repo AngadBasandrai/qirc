@@ -115,6 +115,7 @@ impl Const {
 pub enum Scalar {
     Bool,
     Int(u32),
+    Float,
     Double,
 }
 
@@ -123,11 +124,8 @@ impl Scalar {
         match ty {
             ast::Ty::Int(1) => Scalar::Bool,
             ast::Ty::Int(bits) => Scalar::Int((*bits).clamp(2, 64)),
-            ast::Ty::Half
-            | ast::Ty::Float
-            | ast::Ty::Double
-            | ast::Ty::X86Fp80
-            | ast::Ty::Fp128 => Scalar::Double,
+            ast::Ty::Float => Scalar::Float,
+            ast::Ty::Half | ast::Ty::Double | ast::Ty::X86Fp80 | ast::Ty::Fp128 => Scalar::Double,
             _ => Scalar::Int(64),
         }
     }
@@ -136,8 +134,13 @@ impl Scalar {
         match self {
             Scalar::Bool => Const::Bool(c.as_i64() & 1 == 1),
             Scalar::Int(bits) => Const::Int(wrap(c.as_i64(), bits)),
+            Scalar::Float => Const::Float(c.as_f64() as f32 as f64),
             Scalar::Double => Const::Float(c.as_f64()),
         }
+    }
+
+    pub fn is_float(self) -> bool {
+        matches!(self, Scalar::Float | Scalar::Double)
     }
 
     pub fn signed(self, c: Const) -> i64 {
@@ -159,6 +162,7 @@ impl Scalar {
         match self {
             Scalar::Bool => 1,
             Scalar::Int(bits) => bits,
+            Scalar::Float => 32,
             Scalar::Double => 64,
         }
     }
@@ -169,6 +173,7 @@ impl fmt::Display for Scalar {
         match self {
             Scalar::Bool => write!(f, "i1"),
             Scalar::Int(bits) => write!(f, "i{bits}"),
+            Scalar::Float => write!(f, "float"),
             Scalar::Double => write!(f, "double"),
         }
     }
@@ -215,13 +220,13 @@ impl BinOp {
     pub fn apply(self, ty: Scalar, a: Const, b: Const) -> Const {
         if self.is_float() {
             let (x, y) = (a.as_f64(), b.as_f64());
-            return Const::Float(match self {
+            return ty.normalize(Const::Float(match self {
                 BinOp::FAdd => x + y,
                 BinOp::FSub => x - y,
                 BinOp::FMul => x * y,
                 BinOp::FDiv => x / y,
                 _ => x % y,
-            });
+            }));
         }
 
         let (x, y) = (ty.signed(a), ty.signed(b));
@@ -299,11 +304,16 @@ impl CastOp {
             CastOp::FPToUI => Const::Int(value.as_f64() as u64 as i64),
             CastOp::SIToFP => Const::Float(from.signed(value) as f64),
             CastOp::UIToFP => Const::Float(from.unsigned(value) as f64),
-            CastOp::FPTrunc => Const::Float(value.as_f64() as f32 as f64),
             CastOp::BitCast => match (from, to) {
                 (Scalar::Double, Scalar::Int(_)) => Const::Int(value.as_f64().to_bits() as i64),
+                (Scalar::Float, Scalar::Int(_)) => {
+                    Const::Int(i64::from((value.as_f64() as f32).to_bits()))
+                }
                 (Scalar::Int(_), Scalar::Double) => {
                     Const::Float(f64::from_bits(value.as_i64() as u64))
+                }
+                (Scalar::Int(_), Scalar::Float) => {
+                    Const::Float(f64::from(f32::from_bits(value.as_i64() as u32)))
                 }
                 _ => value,
             },
@@ -329,6 +339,7 @@ pub enum Expr {
     },
     FCmp {
         pred: FloatPredicate,
+        ty: Scalar,
         lhs: Operand,
         rhs: Operand,
     },
@@ -362,7 +373,7 @@ impl Expr {
                 lhs,
                 rhs,
             } => Some(Const::Bool(pred.test(*operands, get(lhs)?, get(rhs)?))),
-            Expr::FCmp { pred, lhs, rhs } => Some(Const::Bool(
+            Expr::FCmp { pred, lhs, rhs, .. } => Some(Const::Bool(
                 pred.test(get(lhs)?.as_f64(), get(rhs)?.as_f64()),
             )),
             Expr::Select {
@@ -863,7 +874,7 @@ fn render_expr(expr: &Expr) -> String {
             render_operand(lhs),
             render_operand(rhs)
         ),
-        Expr::FCmp { pred, lhs, rhs } => format!(
+        Expr::FCmp { pred, lhs, rhs, .. } => format!(
             "fcmp {} {} {}",
             pred.keyword(),
             render_operand(lhs),

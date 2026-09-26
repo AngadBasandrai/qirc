@@ -276,6 +276,12 @@ impl<'a> Lowerer<'a> {
     }
 
     fn execute_function(&mut self, function: &'a ast::Function) -> Option<Binding> {
+        let positions: HashMap<&str, usize> = function
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.label.as_str(), index))
+            .collect();
         let mut current = 0usize;
         let mut previous: Option<String> = None;
 
@@ -359,8 +365,8 @@ impl<'a> Lowerer<'a> {
             };
 
             previous = Some(block.label.clone());
-            match function.blocks.iter().position(|b| b.label == next_label) {
-                Some(index) => current = index,
+            match positions.get(next_label.as_str()) {
+                Some(&index) => current = index,
                 None => {
                     self.bailed = true;
                     return None;
@@ -567,13 +573,13 @@ impl<'a> Lowerer<'a> {
                 })
             }
 
-            ast::InstKind::FCmp { pred, lhs, rhs, .. } => {
-                self.assign_pair(inst, Scalar::Double, Scalar::Bool, lhs, rhs, |lhs, rhs| {
-                    Expr::FCmp {
-                        pred: *pred,
-                        lhs,
-                        rhs,
-                    }
+            ast::InstKind::FCmp { pred, ty, lhs, rhs } => {
+                let ty = Scalar::of(ty);
+                self.assign_pair(inst, ty, Scalar::Bool, lhs, rhs, |lhs, rhs| Expr::FCmp {
+                    pred: *pred,
+                    ty,
+                    lhs,
+                    rhs,
                 })
             }
 

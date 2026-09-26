@@ -206,7 +206,7 @@ $ qirc diff tests/corpus/qsharp_teleport.ll -O3 --gates rz-sx-cx --resynth 4
 equivalent: 8 outcomes agree in probability and final state
 ```
 
-Branches below a probability of 1e-12 are pruned and the search stops after 4096 paths, so loops that repeat until success are checked up to a stated remainder. With `--coupling` only the outcome probabilities are compared, because routing moves qubits.
+Branches below a probability of 1e-12 are pruned and the search stops after 20,000 runs, most probable branches first. When the unexplored probability is above 1e-9 the result is reported as inconclusive and the exit code is 2, so a loop that repeats until success is checked up to a stated remainder. With `--coupling` only the outcome probabilities are compared, because routing moves qubits.
 
 ## Simulator
 

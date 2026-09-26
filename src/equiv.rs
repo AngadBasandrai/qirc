@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::ir::Program;
 use crate::simulator::exec;
@@ -6,7 +6,7 @@ use crate::simulator::matrix::C64;
 use crate::simulator::state::State;
 
 const PRUNE: f64 = 1e-12;
-const MAX_PATHS: usize = 4096;
+const MAX_RUNS: usize = 20_000;
 const TOLERANCE: f64 = 1e-9;
 
 pub struct Branch {
@@ -23,14 +23,15 @@ pub struct Outcomes {
 pub fn explore(program: &Program) -> Outcomes {
     let mut branches: BTreeMap<String, Branch> = BTreeMap::new();
     let mut unexplored = 0.0;
-    let mut pending = vec![(Vec::new(), 1.0)];
-    let mut paths = 0;
+    let mut pending = VecDeque::from([(Vec::new(), 1.0)]);
+    let mut runs = 0;
 
-    while let Some((script, weight)) = pending.pop() {
-        if paths == MAX_PATHS {
+    while let Some((script, weight)) = pending.pop_front() {
+        if runs == MAX_RUNS {
             unexplored += weight;
             continue;
         }
+        runs += 1;
 
         let mut state = State::new(program.num_qubits as usize);
         let mut fork = None;
@@ -55,12 +56,11 @@ pub fn explore(program: &Program) -> Outcomes {
                 }
                 let mut longer = script.clone();
                 longer.push(outcome);
-                pending.push((longer, next));
+                pending.push_back((longer, next));
             }
             continue;
         }
 
-        paths += 1;
         if run.aborted {
             unexplored += weight;
             continue;

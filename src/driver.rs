@@ -486,34 +486,41 @@ fn diff(options: &Options) -> i32 {
     );
     let differences = equiv::compare(&a, &b, states);
 
-    if differences.is_empty() {
-        let checked = if states {
-            "probability and final state"
-        } else {
-            "probability"
-        };
-        let count = a.branches.len();
-        let noun = if count == 1 {
-            "outcome agrees"
-        } else {
-            "outcomes agree"
-        };
-        println!("equivalent: {count} {noun} in {checked}");
+    let unexplored = a.unexplored.max(b.unexplored);
+    let complete = unexplored <= 1e-9;
+    let count = a.branches.len();
+    let noun = if count == 1 {
+        "outcome agrees"
     } else {
+        "outcomes agree"
+    };
+    let checked = if states {
+        "probability and final state"
+    } else {
+        "probability"
+    };
+
+    if !differences.is_empty() {
         println!("different:");
         for difference in differences.iter().take(8) {
             println!("  {difference}");
         }
+    } else if complete {
+        println!("equivalent: {count} {noun} in {checked}");
+    } else {
+        println!(
+            "inconclusive: {count} {noun} in {checked}, but {unexplored:.2e} of the probability was not explored"
+        );
     }
     if !states {
         println!("note: final states are not compared because --coupling moves qubits");
     }
-    let unexplored = a.unexplored.max(b.unexplored);
-    if unexplored > 1e-9 {
-        println!("note: {unexplored:.2e} of the probability was not explored");
-    }
 
-    i32::from(!differences.is_empty())
+    match (differences.is_empty(), complete) {
+        (false, _) => 1,
+        (true, true) => 0,
+        (true, false) => 2,
+    }
 }
 
 pub fn run(options: Options) -> i32 {
