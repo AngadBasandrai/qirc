@@ -1,4 +1,5 @@
 /target
 /web/target
 /web/qirc.wasm
+/python/target
 __pycache__/

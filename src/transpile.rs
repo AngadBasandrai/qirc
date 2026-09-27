@@ -76,6 +76,13 @@ impl GateSet {
         Ok(self)
     }
 
+    pub fn local(mut self) -> GateSet {
+        self.gates
+            .retain(|&(kind, controls)| kind.arity() + controls <= 2);
+        self.name = format!("{} on one and two qubits", self.name);
+        self
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }

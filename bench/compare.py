@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import math
 import subprocess
 import sys
@@ -209,16 +210,9 @@ def run_tket(circuit, line):
     SequencePass(passes).apply(tk)
     elapsed = time.perf_counter() - started
     ops = ops_of_tket(tk)
-    ok = None
-    if checkable(circuit, line):
-        moved = {a.index[0]: b.index[0] for a, b in tk.implicit_qubit_permutation().items()}
-        pattern = [moved.get(q, q) for q in range(circuit.num_qubits)]
-        target = Operator(circuit)
-        ok = False
-        for order in (pattern, [pattern.index(q) for q in range(len(pattern))]):
-            candidate = circuit_of(ops, circuit.num_qubits)
-            candidate.append(PermutationGate(order), range(circuit.num_qubits))
-            ok = ok or Operator(candidate).equiv(target)
+    moved = {a.index[0]: b.index[0] for a, b in tk.implicit_qubit_permutation().items()}
+    pattern = [moved.get(q, q) for q in range(circuit.num_qubits)]
+    ok = permuted(circuit, ops, pattern) if checkable(circuit, line) else None
     return ops, elapsed, ok
 
 
@@ -228,7 +222,7 @@ def run_qirc(circuit, line, binary, flags):
     with tempfile.TemporaryDirectory() as folder:
         source = Path(folder) / "input.ll"
         source.write_text(qir_of(ops, n))
-        command = [str(binary), str(source), "--emit", "json", *flags]
+        command = [str(binary), str(source), "--emit", "json", "-v", *flags]
         if line:
             command += ["--coupling", f"line:{n}"]
         started = time.perf_counter()
@@ -237,8 +231,20 @@ def run_qirc(circuit, line, binary, flags):
     if done.returncode != 0:
         raise RuntimeError(done.stderr)
     ops = ops_of_qirc(json.loads(done.stdout))
-    ok = Operator(circuit_of(ops, n)).equiv(Operator(circuit)) if checkable(circuit, line) else None
+    layout = re.search(r"relabelling removed \d+ swap\(s\), final layout \[([\d, ]*)\]", done.stderr)
+    pattern = [int(q) for q in layout.group(1).split(",")] if layout else list(range(n))
+    ok = permuted(circuit, ops, pattern) if checkable(circuit, line) else None
     return ops, elapsed, ok
+
+
+def permuted(original, ops, pattern):
+    target = Operator(original)
+    for order in (pattern, [pattern.index(q) for q in range(len(pattern))]):
+        candidate = circuit_of(ops, original.num_qubits)
+        candidate.append(PermutationGate(order), range(original.num_qubits))
+        if Operator(candidate).equiv(target):
+            return True
+    return False
 
 
 def checkable(circuit, line):
@@ -247,7 +253,13 @@ def checkable(circuit, line):
 
 def corpus(binary):
     found = []
-    for path in sorted([*ROOT.glob("tests/corpus/*.ll"), *ROOT.glob("examples/*.ll")]):
+    tracked = subprocess.run(
+        ["git", "ls-files", "tests/corpus/*.ll", "examples/*.ll"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    for path in sorted(ROOT / name for name in tracked):
         done = subprocess.run(
             [str(binary), str(path), "--emit", "json", "-O0"], capture_output=True, text=True
         )
@@ -278,7 +290,10 @@ def main():
     parser.add_argument("--flags", action="append")
     options = parser.parse_args()
     binary = Path(options.qirc)
-    configs = options.flags or ["-O3 --gates rz-sx-cx --resynth 4", "-O3 --gates rz-sx-cx --resynth 4 --cost cx"]
+    configs = options.flags or [
+        "-O3 --gates rz-sx-cx --resynth 4 --relabel",
+        "-O3 --gates rz-sx-cx --resynth 4 --relabel --cost cx",
+    ]
 
     circuits = corpus(binary)
     circuits += [(f"qft_{n}", qft(n)) for n in (4, 6, 8, 10)]

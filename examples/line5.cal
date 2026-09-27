@@ -1,0 +1,15 @@
+# a five qubit line with one poor coupler, error rates per operation
+cx 0 1 0.041
+cx 1 2 0.006
+cx 2 3 0.007
+cx 3 4 0.005
+single 0 0.0004
+single 1 0.0003
+single 2 0.0002
+single 3 0.0003
+single 4 0.0005
+readout 0 0.031
+readout 1 0.012
+readout 2 0.009
+readout 3 0.015
+readout 4 0.022

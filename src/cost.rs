@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use crate::calibration::Calibration;
 use crate::ir::*;
 
 const MAX_PATHS: usize = 256;
@@ -12,15 +13,20 @@ pub struct Tally {
     pub gates: usize,
     pub depth: usize,
     pub live: usize,
+    pub success: Option<f64>,
 }
 
 impl Tally {
-    fn of<'a>(blocks: impl Iterator<Item = &'a Block>) -> Tally {
-        let mut tally = Tally::default();
+    fn of<'a>(blocks: impl Iterator<Item = &'a Block>, calibration: Option<&Calibration>) -> Tally {
+        let blocks: Vec<&Block> = blocks.collect();
+        let mut tally = Tally {
+            success: calibration.map(|c| (-c.infidelity(blocks.iter().flat_map(|b| &b.ops))).exp()),
+            ..Tally::default()
+        };
         let mut frontier: HashMap<QubitId, usize> = HashMap::new();
         let mut open: HashMap<QubitId, usize> = HashMap::new();
         let mut intervals = Vec::new();
-        for op in blocks.flat_map(|b| &b.ops) {
+        for op in blocks.iter().flat_map(|b| &b.ops) {
             let qubits = op.qubits();
             let Some(layer) = qubits
                 .iter()
@@ -61,6 +67,10 @@ impl Tally {
             gates: self.gates.max(other.gates),
             depth: self.depth.max(other.depth),
             live: self.live.max(other.live),
+            success: match (self.success, other.success) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
         }
     }
 }
@@ -108,22 +118,27 @@ fn frame(program: &Program, block: BlockId) -> Frame {
     }
 }
 
-fn path(program: &Program, frames: &[Frame], again: Option<BlockId>) -> Path {
+fn path(
+    program: &Program,
+    frames: &[Frame],
+    again: Option<BlockId>,
+    calibration: Option<&Calibration>,
+) -> Path {
     let label = |id: BlockId| program.block(id).label.clone();
     Path {
         labels: frames.iter().map(|f| label(f.block)).collect(),
         again: again.map(label),
-        tally: Tally::of(frames.iter().map(|f| program.block(f.block))),
+        tally: Tally::of(frames.iter().map(|f| program.block(f.block)), calibration),
     }
 }
 
-pub fn analyse(program: &Program) -> Report {
+pub fn analyse(program: &Program, calibration: Option<&Calibration>) -> Report {
     let mut paths = Vec::new();
     let mut truncated = false;
     let mut frames = vec![frame(program, program.entry)];
     let mut on_path = HashSet::from([program.entry]);
     if frames[0].successors.is_empty() {
-        paths.push(path(program, &frames, None));
+        paths.push(path(program, &frames, None, calibration));
     }
 
     while let Some(top) = frames.last_mut() {
@@ -146,7 +161,7 @@ pub fn analyse(program: &Program) -> Report {
             truncated = true;
             break;
         }
-        paths.push(path(program, &frames, again.then_some(next)));
+        paths.push(path(program, &frames, again.then_some(next), calibration));
     }
 
     let worst = paths
@@ -179,17 +194,26 @@ impl fmt::Display for Report {
             .unwrap_or(0)
             .max("worst listed".len());
         let row = |f: &mut fmt::Formatter<'_>, name: &str, t: &Tally| {
-            writeln!(
+            write!(
                 f,
                 "{name:<width$}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
                 t.t, t.cx, t.gates, t.depth, t.live
-            )
+            )?;
+            match t.success {
+                Some(success) => writeln!(f, "  {success:>8.4}"),
+                None => writeln!(f),
+            }
         };
-        writeln!(
+        write!(
             f,
             "{:<width$}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
             "path", "t", "cx", "gates", "depth", "live"
         )?;
+        if self.worst.success.is_some() {
+            writeln!(f, "  {:>8}", "success")?;
+        } else {
+            writeln!(f)?;
+        }
         for (name, p) in names.iter().zip(&self.paths) {
             row(f, name, &p.tally)?;
         }

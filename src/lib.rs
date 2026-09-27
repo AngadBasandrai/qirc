@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod calibration;
 pub mod codegen;
 pub mod cost;
 pub mod diag;
@@ -12,6 +13,7 @@ pub mod lower;
 pub mod opt;
 pub mod parse;
 pub mod qis;
+mod qsd;
 pub mod route;
 pub mod sema;
 pub mod simulator;

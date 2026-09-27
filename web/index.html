@@ -432,6 +432,12 @@ footer a { color: var(--accent); }
         <option value="grid:4x4">grid:4x4</option>
       </select>
     </label>
+    <label class="field" for="relabel">Relabel
+      <select id="relabel">
+        <option value="">off</option>
+        <option value="on">on</option>
+      </select>
+    </label>
     <label class="field" for="shots" id="shots-field">Shots
       <input id="shots" type="number" min="0" max="100000" step="100" value="500">
     </label>
@@ -883,7 +889,7 @@ onmessage = async (event) => {
 `;
 
 const EMITS = ["run", "circuit", "qasm3", "qir", "ir", "json", "cost", "diff"];
-const CONTROLS = ["opt", "gates", "resynth", "cost", "coupling", "shots", "seed"];
+const CONTROLS = ["opt", "gates", "resynth", "cost", "coupling", "relabel", "shots", "seed"];
 const EXTENSIONS = { qasm3: "qasm", qir: "ll", json: "json", ir: "txt", circuit: "txt", cost: "txt", run: "txt", diff: "txt" };
 const MAX_HIGHLIGHT = 400000;
 const MAX_DRAWN = 4000;
@@ -1062,6 +1068,7 @@ function commandFromControls() {
   if ($("resynth").value) parts.push("--resynth", $("resynth").value);
   if ($("cost").value !== "gates") parts.push("--cost", $("cost").value);
   if ($("coupling").value) parts.push("--coupling", $("coupling").value);
+  if ($("relabel").value) parts.push("--relabel");
   if (emit === "run") parts.push("--shots", $("shots").value || "0", "--seed", $("seed").value || "0");
   return parts.join(" ");
 }

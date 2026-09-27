@@ -26,6 +26,7 @@ declare void @__quantum__qis__s__body(%Qubit*)
 declare void @__quantum__qis__rz__body(double, %Qubit*)
 declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
 declare void @__quantum__qis__cz__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__swap__body(%Qubit*, %Qubit*)
 declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
 
 attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"3\" \"required_num_results\"=\"0\" }}
@@ -277,7 +278,7 @@ attributes #0 = { \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"requir
 }
 
 #[test]
-fn routed_states() {
+fn moved_states() {
     let mut seed = 11u64;
     let mut next = |bound: u32| {
         seed = seed
@@ -285,31 +286,37 @@ fn routed_states() {
             .wrapping_add(1442695040888963407);
         ((seed >> 33) % u64::from(bound)) as u32
     };
-    for coupling in ["line:6", "grid:2x3", "ring:6"] {
+    for coupling in [None, Some("line:6"), Some("grid:2x3"), Some("ring:6")] {
         let mut body = String::new();
-        for _ in 0..30 {
+        for step in 0..30 {
             let a = next(5);
             let b = (a + 1 + next(4)) % 5;
             body += &call("h", &[a]);
             body += &call("t", &[b]);
-            body += &call("cx", &[a, b]);
+            body += &call(if step % 3 == 0 { "swap" } else { "cx" }, &[a, b]);
         }
         let source = module(&body).replace(
             "\"required_num_qubits\"=\"3\"",
             "\"required_num_qubits\"=\"5\"",
         );
         let original = common::final_state(&compile(&source, 0));
-        let routed = driver::compile_for(
+        let compiled = driver::compile_for(
             &source,
-            0,
+            2,
             false,
             &Target {
-                coupling: Coupling::parse(coupling),
+                coupling: coupling.and_then(Coupling::parse),
+                relabel: true,
                 ..Default::default()
             },
         );
-        let layout = routed.routed.unwrap().final_layout;
-        let state = common::final_state(&routed.program);
+        let relabelled = compiled.relabelled.unwrap();
+        assert!(relabelled.swaps_removed > 0);
+        let layout = match compiled.routed {
+            Some(routed) => routed.final_layout,
+            None => relabelled.final_layout,
+        };
+        let state = common::final_state(&compiled.program);
         let mut overlap = C64::new(0.0, 0.0);
         for logical in 0..original.len() {
             let physical: usize = (0..5)
@@ -320,7 +327,7 @@ fn routed_states() {
         }
         assert!(
             (overlap.norm() - 1.0).abs() < 1e-9,
-            "{coupling}: overlap {}",
+            "{coupling:?}: overlap {}",
             overlap.norm()
         );
     }

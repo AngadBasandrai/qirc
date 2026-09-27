@@ -1,14 +1,25 @@
 [package]
-name = "qirc"
+name = "qirc-compiler"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Compiler and state vector simulator for QIR, the Quantum Intermediate Representation"
 license = "MIT"
 repository = "https://github.com/AngadBasandrai/qirc"
+homepage = "https://angadbasandrai.github.io/qirc/"
+documentation = "https://docs.rs/qirc-compiler"
 readme = "README.md"
 keywords = ["quantum", "qir", "compiler", "llvm", "simulator"]
 categories = ["compilers", "science", "simulation"]
+include = ["/src", "/tests", "/examples/repeat_until_success.ll", "/README.md", "/LICENSE"]
+
+[lib]
+name = "qirc"
+
+[[bin]]
+name = "qirc"
+path = "src/main.rs"
+doc = false
 
 [dependencies]
 num-complex = "0.4"

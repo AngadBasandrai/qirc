@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::mem;
 
+use crate::calibration::Calibration;
 use crate::diag::Span;
 use crate::ir::*;
 
@@ -211,9 +212,12 @@ const LOOKAHEAD: usize = 20;
 const LOOKAHEAD_WEIGHT: f64 = 0.5;
 const LOOKAHEAD_FADE: f64 = 0.9;
 const ABSORB: f64 = 0.25;
+const EDGE_WEIGHT: f64 = 0.3;
 const DECAY: f64 = 0.001;
-const TRIALS: usize = 8;
-const TRIAL_OPS: usize = 20_000;
+const TRIALS: usize = 16;
+const LAYOUT_ROUNDS: usize = 2;
+const JITTER: f64 = 0.05;
+const TRIAL_BUDGET: usize = 160_000;
 
 struct Layout {
     physical: Vec<usize>,
@@ -243,13 +247,38 @@ impl Layout {
 struct Router<'a> {
     coupling: &'a Coupling,
     distance: Vec<Vec<usize>>,
+    weight: Vec<Vec<f64>>,
     swaps: usize,
+    cost: usize,
+    jitter: f64,
+    noise: u64,
 }
 
 impl Router<'_> {
+    fn random(&mut self) -> f64 {
+        self.noise = self
+            .noise
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.noise >> 11) as f64 / (1u64 << 53) as f64
+    }
+
     fn swap(&mut self, layout: &mut Layout, a: usize, b: usize, span: Span, out: &mut Vec<Op>) {
+        self.merge(layout, a, b, false, span, out);
+    }
+
+    fn merge(
+        &mut self,
+        layout: &mut Layout,
+        a: usize,
+        b: usize,
+        merged: bool,
+        span: Span,
+        out: &mut Vec<Op>,
+    ) {
         layout.swap(a, b);
         self.swaps += 1;
+        self.cost += if merged { 1 } else { 3 };
         out.push(Op::Gate(Gate {
             kind: GateKind::Swap,
             controls: Vec::new(),
@@ -366,8 +395,10 @@ impl Router<'_> {
                         } else {
                             0.0
                         };
-                        let score = (self.score((from, to), &blocked, &upcoming) - absorbed)
-                            * decay[from].max(decay[to]);
+                        let edge = EDGE_WEIGHT * (self.weight[from][to] - 1.0);
+                        let score = (self.score((from, to), &blocked, &upcoming) + edge - absorbed)
+                            * decay[from].max(decay[to])
+                            * (1.0 + self.jitter * self.random());
                         if best.is_none_or(|(_, s)| score < s) {
                             best = Some(((from, to), score));
                         }
@@ -377,7 +408,8 @@ impl Router<'_> {
             let Some(((a, b), _)) = best else {
                 return Err("the coupling map has no edge to move a qubit along".into());
             };
-            self.swap(layout, a, b, span, out);
+            let merged = partner[a] == Some(b);
+            self.merge(layout, a, b, merged, span, out);
             partner[a] = None;
             partner[b] = None;
             decay[a] += DECAY;
@@ -433,7 +465,7 @@ impl Router<'_> {
         let total = |pairs: &[(usize, usize)], fade: f64| {
             let (mut sum, mut norm, mut weight) = (0.0, 0.0, 1.0);
             for &(x, y) in pairs {
-                sum += weight * self.distance[moved(x)][moved(y)] as f64;
+                sum += weight * self.weight[moved(x)][moved(y)];
                 norm += weight;
                 weight *= fade;
             }
@@ -473,10 +505,15 @@ fn pair(op: &Op, layout: &Layout) -> Option<(usize, usize)> {
 }
 
 fn place(op: Op, layout: &Layout) -> Op {
+    remap(op, |q| layout.at(q))
+}
+
+fn remap(op: Op, wire: impl Fn(QubitId) -> usize) -> Op {
+    let moved = |q: QubitId| QubitId(wire(q) as u32);
     match op {
         Op::Gate(mut gate) => {
             for q in gate.controls.iter_mut().chain(gate.targets.iter_mut()) {
-                *q = QubitId(layout.at(*q) as u32);
+                *q = moved(*q);
             }
             Op::Gate(gate)
         }
@@ -485,12 +522,12 @@ fn place(op: Op, layout: &Layout) -> Op {
             result,
             span,
         } => Op::Measure {
-            qubit: QubitId(layout.at(qubit) as u32),
+            qubit: moved(qubit),
             result,
             span,
         },
         Op::Reset { qubit, span } => Op::Reset {
-            qubit: QubitId(layout.at(qubit) as u32),
+            qubit: moved(qubit),
             span,
         },
         other => other,
@@ -524,11 +561,13 @@ fn layout_pass(router: &mut Router, gates: &[Op], start: Vec<usize>) -> Result<V
 struct Routed {
     blocks: Vec<Vec<Op>>,
     swaps: usize,
+    cost: usize,
     final_layout: Vec<usize>,
 }
 
 fn attempt(router: &mut Router, program: &Program, start: Vec<usize>) -> Result<Routed, String> {
     router.swaps = 0;
+    router.cost = 0;
     let home = Layout::new(start);
     let mut final_layout = home.physical.clone();
     let straight = program.blocks.len() == 1;
@@ -559,6 +598,7 @@ fn attempt(router: &mut Router, program: &Program, start: Vec<usize>) -> Result<
     Ok(Routed {
         blocks,
         swaps: router.swaps,
+        cost: router.cost,
         final_layout,
     })
 }
@@ -588,7 +628,55 @@ fn starts(qubits: usize, trials: usize) -> Vec<Vec<usize>> {
         .collect()
 }
 
-pub fn route(program: &mut Program, coupling: &Coupling) -> Result<RouteStats, String> {
+fn weights(coupling: &Coupling, calibration: Option<&Calibration>) -> Vec<Vec<f64>> {
+    let hops = coupling.distances();
+    let Some(calibration) = calibration else {
+        return hops
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|&d| {
+                        if d == usize::MAX {
+                            f64::INFINITY
+                        } else {
+                            d as f64
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+    };
+    let loss = |a: usize, b: usize| -(-calibration.cx(a, b)).ln_1p();
+    let mean = coupling.edges.iter().map(|&(a, b)| loss(a, b)).sum::<f64>()
+        / coupling.edges.len().max(1) as f64;
+    let n = coupling.qubits;
+    let mut weight = vec![vec![f64::INFINITY; n]; n];
+    for (q, row) in weight.iter_mut().enumerate() {
+        row[q] = 0.0;
+    }
+    for &(a, b) in &coupling.edges {
+        let w = if mean > 0.0 { loss(a, b) / mean } else { 1.0 };
+        weight[a][b] = weight[a][b].min(w);
+        weight[b][a] = weight[b][a].min(w);
+    }
+    for k in 0..n {
+        for i in 0..n {
+            for j in 0..n {
+                let through = weight[i][k] + weight[k][j];
+                if through < weight[i][j] {
+                    weight[i][j] = through;
+                }
+            }
+        }
+    }
+    weight
+}
+
+pub fn route(
+    program: &mut Program,
+    coupling: &Coupling,
+    calibration: Option<&Calibration>,
+) -> Result<RouteStats, String> {
     if (program.num_qubits as usize) > coupling.qubits {
         return Err(format!(
             "the program needs {} qubits but the coupling map has {}",
@@ -610,7 +698,11 @@ pub fn route(program: &mut Program, coupling: &Coupling) -> Result<RouteStats, S
     let mut router = Router {
         coupling,
         distance: coupling.distances(),
+        weight: weights(coupling, calibration),
         swaps: 0,
+        cost: 0,
+        jitter: 0.0,
+        noise: 0,
     };
 
     let quantum: Vec<Op> = program
@@ -619,18 +711,22 @@ pub fn route(program: &mut Program, coupling: &Coupling) -> Result<RouteStats, S
         .cloned()
         .collect();
     let reversed: Vec<Op> = quantum.iter().rev().cloned().collect();
-    let trials = if program.op_count() <= TRIAL_OPS {
-        TRIALS
-    } else {
-        1
-    };
+    let trials = (TRIAL_BUDGET / program.op_count().max(1)).clamp(1, TRIALS);
 
     let mut best: Option<Routed> = None;
-    for start in starts(coupling.qubits, trials) {
-        let forward = layout_pass(&mut router, &quantum, start)?;
-        let backward = layout_pass(&mut router, &reversed, forward)?;
-        let routed = attempt(&mut router, program, backward)?;
-        if best.as_ref().is_none_or(|b| routed.swaps < b.swaps) {
+    for (trial, mut layout) in starts(coupling.qubits, trials).into_iter().enumerate() {
+        router.jitter = if trial == 0 { 0.0 } else { JITTER };
+        router.noise = trial as u64;
+        for _ in 0..LAYOUT_ROUNDS {
+            layout = layout_pass(&mut router, &quantum, layout)?;
+            layout = layout_pass(&mut router, &reversed, layout)?;
+        }
+        let routed = attempt(&mut router, program, layout)?;
+        let rank = |r: &Routed| match calibration {
+            Some(calibration) => (calibration.infidelity(r.blocks.iter().flatten()), r.swaps),
+            None => (r.cost as f64, r.swaps),
+        };
+        if best.as_ref().is_none_or(|b| rank(&routed) < rank(b)) {
             best = Some(routed);
         }
     }
@@ -647,6 +743,56 @@ pub fn route(program: &mut Program, coupling: &Coupling) -> Result<RouteStats, S
         swaps_inserted: best.swaps,
         final_layout: best.final_layout,
     })
+}
+
+#[derive(Debug)]
+pub struct Relabelled {
+    pub swaps_removed: usize,
+    pub final_layout: Vec<usize>,
+}
+
+impl fmt::Display for Relabelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "relabelling removed {} swap(s), final layout {:?}",
+            self.swaps_removed, self.final_layout
+        )
+    }
+}
+
+pub fn elide_swaps(program: &mut Program) -> Relabelled {
+    let qubits = program.num_qubits as usize;
+    let straight = program.blocks.len() == 1;
+    let mut swaps_removed = 0;
+    let mut final_layout: Vec<usize> = (0..qubits).collect();
+
+    for block in &mut program.blocks {
+        if !matches!(block.term, Term::Ret(_) | Term::Unreachable) {
+            continue;
+        }
+        let mut wire: Vec<usize> = (0..qubits).collect();
+        for op in mem::take(&mut block.ops) {
+            if let Op::Gate(gate) = &op
+                && gate.kind == GateKind::Swap
+                && gate.controls.is_empty()
+                && let [a, b] = gate.targets[..]
+            {
+                wire.swap(a.index(), b.index());
+                swaps_removed += 1;
+                continue;
+            }
+            block.ops.push(remap(op, |q| wire[q.index()]));
+        }
+        if straight {
+            final_layout = wire;
+        }
+    }
+
+    Relabelled {
+        swaps_removed,
+        final_layout,
+    }
 }
 
 pub fn respects(program: &Program, coupling: &Coupling) -> bool {
@@ -721,7 +867,7 @@ mod tests {
     #[test]
     fn adjacent() {
         let mut program = line_program(&[(0, 1), (1, 2)], 3);
-        let stats = route(&mut program, &Coupling::line(3)).unwrap();
+        let stats = route(&mut program, &Coupling::line(3), None).unwrap();
         assert_eq!(stats.swaps_inserted, 0);
         assert!(respects(&program, &Coupling::line(3)));
     }
@@ -731,7 +877,7 @@ mod tests {
         let coupling = Coupling::line(5);
         let mut program = line_program(&[(0, 1), (0, 2), (0, 3), (0, 4)], 5);
 
-        let stats = route(&mut program, &coupling).unwrap();
+        let stats = route(&mut program, &coupling, None).unwrap();
         assert!((1..=4).contains(&stats.swaps_inserted), "{stats}");
         assert!(respects(&program, &coupling));
         assert_eq!(program.gate_count(), 4 + stats.swaps_inserted);
@@ -750,7 +896,7 @@ mod tests {
         });
         program.blocks[0].term = Term::Br(BlockId(1));
 
-        route(&mut program, &coupling).unwrap();
+        route(&mut program, &coupling, None).unwrap();
         assert!(respects(&program, &coupling));
     }
 
@@ -772,7 +918,7 @@ mod tests {
             span: Span::DUMMY,
         });
 
-        let message = route(&mut program, &Coupling::line(3)).unwrap_err();
+        let message = route(&mut program, &Coupling::line(3), None).unwrap_err();
         assert!(message.contains("acts on 3 qubits"), "{message}");
     }
 
@@ -780,7 +926,7 @@ mod tests {
     fn small_device() {
         let mut program = line_program(&[(0, 1)], 4);
         assert!(
-            route(&mut program, &Coupling::line(2))
+            route(&mut program, &Coupling::line(2), None)
                 .unwrap_err()
                 .contains("needs 4 qubits")
         );

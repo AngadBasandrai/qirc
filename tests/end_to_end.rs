@@ -3,6 +3,7 @@ mod common;
 use std::f64::consts::FRAC_PI_8;
 
 use common::{compile, errors, final_state, run};
+use qirc::calibration::Calibration;
 use qirc::codegen;
 use qirc::cost;
 use qirc::diag::Severity;
@@ -1111,7 +1112,7 @@ declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
 
 attributes #0 = { \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"2\" \"required_num_results\"=\"2\" }
 ";
-    let report = cost::analyse(&compile(source, 0));
+    let report = cost::analyse(&compile(source, 0), None);
     assert_eq!(report.paths.len(), 1);
     assert_eq!(
         report.worst,
@@ -1121,13 +1122,14 @@ attributes #0 = { \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_n
             gates: 4,
             depth: 5,
             live: 2,
+            success: None,
         }
     );
 }
 
 #[test]
 fn cost_paths() {
-    let report = cost::analyse(&compile(TELEPORT, 0));
+    let report = cost::analyse(&compile(TELEPORT, 0), None);
     assert_eq!(report.paths.len(), 4);
     assert!(
         report
@@ -1138,10 +1140,10 @@ fn cost_paths() {
     let most = report.paths.iter().map(|p| p.tally.gates).max();
     assert_eq!(Some(report.worst.gates), most);
 
-    let looping = cost::analyse(&compile(
-        include_str!("../examples/repeat_until_success.ll"),
-        1,
-    ));
+    let looping = cost::analyse(
+        &compile(include_str!("../examples/repeat_until_success.ll"), 1),
+        None,
+    );
     assert!(
         looping
             .paths
@@ -1149,4 +1151,49 @@ fn cost_paths() {
             .any(|p| p.again.as_deref() == Some("attempt"))
     );
     assert!(looping.to_string().contains("attempt again"));
+}
+
+#[test]
+fn noisy_edges() {
+    let body: String = (0..20)
+        .map(|_| "  call void @__quantum__qis__cnot__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*))
+")
+        .collect();
+    let source = format!(
+        "%Qubit = type opaque
+define void @main() #0 {{
+entry:
+{body}  ret void
+}}
+declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
+attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"2\" }}
+"
+    );
+    let calibration =
+        Calibration::parse("cx 0 1 0.3\ncx 1 2 0.005\ncx 2 3 0.005\ncx 3 4 0.005").unwrap();
+    let compiled = |calibration: Option<Calibration>| {
+        driver::compile_for(
+            &source,
+            0,
+            false,
+            &driver::Target {
+                coupling: Some(Coupling::line(5)),
+                calibration,
+                ..Default::default()
+            },
+        )
+        .program
+    };
+    let aware = compiled(Some(calibration.clone()));
+    assert!(aware.gates().all(|g| {
+        let wires: Vec<usize> = g.wires().map(|q| q.index()).collect();
+        wires != [0, 1] && wires != [1, 0]
+    }));
+    let success = |program: &Program| {
+        cost::analyse(program, Some(&calibration))
+            .worst
+            .success
+            .unwrap()
+    };
+    assert!(success(&aware) > success(&compiled(None)) + 0.5);
 }

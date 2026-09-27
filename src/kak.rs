@@ -83,7 +83,7 @@ fn canonical(coordinates: [f64; 3]) -> Unitary {
     m.after(&diagonal(phases)).after(&m.adjoint())
 }
 
-fn det(u: &Unitary) -> C64 {
+pub(crate) fn det(u: &Unitary) -> C64 {
     let mut m: Vec<C64> = u.cells.clone();
     let mut result = ONE;
     for col in 0..4 {

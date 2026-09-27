@@ -5,12 +5,15 @@ use crate::codegen::zyz_angles;
 use crate::diag::Span;
 use crate::ir::*;
 use crate::kak::{self, Piece};
+use crate::qsd;
 use crate::simulator::matrix::{C64, Matrix2, matrix_for};
 use crate::transpile::GateSet;
 
 const EPSILON: f64 = 1e-9;
 const MAX_WINDOW: usize = 12;
 const MAX_REACH: usize = 64;
+const MAX_WIDE: usize = 96;
+const MAX_WIDE_REACH: usize = 160;
 const MAX_WORDS: usize = 50_000;
 const SHORT_WORDS: usize = 2_000;
 const WORD_DEPTH: usize = 8;
@@ -685,6 +688,7 @@ struct Pairs {
 }
 
 const PAIR: [QubitId; 2] = [QubitId(0), QubitId(1)];
+const TRIPLE: [QubitId; 3] = [QubitId(0), QubitId(1), QubitId(2)];
 
 impl Pairs {
     fn new(set: &GateSet, fixed_kinds: &[GateKind], depth: usize) -> Pairs {
@@ -929,31 +933,36 @@ impl Search {
                 .synth
                 .one(u.matrix2(), PAIR[0], Span::DUMMY)
                 .filter(|gates| gates.len() <= self.limit),
-            _ => [
+            2 => [
                 self.pairs.find(u, &self.synth, self.limit, self.cost),
-                self.kak(u),
+                kak::synthesize(u).and_then(|pieces| self.build(pieces, &PAIR, u)),
             ]
             .into_iter()
             .flatten()
             .min_by_key(|gates| self.cost.of(gates)),
+            _ => qsd::synthesize(u).and_then(|pieces| self.build(pieces, &TRIPLE, u)),
         };
         self.cache.insert(key, found.clone());
         found
     }
 
-    fn kak(&self, u: &Unitary) -> Option<Vec<Gate>> {
-        if self.limit < 2 && self.cost == Cost::Gates {
+    fn open(&self) -> bool {
+        self.limit >= 2 || self.cost != Cost::Gates
+    }
+
+    fn build(&self, pieces: Vec<Piece>, wires: &[QubitId], u: &Unitary) -> Option<Vec<Gate>> {
+        if !self.open() {
             return None;
         }
-        let parts = kak::synthesize(u)?
+        let parts = pieces
             .into_iter()
             .map(|piece| match piece {
-                Piece::Local(q, m) => self.synth.one(m, PAIR[q], Span::DUMMY),
-                Piece::Cx(c, t) => self.synth.cx(PAIR[c], PAIR[t], Span::DUMMY),
+                Piece::Local(q, m) => self.synth.one(m, wires[q], Span::DUMMY),
+                Piece::Cx(c, t) => self.synth.cx(wires[c], wires[t], Span::DUMMY),
             })
             .collect::<Option<Vec<_>>>()?;
         let gates = parts.concat();
-        Unitary::of(&gates, &PAIR)
+        Unitary::of(&gates, wires)
             .is_some_and(|m| m.same(u))
             .then_some(gates)
     }
@@ -968,15 +977,21 @@ impl Search {
             return None;
         }
 
+        let (cap, reach, width) = if self.open() {
+            (MAX_WIDE, MAX_WIDE_REACH, 3)
+        } else {
+            (MAX_WINDOW, MAX_REACH, 2)
+        };
         let mut suffixes = vec![(
             last,
             wires.clone(),
             Unitary::gate(newest, &wires)?,
             self.cost.of([newest]),
+            usize::from(wires.len() > 1),
         )];
         let mut skipped = Vec::new();
-        for index in (last.saturating_sub(MAX_REACH)..last).rev() {
-            if suffixes.len() == MAX_WINDOW {
+        for index in (last.saturating_sub(reach)..last).rev() {
+            if suffixes.len() == cap {
                 break;
             }
             let qubits = ops[index].qubits();
@@ -988,7 +1003,7 @@ impl Search {
                 break;
             };
             let grown = distinct(wires.iter().copied().chain(gate.wires()));
-            if grown.len() > 2
+            if grown.len() > width
                 || grown
                     .iter()
                     .any(|q| !wires.contains(q) && skipped.contains(q))
@@ -996,9 +1011,10 @@ impl Search {
             {
                 break;
             }
-            let (_, _, later, spent) = &suffixes[suffixes.len() - 1];
+            let (_, _, later, spent, entangled) = &suffixes[suffixes.len() - 1];
             let (a, b) = self.cost.of([gate]);
             let spent = (spent.0 + a, spent.1 + b);
+            let entangled = entangled + usize::from(gate.wires().count() > 1);
             let step = Unitary::gate(gate, &grown)?;
             let product = if grown.len() > wires.len() {
                 later.widen(grown.len()).after(&step)
@@ -1006,11 +1022,17 @@ impl Search {
                 later.after(&step)
             };
             wires = grown;
-            suffixes.push((index, wires.clone(), product, spent));
+            suffixes.push((index, wires.clone(), product, spent, entangled));
         }
 
         for n in (2..=suffixes.len()).rev() {
-            let (_, local, u, spent) = &suffixes[n - 1];
+            let (_, local, u, spent, entangled) = &suffixes[n - 1];
+            let widest = n == suffixes.len() || suffixes[n].1.len() > local.len();
+            if (n > MAX_WINDOW && !widest)
+                || (local.len() == 3 && (!widest || *entangled <= qsd::MAX_CX))
+            {
+                continue;
+            }
             let spent = *spent;
             let Some(found) = self.best(u, local.len()) else {
                 continue;

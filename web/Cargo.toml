@@ -11,7 +11,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-qirc = { path = ".." }
+qirc = { package = "qirc-compiler", path = ".." }
 
 [profile.release]
 lto = true

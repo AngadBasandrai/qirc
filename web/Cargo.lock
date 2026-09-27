@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qirc"
+name = "qirc-compiler"
 version = "0.1.0"
 dependencies = [
  "num-complex",
@@ -37,5 +37,5 @@ dependencies = [
 name = "qirc-web"
 version = "0.1.0"
 dependencies = [
- "qirc",
+ "qirc-compiler",
 ]

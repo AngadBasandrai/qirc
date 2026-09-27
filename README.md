@@ -38,6 +38,17 @@ measurement over 1000 shots (sampled from the final state):
 simulated in 851.600µs
 ```
 
+## Installing
+
+Each release on GitHub carries a prebuilt `qirc` for Linux (x86_64 and arm64), macOS (Intel and Apple silicon) and Windows, and Python wheels for the same platforms.
+
+```
+cargo install qirc-compiler
+pip install qirc
+```
+
+The crate is published as `qirc-compiler` because `qirc` was taken on crates.io. It installs the `qirc` command, and the library is still used as `qirc`.
+
 ## Building
 
 Requires Rust 1.88 or newer.
@@ -63,6 +74,8 @@ qirc diff <a.ll> [b.ll] [options]
   --resynth <n>     replace runs of gates by at most n gates, 1 to 6
   --cost <model>    what resynthesis minimises: gates, cx or ibm
   --coupling <map>  route onto line:N, ring:N, grid:RxC, full:N or 0-1,1-2,...
+  --calibration <f> route by device error rates and estimate success
+  --relabel         remove swaps at the end of the program by permuting qubits
   --shots <n>       sample n measurement outcomes
   --seed <n>        seed the random number generator
   --no-state        do not print the final state vector
@@ -160,7 +173,7 @@ Cancellation, merging and fusion look past gates that commute with the pair, so 
 
 Window resynthesis multiplies out every run of gates on one or two qubits and replaces the run with anything shorter that has the same matrix up to global phase. By default the replacement must be a single gate, so `t t` becomes `s` and three alternating CNOTs become `swap`. `--resynth n` allows replacements of up to `n` gates: single qubit runs use exact Euler angles, and two qubit runs use a meet in the middle search over the target gate set. Every replacement is checked against the original matrix before it is applied.
 
-With `--resynth 2` or more, or any `--cost`, two qubit runs are also rebuilt from their KAK decomposition with the fewest CNOTs the matrix needs: none for a product of single qubit gates, one when it is locally a CNOT, two when one of its three interaction coordinates is zero, and three otherwise. The result can be longer than `n` gates and is kept only when it is cheaper than the run it replaces.
+With `--resynth 2` or more, or any `--cost`, two qubit runs are also rebuilt from their KAK decomposition with the fewest CNOTs the matrix needs: none for a product of single qubit gates, one when it is locally a CNOT, two when one of its three interaction coordinates is zero, and three otherwise. The result can be longer than `n` gates and is kept only when it is cheaper than the run it replaces. In the same mode the window grows to 96 gates: the longest two qubit run gets one KAK attempt, and a three qubit run with more than 21 two qubit gates is rebuilt by quantum Shannon decomposition. That splits the matrix around its top qubit with a cosine sine decomposition into multiplexed rotations and four two qubit blocks, builds the first three blocks only up to a diagonal so each needs two CNOTs, carries each diagonal into the next block, and needs at most 21 CNOTs in total.
 
 `--cost` sets what cheaper means. `gates` counts gates and breaks ties on two qubit gates, `cx` counts two qubit gates first, and `ibm` charges 10 for a two qubit gate, 1 for other single qubit gates and nothing for `rz`, `s`, `t` and other Z rotations, which IBM hardware applies as frame changes.
 
@@ -181,7 +194,11 @@ $ qirc tests/corpus/base_profile_bell.ll --exclude h,cx --emit ir
   ry(-1.5707963267948966) q1
 ```
 
-`--coupling` inserts SWAPs so that every two qubit gate lands on a physical edge, and remaps measurements so results come back under their original labels. The router works on the dependency graph of each block: gates whose qubits are adjacent run as soon as they are ready, and otherwise it picks the SWAP that most shortens the blocked gates plus the next 20, weighted by half and fading with distance, with a small penalty on qubits that were just swapped. A SWAP on a pair that has just run a two qubit gate is preferred, because resynthesis can merge the two. The starting layout comes from routing the circuit forwards and then backwards from eight starting points, keeping the one that needs the fewest SWAPs. After routing, the program is rebuilt in the gate set and resynthesised again. In a program with branches or loops every block starts from the same layout, and a block that jumps elsewhere swaps its qubits back before the jump, so each successor sees the layout it expects.
+`--coupling` inserts SWAPs so that every two qubit gate lands on a physical edge, and remaps measurements so results come back under their original labels. The router works on the dependency graph of each block: gates whose qubits are adjacent run as soon as they are ready, and otherwise it picks the SWAP that most shortens the blocked gates plus the next 20, weighted by half and fading with distance, with a small penalty on qubits that were just swapped. A SWAP on a pair that has just run a two qubit gate is preferred, because resynthesis can merge the two. The starting layout comes from routing the circuit forwards and backwards twice from up to sixteen starting points, with a little random tie breaking in all but the first, and the router keeps the result with the lowest estimated CNOT count, counting a SWAP that resynthesis can merge as one CNOT instead of three. After routing, the program is rebuilt in the gate set and resynthesised again. Gates on three or more qubits are split into one and two qubit gates before routing when no gate set is given.
+
+`--relabel` removes each SWAP near the end of the program by renaming the qubits of everything after it, measurements included, so recorded results are unchanged and only the final state comes out permuted. It is on whenever the program is routed, `-v` prints the final layout, and `qirc diff` then compares outcome probabilities and recorded values but not final states.
+
+`--calibration file` reads device error rates, one per line as `cx a b error`, `single q error` or `readout q error`, and routes onto the coupling map its `cx` lines describe unless `--coupling` is also given. The router then measures distance by the error of each coupler, prefers SWAPs on good couplers and keeps the layout with the highest estimated success probability, and `--emit cost` adds a `success` column with the product of one minus the error of every operation on each path. `examples/line5.cal` describes a five qubit line with one poor coupler. In a program with branches or loops every block starts from the same layout, and a block that jumps elsewhere swaps its qubits back before the jump, so each successor sees the layout it expects.
 
 ```
 $ qirc tests/corpus/qsharp_loop.ll --emit qasm3 --basis rz-sx-cx --coupling line:4
@@ -204,6 +221,22 @@ c[1] = measure q[1];
 c[2] = measure q[2];
 c[3] = measure q[3];
 ```
+
+## Python
+
+`python/` wraps the compiler as a Python module built with PyO3. `pip install ./python` builds it from source.
+
+```python
+import qirc
+
+source = open("tests/corpus/adaptive_teleport.ll").read()
+qasm = qirc.compile(source, emit="qasm3", opt=3, gates="rz-sx-cx", coupling="line:3")
+counts = qirc.run(source, shots=1000, seed=7)
+assert qirc.diff(source, opt=3, gates="rz-sx-cx", resynth=4) == "equivalent"
+worst = qirc.cost(source, gates="rz-sx-cx")["worst"]
+```
+
+`compile` returns the text of any emit kind, `run` returns measurement counts, `diff` returns `"equivalent"`, `"different"` or `"inconclusive"`, and `cost` returns the per path counts from `--emit cost` as dictionaries. Options are keywords with the command line values: `opt`, `gates`, `exclude`, `resynth`, `cost`, `coupling` and `calibration`, plus `relabel=True`. With a calibration, `cost` also reports the estimated `success` probability. Compile errors raise `qirc.CompileError` with the rendered diagnostics, and warnings go through the `warnings` module.
 
 ## Playground
 
@@ -235,9 +268,13 @@ entry > join_x > join_z                         0       2      16      13       
 worst case                                      0       2      18      13       3
 ```
 
+## Releasing
+
+Pushing a tag such as `v0.1.0` runs `.github/workflows/release.yml`, which builds the binaries, the wheels and a source distribution and attaches them to a GitHub release. Publishing to PyPI runs when the repository variable `PUBLISH_PYPI` is `true` and PyPI trusts the workflow, and publishing to crates.io runs when `PUBLISH_CRATES` is `true` and the `CARGO_REGISTRY_TOKEN` secret is set.
+
 ## Benchmarks
 
-`bench/compare.py` compiles the same circuits with Qiskit 2.5 (`transpile` at `optimization_level=3`), tket 2.18 (`FullPeepholeOptimise`, then a rebase and squash) and qirc (`-O3 --gates rz-sx-cx --resynth 4`, with and without `--cost cx`), all to `rz`, `sx`, `x` and `cx`. The circuits are the straight line programs in `tests/corpus` and `examples` with measurements removed, the QFT, Grover search for the all ones state, and the CDKM, VBE and Draper adders from Qiskit. Each cell is two qubit gates / total gates / depth. Every all to all result up to 12 qubits is checked against the input by exact operator comparison, and all of them pass.
+`bench/compare.py` compiles the same circuits with Qiskit 2.5 (`transpile` at `optimization_level=3`), tket 2.18 (`FullPeepholeOptimise`, then a rebase and squash) and qirc (`-O3 --gates rz-sx-cx --resynth 4 --relabel`, with and without `--cost cx`), all to `rz`, `sx`, `x` and `cx`. The circuits are the straight line programs in `tests/corpus` and `examples` with measurements removed, the QFT, Grover search for the all ones state, and the CDKM, VBE and Draper adders from Qiskit. Each cell is two qubit gates / total gates / depth, and the input column counts each Toffoli and SWAP as one gate. Every all to all result up to 12 qubits is checked against the input by exact operator comparison, allowing for the qubit permutation each tool reports, and all of them pass.
 
 All to all connectivity:
 
@@ -245,24 +282,21 @@ All to all connectivity:
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | redundant | 4 | 2 / 13 / 5 | 0 / 3 / 2 | 0 / 3 / 2 | 0 / 3 / 2 | 0 / 3 / 2 |
 | small | 2 | 1 / 3 / 2 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 |
-| star | 4 | 3 / 5 / 4 | 3 / 11 / 10 | 3 / 11 / 10 | 3 / 11 / 10 | 3 / 11 / 10 |
 | pyqir_real | 3 | 1 / 4 / 2 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 |
-| pyqir_simple | 3 | 2 / 12 / 7 | 6 / 27 / 18 | 6 / 36 / 22 | 7 / 23 / 14 | 7 / 23 / 14 |
+| pyqir_simple | 3 | 2 / 12 / 7 | 6 / 27 / 18 | 6 / 36 / 22 | 6 / 24 / 14 | 6 / 24 / 14 |
 | qsharp_loop | 4 | 3 / 4 / 4 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 |
 | unrestricted_dynamic | 5 | 4 / 6 / 5 | 4 / 8 / 7 | 4 / 8 / 7 | 4 / 8 / 7 | 4 / 8 / 7 |
-| qft_4 | 4 | 14 / 36 / 24 | 12 / 33 / 23 | 12 / 33 / 23 | 18 / 41 / 27 | 18 / 41 / 27 |
-| qft_6 | 6 | 33 / 84 / 40 | 30 / 73 / 37 | 30 / 73 / 37 | 39 / 86 / 41 | 39 / 86 / 41 |
-| qft_8 | 8 | 60 / 152 / 56 | 56 / 129 / 51 | 56 / 129 / 51 | 68 / 147 / 55 | 68 / 147 / 55 |
-| qft_10 | 10 | 95 / 240 / 72 | 90 / 201 / 65 | 90 / 201 / 65 | 105 / 224 / 69 | 105 / 224 / 69 |
-| grover_3 | 3 | 4 / 39 / 21 | 24 / 85 / 53 | 20 / 140 / 86 | 24 / 89 / 55 | 24 / 89 / 55 |
+| qft_4 | 4 | 14 / 36 / 24 | 12 / 33 / 23 | 12 / 33 / 23 | 12 / 35 / 24 | 12 / 35 / 24 |
+| qft_6 | 6 | 33 / 84 / 40 | 30 / 73 / 37 | 30 / 73 / 37 | 30 / 77 / 38 | 30 / 77 / 38 |
+| qft_8 | 8 | 60 / 152 / 56 | 56 / 129 / 51 | 56 / 129 / 51 | 56 / 135 / 52 | 56 / 135 / 52 |
+| qft_10 | 10 | 95 / 240 / 72 | 90 / 201 / 65 | 90 / 201 / 65 | 90 / 209 / 66 | 90 / 209 / 66 |
+| grover_3 | 3 | 4 / 39 / 21 | 24 / 85 / 53 | 20 / 140 / 86 | 24 / 89 / 55 | 23 / 154 / 95 |
 | grover_4 | 4 | 84 / 250 / 171 | 84 / 228 / 166 | 84 / 243 / 183 | 84 / 234 / 171 | 84 / 234 / 171 |
 | grover_5 | 5 | 288 / 941 / 681 | 288 / 788 / 607 | 288 / 849 / 662 | 288 / 788 / 603 | 288 / 788 / 603 |
 | adder_cdkm_4 | 9 | 24 / 24 / 21 | 64 / 151 / 114 | 47 / 130 / 88 | 50 / 121 / 88 | 50 / 121 / 88 |
 | adder_vbe_3 | 8 | 13 / 13 / 11 | 37 / 87 / 54 | 37 / 87 / 56 | 37 / 94 / 56 | 37 / 127 / 76 |
-| adder_draper_4 | 8 | 48 / 122 / 74 | 40 / 123 / 67 | 40 / 107 / 57 | 56 / 127 / 79 | 52 / 135 / 78 |
-| total |  |  | 743 / 1963 / 1288 | 722 / 2066 / 1363 | 788 / 2012 / 1291 | 784 / 2053 / 1310 |
-
-Qiskit and tket remove SWAP gates by relabelling the qubits after them and leaving the output permuted. qirc keeps them, because a compiled program must leave the same final state for `qirc diff` to accept it, so the QFT, Draper and `pyqir_simple` rows carry 3 CNOTs for each SWAP. Elsewhere qirc is level with Qiskit on Grover, where tket saves 4 CNOTs on 3 qubits, level with both on VBE, and between them on CDKM with 50 against 47 for tket and 64 for Qiskit. The input column counts each Toffoli and SWAP as one gate.
+| adder_draper_4 | 8 | 48 / 122 / 74 | 40 / 123 / 67 | 40 / 107 / 57 | 44 / 114 / 62 | 40 / 128 / 66 |
+| total |  |  | 740 / 1952 / 1278 | 719 / 2055 / 1353 | 730 / 1947 / 1252 | 725 / 2059 / 1316 |
 
 A line of qubits (`--coupling line:n`, Qiskit `CouplingMap.from_line`, tket `DefaultMappingPass`):
 
@@ -270,26 +304,25 @@ A line of qubits (`--coupling line:n`, Qiskit `CouplingMap.from_line`, tket `Def
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | redundant | 4 | 2 / 13 / 5 | 0 / 3 / 2 | 0 / 3 / 2 | 0 / 3 / 2 | 0 / 3 / 2 |
 | small | 2 | 1 / 3 / 2 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 |
-| star | 4 | 3 / 5 / 4 | 3 / 11 / 10 | 3 / 11 / 10 | 3 / 11 / 10 | 3 / 11 / 10 |
 | pyqir_real | 3 | 1 / 4 / 2 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 |
-| pyqir_simple | 3 | 2 / 12 / 7 | 7 / 37 / 24 | 9 / 39 / 25 | 8 / 24 / 15 | 8 / 25 / 16 |
+| pyqir_simple | 3 | 2 / 12 / 7 | 7 / 37 / 24 | 9 / 39 / 25 | 7 / 25 / 15 | 7 / 26 / 16 |
 | qsharp_loop | 4 | 3 / 4 / 4 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 |
 | unrestricted_dynamic | 5 | 4 / 6 / 5 | 8 / 12 / 11 | 11 / 15 / 11 | 6 / 10 / 9 | 6 / 10 / 9 |
-| qft_4 | 4 | 14 / 36 / 24 | 19 / 49 / 33 | 24 / 45 / 35 | 25 / 48 / 32 | 25 / 48 / 32 |
-| qft_6 | 6 | 33 / 84 / 40 | 51 / 143 / 69 | 72 / 115 / 71 | 94 / 141 / 78 | 88 / 174 / 93 |
-| qft_8 | 8 | 60 / 152 / 56 | 90 / 312 / 113 | 137 / 210 / 103 | 150 / 229 / 105 | 138 / 370 / 148 |
-| qft_10 | 10 | 95 / 240 / 72 | 147 / 514 / 158 | 222 / 333 / 135 | 234 / 353 / 134 | 216 / 642 / 206 |
-| grover_3 | 3 | 4 / 39 / 21 | 37 / 128 / 91 | 35 / 155 / 98 | 48 / 110 / 88 | 34 / 164 / 102 |
-| grover_4 | 4 | 84 / 250 / 171 | 165 / 402 / 294 | 171 / 330 / 259 | 213 / 369 / 269 | 173 / 553 / 369 |
-| grover_5 | 5 | 288 / 941 / 681 | 543 / 1409 / 893 | 639 / 1200 / 840 | 715 / 1215 / 943 | 605 / 1561 / 1078 |
-| adder_cdkm_4 | 9 | 24 / 24 / 21 | 93 / 251 / 184 | 86 / 169 / 134 | 88 / 159 / 134 | 76 / 180 / 137 |
-| adder_vbe_3 | 8 | 13 / 13 / 11 | 66 / 160 / 101 | 79 / 129 / 91 | 80 / 137 / 95 | 70 / 205 / 123 |
-| adder_draper_4 | 8 | 48 / 122 / 74 | 90 / 202 / 117 | 112 / 179 / 119 | 107 / 178 / 113 | 103 / 218 / 130 |
-| total |  |  | 1324 / 3649 / 2114 | 1605 / 2949 / 1947 | 1776 / 3003 / 2041 | 1550 / 4180 / 2469 |
+| qft_4 | 4 | 14 / 36 / 24 | 19 / 49 / 33 | 24 / 45 / 35 | 19 / 42 / 29 | 19 / 42 / 29 |
+| qft_6 | 6 | 33 / 84 / 40 | 51 / 143 / 69 | 72 / 115 / 71 | 53 / 100 / 56 | 45 / 122 / 64 |
+| qft_8 | 8 | 60 / 152 / 56 | 90 / 312 / 113 | 137 / 210 / 103 | 101 / 180 / 81 | 83 / 221 / 83 |
+| qft_10 | 10 | 95 / 240 / 72 | 147 / 514 / 158 | 222 / 333 / 135 | 159 / 278 / 107 | 135 / 364 / 109 |
+| grover_3 | 3 | 4 / 39 / 21 | 37 / 128 / 91 | 35 / 155 / 98 | 47 / 110 / 88 | 35 / 194 / 110 |
+| grover_4 | 4 | 84 / 250 / 171 | 165 / 402 / 294 | 171 / 330 / 259 | 209 / 365 / 263 | 171 / 542 / 359 |
+| grover_5 | 5 | 288 / 941 / 681 | 543 / 1409 / 893 | 639 / 1200 / 840 | 698 / 1196 / 916 | 594 / 1528 / 1033 |
+| adder_cdkm_4 | 9 | 24 / 24 / 21 | 93 / 251 / 184 | 86 / 169 / 134 | 88 / 159 / 134 | 76 / 176 / 134 |
+| adder_vbe_3 | 8 | 13 / 13 / 11 | 66 / 160 / 101 | 79 / 129 / 91 | 80 / 137 / 95 | 70 / 202 / 120 |
+| adder_draper_4 | 8 | 48 / 122 / 74 | 90 / 202 / 117 | 112 / 179 / 119 | 91 / 161 / 90 | 81 / 193 / 93 |
+| total |  |  | 1321 / 3638 / 2104 | 1602 / 2938 / 1937 | 1563 / 2782 / 1899 | 1327 / 3639 / 2175 |
 
-Routed, qirc with `--cost cx` uses fewer CNOTs than tket in total and about 17% more than Qiskit, whose SABRE runs many randomised layout and routing trials. It pays for them in single qubit gates, while plain qirc stays close to tket on total gates.
+All three tools remove SWAP gates by relabelling qubits, which qirc does with `--relabel`. On all to all connectivity qirc needs 11 more CNOTs than tket and 10 fewer than Qiskit in plain mode, with the fewest gates and the lowest depth of the three. Routed on a line, qirc with `--cost cx` is within half a percent of Qiskit on CNOTs and total gates and needs 17% fewer CNOTs than tket, and plain qirc has the fewest gates and the lowest depth.
 
-Compile time over the whole set is about 0.2 s for Qiskit, 19 s for tket and 0.7 s for qirc, or 2.3 s routed with `--cost cx`, counting a process start per circuit. To run it, install `qiskit` and `pytket` and build qirc in release mode:
+Compile time over the whole set is about 0.2 s for Qiskit, 20 s for tket and 0.7 s for qirc, or 3.2 s routed with `--cost cx`, counting a process start per circuit. To run it, install `qiskit` and `pytket` and build qirc in release mode:
 
 ```
 python bench/compare.py --qirc target/release/qirc
@@ -331,14 +364,14 @@ The tests include:
 - Round trips through the QIR emitter and back through the frontend.
 - Decomposition checks against the exact Toffoli, controlled unitary and swap matrices for several gate sets.
 - Random programs compiled for several gate sets, with and without resynthesis, checked branch by branch against `-O0`.
-- Routed random circuits on line, ring and grid maps, compared state by state through the final layout.
 - KAK synthesis of random two qubit unitaries and of Clifford+T words, checked exactly and against the CNOT count of the word.
+- Quantum Shannon decomposition of random and Clifford+T three qubit unitaries, checked exactly and against 21 CNOTs.
+- Relabelled and routed random circuits compared state by state through the reported final layout, and noise aware routing checked to avoid a poor coupler.
 
 ## Limitations
 
 - A qubit index that depends on a measurement cannot be resolved, because qubits are assigned at compile time.
 - Recursive functions are rejected.
-- The router handles one and two qubit gates, so a Toffoli needs `--gates` before it can be routed.
 - OpenQASM 3 output writes branches as `if` and `else`, loops as a `while` over blocks, classical values as typed variables and recorded values as `output` variables. A floating point remainder, a pointer cast or a value recorded inside a loop is refused rather than approximated, and `--emit qir` keeps them.
 - QIR output decomposes a controlled gate that has no QIR function of its own, and refuses one with three or more controls.
 

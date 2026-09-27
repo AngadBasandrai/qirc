@@ -1,0 +1,16 @@
+[package]
+name = "qirc-python"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Python bindings for qirc"
+license = "MIT"
+publish = false
+
+[lib]
+name = "qirc"
+crate-type = ["cdylib"]
+
+[dependencies]
+compiler = { package = "qirc-compiler", path = ".." }
+pyo3 = { version = "0.29", features = ["abi3-py39", "extension-module"] }

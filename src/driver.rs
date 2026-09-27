@@ -8,6 +8,7 @@ use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::calibration::Calibration;
 use crate::codegen;
 use crate::cost;
 use crate::diag::{Diagnostic, Severity, SourceFile};
@@ -16,7 +17,7 @@ use crate::ir::Program;
 use crate::lower;
 use crate::opt::{self, OptStats};
 use crate::parse::parse_module;
-use crate::route::{self, Coupling, RouteStats};
+use crate::route::{self, Coupling, Relabelled, RouteStats};
 use crate::sema;
 use crate::simulator::exec::{self, ExecConfig};
 use crate::simulator::simd;
@@ -167,10 +168,25 @@ pub struct Options {
     pub gates: Option<GateSet>,
     pub resynth: Option<usize>,
     pub cost: Cost,
+    pub relabel: bool,
     pub coupling: Option<Coupling>,
+    pub calibration: Option<Calibration>,
     pub color: Color,
     pub diff: bool,
     pub other: Option<PathBuf>,
+}
+
+impl Options {
+    pub fn target(&self) -> Target {
+        Target {
+            gates: self.gates.clone(),
+            coupling: self.coupling.clone(),
+            resynth: self.resynth,
+            cost: self.cost,
+            relabel: self.relabel,
+            calibration: self.calibration.clone(),
+        }
+    }
 }
 
 impl Default for Options {
@@ -188,7 +204,9 @@ impl Default for Options {
             gates: None,
             resynth: None,
             cost: Cost::Gates,
+            relabel: false,
             coupling: None,
+            calibration: None,
             color: Color::Auto,
             diff: false,
             other: None,
@@ -220,6 +238,8 @@ options:
   --resynth <n>     replace runs of gates by at most n gates, 1 to 6
                     (default 1 from -O2)
   --cost <model>    what resynthesis minimises: gates | cx | ibm       (default: gates)
+  --relabel         remove swaps at the end of the program by permuting qubits
+  --calibration <f> device error rates: lines of cx a b e, single q e, readout q e
   --coupling <map>  route onto hardware: line:N | ring:N | grid:RxC | full:N
                     or an explicit edge list such as 0-1,1-2,2-3
   --verify-each     run the IR verifier after lowering and after every pass
@@ -288,6 +308,18 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
                 options.cost = Cost::parse(value).ok_or_else(|| {
                     format!("unknown cost model `{value}`, expected gates, cx or ibm")
                 })?;
+            }
+
+            "--relabel" => options.relabel = true,
+
+            "--calibration" => {
+                let path = value(&mut args, "--calibration needs a file")?;
+                let text = fs::read_to_string(path)
+                    .map_err(|error| format!("cannot read calibration {path}: {error}"))?;
+                options.calibration = Some(
+                    Calibration::parse(&text)
+                        .map_err(|error| format!("calibration {path}: {error}"))?,
+                );
             }
 
             "--coupling" => {
@@ -361,6 +393,8 @@ pub struct Target {
     pub coupling: Option<Coupling>,
     pub resynth: Option<usize>,
     pub cost: Cost,
+    pub relabel: bool,
+    pub calibration: Option<Calibration>,
 }
 
 pub struct Compilation {
@@ -368,6 +402,7 @@ pub struct Compilation {
     pub stats: OptStats,
     pub transpiled: Option<TranspileStats>,
     pub routed: Option<RouteStats>,
+    pub relabelled: Option<Relabelled>,
     pub diagnostics: Vec<Diagnostic>,
     pub parse_time: Duration,
     pub lower_time: Duration,
@@ -404,6 +439,13 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     lowering_violations.append(&mut stats.violations);
     stats.violations = lowering_violations;
 
+    let coupling = target
+        .coupling
+        .clone()
+        .or_else(|| target.calibration.as_ref().map(Calibration::coupling));
+    let relabel = target.relabel || coupling.is_some();
+    let mut relabelled = relabel.then(|| route::elide_swaps(&mut program));
+
     let transpiled = target
         .gates
         .as_ref()
@@ -425,6 +467,15 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     let set = target.gates.as_ref().unwrap_or(&native);
     let limit = target.resynth.unwrap_or(usize::from(opt_level >= 2));
     let replaced = synth::resynthesize(&mut program, set, limit, target.cost);
+    if let Some(first) = &mut relabelled {
+        let again = route::elide_swaps(&mut program);
+        first.swaps_removed += again.swaps_removed;
+        first.final_layout = first
+            .final_layout
+            .iter()
+            .map(|&w| again.final_layout[w])
+            .collect();
+    }
     if replaced > 0 {
         stats.applied.push(("resynthesize", replaced));
         stats.gates_after = program.gate_count();
@@ -433,9 +484,20 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     }
 
     let mut routed = None;
-    if let Some(coupling) = &target.coupling {
-        match route::route(&mut program, coupling) {
-            Ok(stats) => routed = Some(stats),
+    if let Some(coupling) = &coupling {
+        if target.gates.is_none() {
+            transpile::transpile(&mut program, &GateSet::native().local());
+        }
+        match route::route(&mut program, coupling, target.calibration.as_ref()) {
+            Ok(mut stats) => {
+                if let Some(relabelled) = &relabelled {
+                    let physical = stats.final_layout.clone();
+                    for (q, slot) in stats.final_layout.iter_mut().enumerate() {
+                        *slot = physical[relabelled.final_layout.get(q).copied().unwrap_or(q)];
+                    }
+                }
+                routed = Some(stats);
+            }
             Err(message) => diagnostics.push(
                 Diagnostic::error(format!("cannot route this program: {message}"))
                     .with_code("QIR0400"),
@@ -460,6 +522,7 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
         stats,
         transpiled,
         routed,
+        relabelled,
         diagnostics,
         parse_time,
         lower_time,
@@ -477,15 +540,6 @@ fn read(path: &PathBuf, output: &mut Output) -> Option<SourceFile> {
             ));
             None
         }
-    }
-}
-
-fn target(options: &Options) -> Target {
-    Target {
-        gates: options.gates.clone(),
-        coupling: options.coupling.clone(),
-        resynth: options.resynth,
-        cost: options.cost,
     }
 }
 
@@ -529,7 +583,7 @@ fn diff(options: &Options, left: &SourceFile, right: &SourceFile, output: &mut O
         &right.text,
         options.opt_level,
         options.verify_each,
-        &target(options),
+        &options.target(),
     );
     if !report(left, &reference, color, output) || !report(right, &candidate, color, output) {
         return 1;
@@ -544,7 +598,7 @@ fn diff(options: &Options, left: &SourceFile, right: &SourceFile, output: &mut O
         }
     }
 
-    let states = options.coupling.is_none();
+    let states = options.coupling.is_none() && options.calibration.is_none() && !options.relabel;
     let (a, b) = (
         equiv::explore(&reference.program),
         equiv::explore(&candidate.program),
@@ -579,7 +633,7 @@ fn diff(options: &Options, left: &SourceFile, right: &SourceFile, output: &mut O
     }
     if !states {
         output.println(format_args!(
-            "note: final states are not compared because --coupling moves qubits"
+            "note: final states are not compared because the compiled program moves qubits"
         ));
     }
 
@@ -621,7 +675,7 @@ pub fn run_source(
         &file.text,
         options.opt_level,
         options.verify_each,
-        &target(options),
+        &options.target(),
     );
 
     let color = options.color.enabled();
@@ -639,6 +693,9 @@ pub fn run_source(
         output.eprint(format_args!("{}", compilation.stats));
         if let Some(stats) = &compilation.transpiled {
             output.eprintln(format_args!("{stats}"));
+        }
+        if let Some(stats) = &compilation.relabelled {
+            output.eprintln(stats);
         }
         if let Some(stats) = &compilation.routed {
             output.eprintln(format_args!("{stats}"));
@@ -668,7 +725,7 @@ pub fn run_source(
         },
         Emit::Json => codegen::emit_json(program),
         Emit::Circuit => codegen::emit_circuit(program),
-        Emit::Cost => cost::analyse(program).to_string(),
+        Emit::Cost => cost::analyse(program, options.calibration.as_ref()).to_string(),
         Emit::Run => return execute(options, &compilation, output),
     };
 
