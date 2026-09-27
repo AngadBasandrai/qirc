@@ -52,6 +52,14 @@ def test_calibration():
     assert qirc.cost(BELL)["worst"]["success"] is None
 
 
+def test_noisy():
+    device = str(ROOT / "examples" / "line5.cal")
+    clean = qirc.run(BELL, shots=2000, seed=3)
+    noisy = qirc.run(BELL, shots=2000, seed=3, calibration=device, noisy=True)
+    assert set(clean) == {"00", "11"}
+    assert set(noisy) > {"00", "11"}
+
+
 def test_errors():
     with pytest.raises(qirc.CompileError, match="QIR0100"):
         qirc.compile("define garbage {")

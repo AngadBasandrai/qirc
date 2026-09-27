@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::ir::*;
+use crate::phase;
 use crate::simulator::matrix::{Matrix2, matrix_for};
 use crate::synth;
 use crate::verify;
@@ -112,6 +113,7 @@ type Pass = fn(&mut Program) -> usize;
 fn schedule(level: u8) -> Vec<(&'static str, Pass)> {
     let mut schedule: Vec<(&'static str, Pass)> = vec![
         ("drop-identity", drop_identity_gates),
+        ("drop-before-measure", drop_before_measure),
         ("cancel-inverses", cancel_inverses),
         ("merge-rotations", merge_rotations),
         ("fold-constants", fold_constants),
@@ -119,6 +121,7 @@ fn schedule(level: u8) -> Vec<(&'static str, Pass)> {
 
     if level >= 2 {
         schedule.push(("peephole", peephole));
+        schedule.push(("fold-phases", phase::fold));
         schedule.push(("simplify-cfg", simplify_cfg));
     }
 
@@ -261,6 +264,38 @@ fn is_identity_gate(gate: &Gate) -> bool {
         GateKind::Swap => gate.targets.len() == 2 && gate.targets[0] == gate.targets[1],
         _ => false,
     }
+}
+
+pub(crate) fn drop_before_measure(program: &mut Program) -> usize {
+    let mut removed = 0;
+    for block in &mut program.blocks {
+        let mut settled: HashSet<QubitId> = HashSet::new();
+        let mut keep = vec![true; block.ops.len()];
+        for (index, op) in block.ops.iter().enumerate().rev() {
+            match op {
+                Op::Measure { qubit, .. } | Op::Reset { qubit, .. } => {
+                    settled.insert(*qubit);
+                }
+                Op::Gate(gate)
+                    if phase::diagonal(gate.kind) && gate.wires().all(|q| settled.contains(&q)) =>
+                {
+                    keep[index] = false;
+                    removed += 1;
+                }
+                _ => {
+                    for q in op.qubits() {
+                        settled.remove(&q);
+                    }
+                }
+            }
+        }
+        let mut index = 0;
+        block.ops.retain(|_| {
+            index += 1;
+            keep[index - 1]
+        });
+    }
+    removed
 }
 
 fn drop_identity_gates(program: &mut Program) -> usize {

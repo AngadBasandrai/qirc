@@ -13,7 +13,7 @@ use pyo3::types::{PyDict, PyList};
 
 create_exception!(qirc, CompileError, PyException);
 
-const FLAGS: [(&str, &str); 8] = [
+const FLAGS: [(&str, &str); 10] = [
     ("opt", "-O"),
     ("gates", "--gates"),
     ("exclude", "--exclude"),
@@ -22,6 +22,8 @@ const FLAGS: [(&str, &str); 8] = [
     ("coupling", "--coupling"),
     ("relabel", "--relabel"),
     ("calibration", "--calibration"),
+    ("reuse", "--reuse"),
+    ("noisy", "--noisy"),
 ];
 
 fn flags(options: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<String>> {
@@ -33,7 +35,7 @@ fn flags(options: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<String>> {
         let key: String = key.extract()?;
         let Some(&(_, flag)) = FLAGS.iter().find(|(name, _)| *name == key) else {
             return Err(PyTypeError::new_err(format!(
-                "unexpected keyword argument `{key}`, expected one of opt, gates, exclude, resynth, cost, coupling, relabel or calibration"
+                "unexpected keyword argument `{key}`, expected one of opt, gates, exclude, resynth, cost, coupling, relabel, calibration, reuse or noisy"
             )));
         };
         if value.is_none() {
@@ -146,7 +148,7 @@ fn run(
     let file = SourceFile::new(name, source);
     let compilation = compiled(py, &file, &options)?;
     let program = compilation.program;
-    if program.num_qubits as usize > state::MAX_QUBITS {
+    if program.num_qubits as usize > state::MAX_QUBITS && !exec::stabilizer(&program) {
         return Err(PyValueError::new_err(format!(
             "this program needs {} qubits, the simulator supports at most {}",
             program.num_qubits,
@@ -164,7 +166,10 @@ fn run(
         seed,
         keep_state: false,
     };
-    let outcome = py.detach(|| exec::execute(&program, config));
+    let outcome = py.detach(|| match (&options.calibration, options.noisy) {
+        (Some(calibration), true) => exec::execute_noisy(&program, config, calibration),
+        _ => exec::execute(&program, config),
+    });
     if outcome.aborted {
         return Err(PyRuntimeError::new_err(
             "execution did not terminate within the step limit",

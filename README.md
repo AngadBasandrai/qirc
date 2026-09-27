@@ -76,6 +76,8 @@ qirc diff <a.ll> [b.ll] [options]
   --coupling <map>  route onto line:N, ring:N, grid:RxC, full:N or 0-1,1-2,...
   --calibration <f> route by device error rates and estimate success
   --relabel         remove swaps at the end of the program by permuting qubits
+  --reuse           reset measured qubits and reuse them to need fewer qubits
+  --noisy           simulate with the error rates from --calibration
   --shots <n>       sample n measurement outcomes
   --seed <n>        seed the random number generator
   --no-state        do not print the final state vector
@@ -166,10 +168,12 @@ The profile comes from the `qir_profiles` attribute on the entry point. Qubit an
 | --- | --- |
 | `-O0` | none |
 | `-O1` | identity removal, inverse cancellation, rotation merging, constant folding, dead code elimination |
-| `-O2` | `-O1` plus peephole rewrites and CFG simplification, repeated until nothing changes, then window resynthesis |
+| `-O2` | `-O1` plus peephole rewrites, phase folding and CFG simplification, repeated until nothing changes, then window resynthesis |
 | `-O3` | `-O2` plus single qubit gate fusion |
 
 Cancellation, merging and fusion look past gates that commute with the pair, so `rz` on a control qubit cancels across a CNOT. Commutation is checked on the exact matrices of the gates involved.
+
+Phase folding tracks which parity of path variables each qubit holds as CNOTs, X gates and swaps move values around, starting a new variable at every H. Two Z rotations (`rz`, `r1`, `t`, `s`, `z` and their inverses) that act on the same parity are merged into one at the place of the first, however far apart they are, and a rotation on a constant parity is a global phase and is dropped. Diagonal gates such as CZ leave the parities alone, and any other gate, a measurement or a reset ends the region. On Clifford+T adders this removes up to three quarters of the T gates that the other passes leave, for example 34 to 8 on a 3 bit VBE adder.
 
 Window resynthesis multiplies out every run of gates on one or two qubits and replaces the run with anything shorter that has the same matrix up to global phase. By default the replacement must be a single gate, so `t t` becomes `s` and three alternating CNOTs become `swap`. `--resynth n` allows replacements of up to `n` gates: single qubit runs use exact Euler angles, and two qubit runs use a meet in the middle search over the target gate set. Every replacement is checked against the original matrix before it is applied.
 
@@ -197,6 +201,8 @@ $ qirc tests/corpus/base_profile_bell.ll --exclude h,cx --emit ir
 `--coupling` inserts SWAPs so that every two qubit gate lands on a physical edge, and remaps measurements so results come back under their original labels. The router works on the dependency graph of each block: gates whose qubits are adjacent run as soon as they are ready, and otherwise it picks the SWAP that most shortens the blocked gates plus the next 20, weighted by half and fading with distance, with a small penalty on qubits that were just swapped. A SWAP on a pair that has just run a two qubit gate is preferred, because resynthesis can merge the two. The starting layout comes from routing the circuit forwards and backwards twice from up to sixteen starting points, with a little random tie breaking in all but the first, and the router keeps the result with the lowest estimated CNOT count, counting a SWAP that resynthesis can merge as one CNOT instead of three. After routing, the program is rebuilt in the gate set and resynthesised again. Gates on three or more qubits are split into one and two qubit gates before routing when no gate set is given.
 
 `--relabel` removes each SWAP near the end of the program by renaming the qubits of everything after it, measurements included, so recorded results are unchanged and only the final state comes out permuted. It is on whenever the program is routed, `-v` prints the final layout, and `qirc diff` then compares outcome probabilities and recorded values but not final states.
+
+`--reuse` reorders each run of quantum operations to finish the qubits it has started before touching new ones, then packs qubit lifetimes onto as few wires as it can and resets a wire before it is reused. Resetting a qubit that is no longer used cannot change what later measurements see, so the outcome distribution is unchanged, and a Base Profile program becomes Adaptive because it now resets qubits. Bernstein Vazirani on 9 qubits runs on 2. `qirc diff` compares outcome probabilities only, as after routing.
 
 `--calibration file` reads device error rates, one per line as `cx a b error`, `single q error` or `readout q error`, and routes onto the coupling map its `cx` lines describe unless `--coupling` is also given. The router then measures distance by the error of each coupler, prefers SWAPs on good couplers and keeps the layout with the highest estimated success probability, and `--emit cost` adds a `success` column with the product of one minus the error of every operation on each path. `examples/line5.cal` describes a five qubit line with one poor coupler. In a program with branches or loops every block starts from the same layout, and a block that jumps elsewhere swaps its qubits back before the jump, so each successor sees the layout it expects.
 
@@ -348,7 +354,11 @@ When the target qubit is 2 or higher, each pair's two halves are contiguous and 
 
 Straight line programs are evolved once and sampled. Programs that branch on a measurement, reset a qubit, or act on a qubit after measuring it are simulated shot by shot with real collapse.
 
-The simulator is limited to 30 qubits. Larger programs can still be compiled and emitted.
+A program with more than 20 qubits whose gates are all Clifford (H, S, the Paulis, SX, CNOT, CZ, CY, swap, and rotations by multiples of a quarter turn) runs on a stabilizer tableau instead, up to 5,000 qubits, with branches, resets and measurements. The tableau is stored row by row as bit words, so combining two rows costs a few popcounts, and a straight line program is prepared once and each shot measures a copy. A 1,000 qubit GHZ state takes under a second for 1,000 shots. `qirc diff` uses the same tableau for such programs, following each measurement that is not already determined and comparing final states through the reduced row echelon form of their stabilizer groups, so it can check a compile of a large Clifford circuit exactly.
+
+Other programs are limited to 30 qubits by the state vector. Larger programs can still be compiled and emitted.
+
+With `--calibration` and `--noisy`, every gate is followed by a random Pauli error with the probability the calibration gives for it, uniform over the nonidentity Paulis on its qubits, and every measurement result flips with the readout error of its qubit. Pauli errors are Clifford, so noisy Clifford programs still run on the tableau. For a 5 qubit GHZ state on `examples/line5.cal` the fraction of correct shots is 0.885 against a `--emit cost` estimate of 0.861, which counts every error as fatal.
 
 ## Testing
 
@@ -367,6 +377,8 @@ The tests include:
 - KAK synthesis of random two qubit unitaries and of Clifford+T words, checked exactly and against the CNOT count of the word.
 - Quantum Shannon decomposition of random and Clifford+T three qubit unitaries, checked exactly and against 21 CNOTs.
 - Relabelled and routed random circuits compared state by state through the reported final layout, and noise aware routing checked to avoid a poor coupler.
+- The stabilizer tableau checked against the state vector on random Clifford circuits, measurement by measurement, and `qirc diff` on 24 qubit Clifford circuits both for compiled programs and for programs with a single extra gate.
+- Phase folding, qubit reuse and noisy simulation, each checked against an exact or statistical expectation.
 
 ## Limitations
 

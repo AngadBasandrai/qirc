@@ -2,6 +2,7 @@ use std::{ptr, slice};
 
 use qirc::diag::SourceFile;
 use qirc::driver::{self, Emit, Output};
+use qirc::simulator::exec;
 
 const MAX_QUBITS: u32 = 20;
 
@@ -58,8 +59,9 @@ fn execute(source: &str, args: &str, output: &mut Output) -> i32 {
     };
 
     if options.diff || matches!(options.emit, Emit::Run) {
-        let qubits = driver::compile(source, 0).program.num_qubits;
-        if qubits > MAX_QUBITS {
+        let program = driver::compile(source, 0).program;
+        let qubits = program.num_qubits;
+        if qubits > MAX_QUBITS && !exec::stabilizer(&program) {
             output.stderr.push_str(&format!(
                 "error: this program needs {qubits} qubits, the playground simulates at most {MAX_QUBITS}\n"
             ));

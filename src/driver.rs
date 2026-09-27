@@ -17,10 +17,10 @@ use crate::ir::Program;
 use crate::lower;
 use crate::opt::{self, OptStats};
 use crate::parse::parse_module;
+use crate::reuse::{self, Reused};
 use crate::route::{self, Coupling, Relabelled, RouteStats};
 use crate::sema;
 use crate::simulator::exec::{self, ExecConfig};
-use crate::simulator::simd;
 use crate::simulator::state;
 use crate::synth::{self, Cost};
 use crate::transpile::{self, GateSet, TranspileStats};
@@ -169,6 +169,8 @@ pub struct Options {
     pub resynth: Option<usize>,
     pub cost: Cost,
     pub relabel: bool,
+    pub reuse: bool,
+    pub noisy: bool,
     pub coupling: Option<Coupling>,
     pub calibration: Option<Calibration>,
     pub color: Color,
@@ -184,6 +186,7 @@ impl Options {
             resynth: self.resynth,
             cost: self.cost,
             relabel: self.relabel,
+            reuse: self.reuse,
             calibration: self.calibration.clone(),
         }
     }
@@ -205,6 +208,8 @@ impl Default for Options {
             resynth: None,
             cost: Cost::Gates,
             relabel: false,
+            reuse: false,
+            noisy: false,
             coupling: None,
             calibration: None,
             color: Color::Auto,
@@ -239,6 +244,8 @@ options:
                     (default 1 from -O2)
   --cost <model>    what resynthesis minimises: gates | cx | ibm       (default: gates)
   --relabel         remove swaps at the end of the program by permuting qubits
+  --reuse           reset measured qubits and reuse them to need fewer qubits
+  --noisy           simulate with the error rates from --calibration
   --calibration <f> device error rates: lines of cx a b e, single q e, readout q e
   --coupling <map>  route onto hardware: line:N | ring:N | grid:RxC | full:N
                     or an explicit edge list such as 0-1,1-2,2-3
@@ -312,6 +319,10 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
 
             "--relabel" => options.relabel = true,
 
+            "--reuse" => options.reuse = true,
+
+            "--noisy" => options.noisy = true,
+
             "--calibration" => {
                 let path = value(&mut args, "--calibration needs a file")?;
                 let text = fs::read_to_string(path)
@@ -378,6 +389,9 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
         );
     }
     options.input = input.ok_or_else(|| "no input file given".to_string())?;
+    if options.noisy && options.calibration.is_none() {
+        return Err("--noisy needs --calibration for its error rates".into());
+    }
     Ok(options)
 }
 
@@ -394,6 +408,7 @@ pub struct Target {
     pub resynth: Option<usize>,
     pub cost: Cost,
     pub relabel: bool,
+    pub reuse: bool,
     pub calibration: Option<Calibration>,
 }
 
@@ -403,6 +418,7 @@ pub struct Compilation {
     pub transpiled: Option<TranspileStats>,
     pub routed: Option<RouteStats>,
     pub relabelled: Option<Relabelled>,
+    pub reused: Option<Reused>,
     pub diagnostics: Vec<Diagnostic>,
     pub parse_time: Duration,
     pub lower_time: Duration,
@@ -439,6 +455,12 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     lowering_violations.append(&mut stats.violations);
     stats.violations = lowering_violations;
 
+    let reused = if target.reuse {
+        reuse::reuse(&mut program)
+    } else {
+        None
+    };
+
     let coupling = target
         .coupling
         .clone()
@@ -466,7 +488,10 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     let native = GateSet::native();
     let set = target.gates.as_ref().unwrap_or(&native);
     let limit = target.resynth.unwrap_or(usize::from(opt_level >= 2));
-    let replaced = synth::resynthesize(&mut program, set, limit, target.cost);
+    let mut replaced = synth::resynthesize(&mut program, set, limit, target.cost);
+    if opt_level > 0 {
+        replaced += opt::drop_before_measure(&mut program);
+    }
     if let Some(first) = &mut relabelled {
         let again = route::elide_swaps(&mut program);
         first.swaps_removed += again.swaps_removed;
@@ -509,6 +534,9 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
             transpile::transpile(&mut program, gates);
         }
         synth::resynthesize(&mut program, set, limit, target.cost);
+        if opt_level > 0 {
+            opt::drop_before_measure(&mut program);
+        }
     }
 
     if verify_each && (transpiled.is_some() || routed.is_some()) {
@@ -523,6 +551,7 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
         transpiled,
         routed,
         relabelled,
+        reused,
         diagnostics,
         parse_time,
         lower_time,
@@ -590,15 +619,18 @@ fn diff(options: &Options, left: &SourceFile, right: &SourceFile, output: &mut O
     }
 
     for program in [&reference.program, &candidate.program] {
-        if program.num_qubits as usize > DIFF_QUBITS {
+        if program.num_qubits as usize > DIFF_QUBITS && !exec::stabilizer(program) {
             output.eprintln(format_args!(
-                "error: diff follows every branch and supports at most {DIFF_QUBITS} qubits"
+                "error: diff follows every branch and supports at most {DIFF_QUBITS} qubits unless the program only uses Clifford gates"
             ));
             return 1;
         }
     }
 
-    let states = options.coupling.is_none() && options.calibration.is_none() && !options.relabel;
+    let states = options.coupling.is_none()
+        && options.calibration.is_none()
+        && !options.relabel
+        && !options.reuse;
     let (a, b) = (
         equiv::explore(&reference.program),
         equiv::explore(&candidate.program),
@@ -694,6 +726,9 @@ pub fn run_source(
         if let Some(stats) = &compilation.transpiled {
             output.eprintln(format_args!("{stats}"));
         }
+        if let Some(stats) = &compilation.reused {
+            output.eprintln(stats);
+        }
         if let Some(stats) = &compilation.relabelled {
             output.eprintln(stats);
         }
@@ -750,7 +785,7 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
     let program = &compilation.program;
 
     let qubits = program.num_qubits as usize;
-    if qubits > state::MAX_QUBITS {
+    if qubits > state::MAX_QUBITS && !exec::stabilizer(program) {
         output.eprintln(format_args!(
             "error: this program needs {qubits} qubits, but the simulator supports at most {}",
             state::MAX_QUBITS
@@ -773,7 +808,7 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
     let seed = options.seed.unwrap_or_else(clock_seed);
 
     output.println(format_args!("source:  {}", options.input.display()));
-    output.println(format_args!("kernel:  {}", simd::backend()));
+    output.println(format_args!("kernel:  {}", exec::kernel(program)));
     output.println(format_args!("program: {}", summary(program)));
 
     if compilation.stats.changed() {
@@ -788,16 +823,18 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
     output.println("");
     output.print(format_args!("{}", codegen::emit_circuit(program)));
 
-    let (outcome, elapsed) = timed(|| {
-        exec::execute(
-            program,
-            ExecConfig {
-                shots: options.shots,
-                seed,
-                keep_state: options.show_state,
-            },
-        )
+    let config = ExecConfig {
+        shots: options.shots,
+        seed,
+        keep_state: options.show_state,
+    };
+    let (outcome, elapsed) = timed(|| match (&options.calibration, options.noisy) {
+        (Some(calibration), true) => exec::execute_noisy(program, config, calibration),
+        _ => exec::execute(program, config),
     });
+    if options.noisy {
+        output.println("noise:   calibration error rates applied to every gate and measurement");
+    }
 
     if outcome.aborted {
         output.eprintln(format_args!(
