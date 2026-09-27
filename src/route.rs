@@ -508,7 +508,7 @@ fn place(op: Op, layout: &Layout) -> Op {
     remap(op, |q| layout.at(q))
 }
 
-fn remap(op: Op, wire: impl Fn(QubitId) -> usize) -> Op {
+pub(crate) fn remap(op: Op, wire: impl Fn(QubitId) -> usize) -> Op {
     let moved = |q: QubitId| QubitId(wire(q) as u32);
     match op {
         Op::Gate(mut gate) => {

@@ -1,8 +1,129 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::matrix::{Matrix2, matrix_for};
-use super::state::{Rng, State};
+use super::simd;
+use super::state::{Rng, Sampler, State};
+use super::tableau::{self, Tableau};
+use crate::calibration::Calibration;
 use crate::ir::*;
+
+const STABILIZER_ABOVE: usize = 20;
+
+pub(crate) trait Backend {
+    fn gate(&mut self, gate: &Gate, params: &[f64]);
+    fn pauli(&mut self, qubit: usize, x: bool, z: bool);
+
+    fn flip(&mut self, qubit: usize) {
+        self.pauli(qubit, true, false);
+    }
+}
+
+impl Backend for State {
+    fn gate(&mut self, gate: &Gate, params: &[f64]) {
+        let controls = control_mask(gate);
+        if gate.kind == GateKind::Swap {
+            if let [a, b] = gate.targets[..] {
+                self.swap(a.index(), b.index(), controls);
+            }
+            return;
+        }
+        let matrix = matrix_for(gate.kind, params);
+        for target in &gate.targets {
+            self.apply(&matrix, target.index(), controls);
+        }
+    }
+
+    fn pauli(&mut self, qubit: usize, x: bool, z: bool) {
+        if x {
+            self.apply(&Matrix2::x(), qubit, 0);
+        }
+        if z {
+            self.apply(&Matrix2::z(), qubit, 0);
+        }
+    }
+}
+
+impl Backend for Tableau {
+    fn gate(&mut self, gate: &Gate, params: &[f64]) {
+        self.apply(gate, params);
+    }
+
+    fn pauli(&mut self, qubit: usize, x: bool, z: bool) {
+        Tableau::pauli(self, qubit, x, z);
+    }
+}
+
+trait Sample: Backend {
+    type Sampler;
+    fn sampler(&self) -> Self::Sampler;
+    fn sample(
+        &self,
+        sampler: &Self::Sampler,
+        plan: &[(QubitId, ResultId)],
+        rng: &mut Rng,
+        results: &mut [bool],
+    );
+}
+
+impl Sample for State {
+    type Sampler = Sampler;
+
+    fn sampler(&self) -> Sampler {
+        State::sampler(self)
+    }
+
+    fn sample(
+        &self,
+        sampler: &Sampler,
+        plan: &[(QubitId, ResultId)],
+        rng: &mut Rng,
+        results: &mut [bool],
+    ) {
+        let index = sampler.draw(rng);
+        for (qubit, result) in plan {
+            if let Some(slot) = results.get_mut(result.index()) {
+                *slot = (index >> qubit.0) & 1 == 1;
+            }
+        }
+    }
+}
+
+impl Sample for Tableau {
+    type Sampler = ();
+
+    fn sampler(&self) {}
+
+    fn sample(&self, _: &(), plan: &[(QubitId, ResultId)], rng: &mut Rng, results: &mut [bool]) {
+        let mut copy = self.clone();
+        for (qubit, result) in plan {
+            let outcome = copy.measure(qubit.index(), rng);
+            if let Some(slot) = results.get_mut(result.index()) {
+                *slot = outcome;
+            }
+        }
+    }
+}
+
+pub fn stabilizer(program: &Program) -> bool {
+    let qubits = program.num_qubits as usize;
+    qubits > STABILIZER_ABOVE
+        && qubits <= tableau::MAX_QUBITS
+        && program.gates().all(|gate| {
+            gate.params
+                .iter()
+                .map(|p| p.constant().map(Const::as_f64))
+                .collect::<Option<Vec<f64>>>()
+                .is_some_and(|params| tableau::supports(gate, &params))
+        })
+}
+
+pub fn kernel(program: &Program) -> &'static str {
+    if stabilizer(program) {
+        "stabilizer tableau"
+    } else {
+        simd::backend()
+    }
+}
 
 const MAX_STEPS: usize = 1_000_000;
 
@@ -83,10 +204,29 @@ pub fn needs_per_shot(program: &Program) -> bool {
 }
 
 pub fn execute(program: &Program, config: ExecConfig) -> ExecOutcome {
-    if needs_per_shot(program) {
-        execute_per_shot(program, config)
+    let qubits = program.num_qubits as usize;
+    if stabilizer(program) && needs_per_shot(program) {
+        shots(
+            program,
+            config,
+            None,
+            || Tableau::new(qubits),
+            Tableau::measure,
+        )
+        .0
+    } else if stabilizer(program) {
+        execute_sampled(program, config, Tableau::new(qubits)).0
+    } else if needs_per_shot(program) {
+        let (mut outcome, state) =
+            shots(program, config, None, || State::new(qubits), State::measure);
+        if config.keep_state {
+            outcome.final_state = state;
+        }
+        outcome
     } else {
-        execute_sampled(program, config)
+        let (mut outcome, state) = execute_sampled(program, config, State::new(qubits));
+        outcome.final_state = config.keep_state.then_some(state);
+        outcome
     }
 }
 
@@ -106,8 +246,11 @@ fn measurement_plan(program: &Program) -> Vec<(QubitId, ResultId)> {
         .collect()
 }
 
-fn execute_sampled(program: &Program, config: ExecConfig) -> ExecOutcome {
-    let mut state = State::new(program.num_qubits as usize);
+fn execute_sampled<S: Sample>(
+    program: &Program,
+    config: ExecConfig,
+    mut state: S,
+) -> (ExecOutcome, S) {
     let mut messages = Vec::new();
     let mut outputs = Vec::new();
     let mut values = HashMap::new();
@@ -154,13 +297,8 @@ fn execute_sampled(program: &Program, config: ExecConfig) -> ExecOutcome {
         let mut rng = Rng::new(config.seed);
         let sampler = state.sampler();
         for _ in 0..config.shots {
-            let index = sampler.draw(&mut rng);
             let mut results = vec![false; program.num_results as usize];
-            for (qubit, result) in &plan {
-                if result.index() < results.len() {
-                    results[result.index()] = (index >> qubit.0) & 1 == 1;
-                }
-            }
+            state.sample(&sampler, &plan, &mut rng, &mut results);
             if !plan.is_empty() {
                 *counts.entry(format_results(&results)).or_insert(0) += 1;
             }
@@ -174,20 +312,70 @@ fn execute_sampled(program: &Program, config: ExecConfig) -> ExecOutcome {
         }
     }
 
-    ExecOutcome {
-        final_state: config.keep_state.then_some(state),
+    let outcome = ExecOutcome {
+        final_state: None,
         aborted: false,
         counts,
         returns,
         messages,
         outputs,
         sampled: true,
+    };
+    (outcome, state)
+}
+
+pub fn execute_noisy(
+    program: &Program,
+    config: ExecConfig,
+    calibration: &Calibration,
+) -> ExecOutcome {
+    let qubits = program.num_qubits as usize;
+    if stabilizer(program) {
+        return shots(
+            program,
+            config,
+            Some(calibration),
+            || Tableau::new(qubits),
+            Tableau::measure,
+        )
+        .0;
+    }
+    let (mut outcome, state) = shots(
+        program,
+        config,
+        Some(calibration),
+        || State::new(qubits),
+        State::measure,
+    );
+    if config.keep_state {
+        outcome.final_state = state;
+    }
+    outcome
+}
+
+fn depolarize<S: Backend>(state: &mut S, gate: &Gate, calibration: &Calibration, rng: &mut Rng) {
+    if rng.next_unit() >= calibration.gate_error(gate) {
+        return;
+    }
+    let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
+    let choices = (1u64 << (2 * wires.len())) - 1;
+    let choice = 1 + rng.next_u64() % choices;
+    for (i, &q) in wires.iter().enumerate() {
+        let pauli = choice >> (2 * i) & 3;
+        state.pauli(q, pauli & 1 == 1, pauli & 2 == 2);
     }
 }
 
-fn execute_per_shot(program: &Program, config: ExecConfig) -> ExecOutcome {
+fn shots<S: Backend>(
+    program: &Program,
+    config: ExecConfig,
+    noise: Option<&Calibration>,
+    fresh: impl Fn() -> S,
+    measure: fn(&mut S, usize, &mut Rng) -> bool,
+) -> (ExecOutcome, Option<S>) {
     let shots = config.shots.max(1);
     let mut rng = Rng::new(config.seed);
+    let mut errors = Rng::new(config.seed.wrapping_add(0x9e37_79b9_7f4a_7c15));
     let mut counts = BTreeMap::new();
     let mut returns = BTreeMap::new();
     let mut messages = Vec::new();
@@ -199,10 +387,21 @@ fn execute_per_shot(program: &Program, config: ExecConfig) -> ExecOutcome {
         .any(|op| matches!(op, Op::RecordOutput { .. }));
 
     for shot in 0..shots {
-        let mut state = State::new(program.num_qubits as usize);
-        let run = run_with(program, &mut state, &mut |state, qubit| {
-            Some(state.measure(qubit, &mut rng))
-        });
+        let mut state = fresh();
+        let run = run_with(
+            program,
+            &mut state,
+            &mut |state, qubit| {
+                let outcome = measure(state, qubit, &mut rng);
+                let flipped = noise.is_some_and(|c| rng.next_unit() < c.readout(qubit));
+                Some(outcome ^ flipped)
+            },
+            &mut |state, gate| {
+                if let Some(calibration) = noise {
+                    depolarize(state, gate, calibration, &mut errors);
+                }
+            },
+        );
         if run.aborted {
             aborted = true;
             break;
@@ -218,20 +417,21 @@ fn execute_per_shot(program: &Program, config: ExecConfig) -> ExecOutcome {
             *returns.entry(format_returned(&run.returned)).or_insert(0) += 1;
         }
 
-        if shot + 1 == shots && config.keep_state {
+        if shot + 1 == shots {
             last_state = Some(state);
         }
     }
 
-    ExecOutcome {
-        final_state: last_state,
+    let outcome = ExecOutcome {
+        final_state: None,
         aborted,
         counts,
         returns,
         messages,
         outputs,
         sampled: false,
-    }
+    };
+    (outcome, last_state)
 }
 
 pub(crate) struct ShotRun {
@@ -242,10 +442,11 @@ pub(crate) struct ShotRun {
     pub(crate) returned: Vec<Returned>,
 }
 
-pub(crate) fn run_with(
+pub(crate) fn run_with<S: Backend>(
     program: &Program,
-    state: &mut State,
-    measure: &mut dyn FnMut(&mut State, usize) -> Option<bool>,
+    state: &mut S,
+    measure: &mut dyn FnMut(&mut S, usize) -> Option<bool>,
+    after: &mut dyn FnMut(&mut S, &Gate),
 ) -> ShotRun {
     let mut results = vec![false; program.num_results as usize];
     let mut values = HashMap::new();
@@ -289,7 +490,10 @@ pub(crate) fn run_with(
 
         for op in &block.ops {
             match op {
-                Op::Gate(gate) => apply_gate(state, gate, &values),
+                Op::Gate(gate) => {
+                    apply_gate(state, gate, &values);
+                    after(state, gate);
+                }
 
                 Op::Measure { qubit, result, .. } => {
                     let Some(outcome) = measure(state, qubit.index()) else {
@@ -302,7 +506,7 @@ pub(crate) fn run_with(
                 }
 
                 Op::Reset { qubit, .. } => match measure(state, qubit.index()) {
-                    Some(true) => state.apply(&Matrix2::x(), qubit.index(), 0),
+                    Some(true) => state.flip(qubit.index()),
                     Some(false) => {}
                     None => {
                         aborted = true;
@@ -460,27 +664,13 @@ fn take_returned(rest: &mut &[Returned]) -> Option<String> {
     })
 }
 
-fn apply_gate(state: &mut State, gate: &Gate, values: &HashMap<ValueId, Const>) {
-    let controls = control_mask(gate);
-
-    if gate.kind == GateKind::Swap {
-        if gate.targets.len() == 2 {
-            state.swap(gate.targets[0].index(), gate.targets[1].index(), controls);
-        }
-        return;
-    }
-
+fn apply_gate<S: Backend>(state: &mut S, gate: &Gate, values: &HashMap<ValueId, Const>) {
     let params: Vec<f64> = gate
         .params
         .iter()
         .map(|operand| operand.resolve(values).map_or(0.0, |c| c.as_f64()))
         .collect();
-
-    let matrix = matrix_for(gate.kind, &params);
-
-    for target in &gate.targets {
-        state.apply(&matrix, target.index(), controls);
-    }
+    state.gate(gate, &params);
 }
 
 fn eval(

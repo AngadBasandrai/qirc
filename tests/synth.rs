@@ -154,6 +154,25 @@ fn fewest_cnots() {
 }
 
 #[test]
+fn phase_folding() {
+    let source = module(
+        &[
+            call("t", &[1]),
+            call("cx", &[0, 1]),
+            call("t", &[1]),
+            call("cx", &[0, 1]),
+            call("h", &[2]),
+            call("t", &[1]),
+        ]
+        .concat(),
+    );
+    let program = targeted(&source, 2, None, None);
+    let names = names(&program);
+    assert_eq!(names.iter().filter(|n| *n == "t").count(), 1, "{names:?}");
+    assert!(names.contains(&"s".to_string()), "{names:?}");
+}
+
+#[test]
 fn skipped_qubits() {
     let source = module(
         &[
@@ -330,5 +349,55 @@ fn moved_states() {
             "{coupling:?}: overlap {}",
             overlap.norm()
         );
+    }
+}
+
+#[test]
+fn clifford_diff() {
+    let mut seed = 29u64;
+    let mut next = |bound: u32| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) % u64::from(bound)) as u32
+    };
+    for _ in 0..6 {
+        let mut body = String::new();
+        for _ in 0..80 {
+            let a = next(24);
+            let b = (a + 1 + next(23)) % 24;
+            body += &match next(5) {
+                0 => call("h", &[a]),
+                1 => call("s", &[a]),
+                2 => call("cz", &[a, b]),
+                _ => call("cx", &[a, b]),
+            };
+        }
+        for q in 0..4 {
+            body += &format!(
+                "  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 {q} to %Qubit*), %Result* inttoptr (i64 {q} to %Result*))
+"
+            );
+        }
+        let source = module(&body)
+            .replace(
+                "\"required_num_qubits\"=\"3\"",
+                "\"required_num_qubits\"=\"24\"",
+            )
+            .replace(
+                "\"required_num_results\"=\"0\"",
+                "\"required_num_results\"=\"4\"",
+            );
+        let reference = equiv::explore(&compile(&source, 0));
+        let target = Target {
+            gates: Some(GateSet::parse("rz-sx-cx").unwrap()),
+            ..Default::default()
+        };
+        let compiled = driver::compile_for(&source, 3, false, &target).program;
+        assert!(equiv::compare(&reference, &equiv::explore(&compiled), true).is_empty());
+
+        let flipped = source.replace("  ret void", &format!("{}  ret void", call("x", &[0])));
+        let changed = equiv::explore(&compile(&flipped, 0));
+        assert!(!equiv::compare(&reference, &changed, true).is_empty());
     }
 }

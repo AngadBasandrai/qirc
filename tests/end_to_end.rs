@@ -1197,3 +1197,160 @@ attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_
     };
     assert!(success(&aware) > success(&compiled(None)) + 0.5);
 }
+
+#[test]
+fn large_clifford() {
+    let chain: String = (1..24)
+        .map(|q| format!("  call void @__quantum__qis__cnot__body(%Qubit* inttoptr (i64 {} to %Qubit*), %Qubit* inttoptr (i64 {q} to %Qubit*))
+", q - 1))
+        .collect();
+    let source = format!(
+        "%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {{
+entry:
+  call void @__quantum__qis__h__body(%Qubit* null)
+{chain}  call void @__quantum__qis__mz__body(%Qubit* null, %Result* null)
+  %one = call i1 @__quantum__qis__read_result__body(%Result* null)
+  br i1 %one, label %fix, label %done
+fix:
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 23 to %Qubit*))
+  br label %done
+done:
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 23 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  ret void
+}}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__x__body(%Qubit*)
+declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+declare i1 @__quantum__qis__read_result__body(%Result*)
+
+attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"required_num_qubits\"=\"24\" \"required_num_results\"=\"2\" }}
+"
+    );
+    let program = compile(&source, 1);
+    assert!(exec::stabilizer(&program));
+    let outcome = run(&program, 400, 5);
+    assert_eq!(outcome.counts.keys().collect::<Vec<_>>(), ["00", "10"]);
+    assert!(outcome.counts.values().all(|&n| n > 150));
+}
+
+#[test]
+fn qubit_reuse() {
+    let secret = "10110101";
+    let qubit = |i: usize| format!("%Qubit* inttoptr (i64 {i} to %Qubit*)");
+    let mut body = format!(
+        "  call void @__quantum__qis__x__body({0})\n  call void @__quantum__qis__h__body({0})\n",
+        qubit(8)
+    );
+    for i in 0..8 {
+        body += &format!("  call void @__quantum__qis__h__body({})\n", qubit(i));
+    }
+    for (i, bit) in secret.chars().enumerate() {
+        if bit == '1' {
+            body += &format!(
+                "  call void @__quantum__qis__cnot__body({}, {})\n",
+                qubit(i),
+                qubit(8)
+            );
+        }
+    }
+    for i in 0..8 {
+        body += &format!(
+            "  call void @__quantum__qis__h__body({0})\n  call void @__quantum__qis__mz__body({0}, %Result* inttoptr (i64 {i} to %Result*))\n",
+            qubit(i)
+        );
+    }
+    let source = format!(
+        "%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {{
+entry:
+{body}  ret void
+}}
+
+declare void @__quantum__qis__x__body(%Qubit*)
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+
+attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"9\" \"required_num_results\"=\"8\" }}
+"
+    );
+    let compiled = driver::compile_for(
+        &source,
+        1,
+        false,
+        &driver::Target {
+            reuse: true,
+            ..Default::default()
+        },
+    );
+    let reused = compiled.reused.expect("reuse");
+    assert_eq!((reused.qubits_before, reused.qubits_after), (9, 2));
+    assert_eq!(compiled.program.profile, Profile::Adaptive);
+    let outcome = run(&compiled.program, 100, 3);
+    assert_eq!(outcome.counts.keys().collect::<Vec<_>>(), [secret]);
+}
+
+#[test]
+fn noisy_ghz() {
+    let qubit = |i: usize| format!("%Qubit* inttoptr (i64 {i} to %Qubit*)");
+    let mut body = format!("  call void @__quantum__qis__h__body({})\n", qubit(0));
+    for i in 1..5 {
+        body += &format!(
+            "  call void @__quantum__qis__cnot__body({}, {})\n",
+            qubit(i - 1),
+            qubit(i)
+        );
+    }
+    for i in 0..5 {
+        body += &format!(
+            "  call void @__quantum__qis__mz__body({}, %Result* inttoptr (i64 {i} to %Result*))\n",
+            qubit(i)
+        );
+    }
+    let source = format!(
+        "%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {{
+entry:
+{body}  ret void
+}}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+
+attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"5\" \"required_num_results\"=\"5\" }}
+"
+    );
+    let calibration = Calibration::parse(include_str!("../examples/line5.cal")).unwrap();
+    let program = compile(&source, 1);
+    let estimate = cost::analyse(&program, Some(&calibration))
+        .worst
+        .success
+        .unwrap();
+    let config = ExecConfig {
+        shots: 20_000,
+        seed: 4,
+        keep_state: false,
+    };
+    let noisy = exec::execute_noisy(&program, config, &calibration);
+    let correct = ["00000", "11111"]
+        .iter()
+        .map(|key| noisy.counts.get(*key).copied().unwrap_or(0))
+        .sum::<u64>() as f64
+        / 20_000.0;
+    assert!(noisy.counts.len() > 2);
+    assert!(
+        correct > estimate && correct < estimate + 0.08,
+        "{correct} vs {estimate}"
+    );
+    assert_eq!(exec::execute(&program, config).counts.len(), 2);
+}

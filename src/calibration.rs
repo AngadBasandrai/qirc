@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::ir::{GateKind, Op};
+use crate::ir::{Gate, GateKind, Op};
 use crate::route::Coupling;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -79,35 +79,37 @@ impl Calibration {
             .unwrap_or_else(|| self.cx.values().sum::<f64>() / self.cx.len().max(1) as f64)
     }
 
-    pub fn infidelity<'a>(&self, ops: impl IntoIterator<Item = &'a Op>) -> f64 {
-        let loss = |e: f64| -(-e).ln_1p();
-        let mut total = 0.0;
-        for op in ops {
-            match op {
-                Op::Gate(gate) => {
-                    let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
-                    total += match wires[..] {
-                        [q] => loss(self.single.get(&q).copied().unwrap_or(0.0)),
-                        [a, b] if gate.kind == GateKind::Swap => 3.0 * loss(self.cx(a, b)),
-                        [a, b] => loss(self.cx(a, b)),
-                        _ => {
-                            let mut sum = 0.0;
-                            for (i, &a) in wires.iter().enumerate() {
-                                for &b in &wires[i + 1..] {
-                                    sum += 2.0 * loss(self.cx(a, b));
-                                }
-                            }
-                            sum
-                        }
-                    };
+    pub fn readout(&self, q: usize) -> f64 {
+        self.readout.get(&q).copied().unwrap_or(0.0)
+    }
+
+    pub fn gate_error(&self, gate: &Gate) -> f64 {
+        let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
+        match wires[..] {
+            [q] => self.single.get(&q).copied().unwrap_or(0.0),
+            [a, b] if gate.kind == GateKind::Swap => 1.0 - (1.0 - self.cx(a, b)).powi(3),
+            [a, b] => self.cx(a, b),
+            _ => {
+                let mut kept = 1.0;
+                for (i, &a) in wires.iter().enumerate() {
+                    for &b in &wires[i + 1..] {
+                        kept *= (1.0 - self.cx(a, b)).powi(2);
+                    }
                 }
-                Op::Measure { qubit, .. } => {
-                    total += loss(self.readout.get(&qubit.index()).copied().unwrap_or(0.0));
-                }
-                _ => {}
+                1.0 - kept
             }
         }
-        total
+    }
+
+    pub fn infidelity<'a>(&self, ops: impl IntoIterator<Item = &'a Op>) -> f64 {
+        let loss = |e: f64| -(-e).ln_1p();
+        ops.into_iter()
+            .map(|op| match op {
+                Op::Gate(gate) => loss(self.gate_error(gate)),
+                Op::Measure { qubit, .. } => loss(self.readout(qubit.index())),
+                _ => 0.0,
+            })
+            .sum()
     }
 }
 

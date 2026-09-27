@@ -318,12 +318,13 @@ fn opt_levels_measured() {
         let qubits = 2 + rng.below(3);
         let source = random_measured_circuit(&mut rng, qubits);
 
-        let base = counts(&source, 0, 600, 4242);
+        let base = equiv::explore(&compile(&source, 0));
         for level in 1..=3 {
-            assert_eq!(
-                base,
-                counts(&source, level, 600, 4242),
-                "trial {trial} at -O{level} changed the observed outcomes\n{source}"
+            let other = equiv::explore(&compile(&source, level));
+            let differences = equiv::compare(&base, &other, true);
+            assert!(
+                differences.is_empty(),
+                "trial {trial} at -O{level} changed the observed outcomes: {differences:?}\n{source}"
             );
         }
     }
