@@ -4,6 +4,9 @@ use common::compile;
 use qirc::driver::{self, Target};
 use qirc::equiv;
 use qirc::ir::*;
+use qirc::route::Coupling;
+use qirc::simulator::matrix::C64;
+use qirc::synth::Cost;
 use qirc::transpile::GateSet;
 
 fn module(body: &str) -> String {
@@ -55,16 +58,19 @@ fn measure(qubit: u32) -> String {
 }
 
 fn targeted(source: &str, level: u8, gates: Option<&str>, resynth: Option<usize>) -> Program {
-    let compilation = driver::compile_for(
+    checked(
         source,
         level,
-        false,
         &Target {
             gates: gates.map(|g| GateSet::parse(g).unwrap()),
             resynth,
             ..Default::default()
         },
-    );
+    )
+}
+
+fn checked(source: &str, level: u8, target: &Target) -> Program {
+    let compilation = driver::compile_for(source, level, false, target);
     let reference = equiv::explore(&compile(source, 0));
     let differences = equiv::compare(&reference, &equiv::explore(&compilation.program), true);
     assert!(differences.is_empty(), "{differences:?}\n{source}");
@@ -110,6 +116,40 @@ fn longer_rewrites() {
     let source = module(&[call("cx", &[0, 1]), call("x", &[0]), call("cx", &[0, 1])].concat());
     assert_eq!(targeted(&source, 0, None, Some(1)).gate_count(), 3);
     assert_eq!(names(&targeted(&source, 0, None, Some(2))), ["x", "x"]);
+}
+
+#[test]
+fn fewest_cnots() {
+    let source = module(
+        &[
+            call("cx", &[0, 1]),
+            rz(0.3, 1),
+            call("cx", &[0, 1]),
+            call("h", &[0]),
+            call("cx", &[1, 0]),
+            call("t", &[1]),
+            call("cx", &[0, 1]),
+            rz(0.7, 0),
+            call("cx", &[1, 0]),
+            call("s", &[1]),
+            call("cx", &[0, 1]),
+        ]
+        .concat(),
+    );
+    let entanglers = |cost| {
+        let target = Target {
+            gates: Some(GateSet::parse("rz-sx-cx").unwrap()),
+            cost,
+            ..Default::default()
+        };
+        checked(&source, 3, &target)
+            .gates()
+            .filter(|g| g.wires().count() == 2)
+            .count()
+    };
+    assert_eq!(entanglers(Cost::Gates), 6);
+    assert!(entanglers(Cost::Cx) <= 3);
+    assert!(entanglers(Cost::Ibm) <= 3);
 }
 
 #[test]
@@ -234,4 +274,54 @@ attributes #0 = { \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"requir
     let outcomes = equiv::explore(&compile(source, 0));
     assert!(outcomes.branches.is_empty());
     assert!(outcomes.unexplored > 0.99);
+}
+
+#[test]
+fn routed_states() {
+    let mut seed = 11u64;
+    let mut next = |bound: u32| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) % u64::from(bound)) as u32
+    };
+    for coupling in ["line:6", "grid:2x3", "ring:6"] {
+        let mut body = String::new();
+        for _ in 0..30 {
+            let a = next(5);
+            let b = (a + 1 + next(4)) % 5;
+            body += &call("h", &[a]);
+            body += &call("t", &[b]);
+            body += &call("cx", &[a, b]);
+        }
+        let source = module(&body).replace(
+            "\"required_num_qubits\"=\"3\"",
+            "\"required_num_qubits\"=\"5\"",
+        );
+        let original = common::final_state(&compile(&source, 0));
+        let routed = driver::compile_for(
+            &source,
+            0,
+            false,
+            &Target {
+                coupling: Coupling::parse(coupling),
+                ..Default::default()
+            },
+        );
+        let layout = routed.routed.unwrap().final_layout;
+        let state = common::final_state(&routed.program);
+        let mut overlap = C64::new(0.0, 0.0);
+        for logical in 0..original.len() {
+            let physical: usize = (0..5)
+                .filter(|q| logical >> q & 1 == 1)
+                .map(|q| 1 << layout[q])
+                .sum();
+            overlap += original.amplitude(logical).conj() * state.amplitude(physical);
+        }
+        assert!(
+            (overlap.norm() - 1.0).abs() < 1e-9,
+            "{coupling}: overlap {}",
+            overlap.norm()
+        );
+    }
 }

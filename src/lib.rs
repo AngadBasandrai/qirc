@@ -1,10 +1,12 @@
 pub mod ast;
 pub mod codegen;
+pub mod cost;
 pub mod diag;
 pub mod driver;
 pub mod equiv;
 pub mod inline;
 pub mod ir;
+mod kak;
 pub mod lex;
 pub mod lower;
 pub mod opt;

@@ -1,10 +1,15 @@
 use std::collections::BTreeMap;
+use std::fmt;
+use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::slice;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::codegen;
+use crate::cost;
 use crate::diag::{Diagnostic, Severity, SourceFile};
 use crate::equiv;
 use crate::ir::Program;
@@ -16,7 +21,7 @@ use crate::sema;
 use crate::simulator::exec::{self, ExecConfig};
 use crate::simulator::simd;
 use crate::simulator::state;
-use crate::synth;
+use crate::synth::{self, Cost};
 use crate::transpile::{self, GateSet, TranspileStats};
 use crate::verify;
 
@@ -30,6 +35,7 @@ pub enum Emit {
     Qir,
     Json,
     Circuit,
+    Cost,
     Check,
 }
 
@@ -42,6 +48,7 @@ impl Emit {
             "qir" | "llvm" => Emit::Qir,
             "json" => Emit::Json,
             "circuit" => Emit::Circuit,
+            "cost" => Emit::Cost,
             "check" => Emit::Check,
             _ => return None,
         })
@@ -96,6 +103,57 @@ fn enable_ansi() -> bool {
     true
 }
 
+#[derive(Default)]
+pub struct Output {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Output {
+    fn print(&mut self, text: impl fmt::Display) {
+        self.stdout.push_str(&text.to_string());
+    }
+
+    fn println(&mut self, text: impl fmt::Display) {
+        self.print(text);
+        self.stdout.push('\n');
+    }
+
+    fn eprint(&mut self, text: impl fmt::Display) {
+        self.stderr.push_str(&text.to_string());
+    }
+
+    fn eprintln(&mut self, text: impl fmt::Display) {
+        self.eprint(text);
+        self.stderr.push('\n');
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {
+    let started = Instant::now();
+    let value = work();
+    (value, started.elapsed())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {
+    (work(), Duration::ZERO)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn clock_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn clock_seed() -> u64 {
+    1
+}
+
 pub struct Options {
     pub input: PathBuf,
     pub emit: Emit,
@@ -108,6 +166,7 @@ pub struct Options {
     pub verify_each: bool,
     pub gates: Option<GateSet>,
     pub resynth: Option<usize>,
+    pub cost: Cost,
     pub coupling: Option<Coupling>,
     pub color: Color,
     pub diff: bool,
@@ -128,6 +187,7 @@ impl Default for Options {
             verify_each: false,
             gates: None,
             resynth: None,
+            cost: Cost::Gates,
             coupling: None,
             color: Color::Auto,
             diff: false,
@@ -146,7 +206,8 @@ usage:
                     behaves exactly like a.ll at -O0
 
 options:
-  --emit <kind>     run | ir | qasm3 | qir | json | circuit | check   (default: run)
+  --emit <kind>     run | ir | qasm3 | qir | json | circuit | cost | check
+                    (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
   --shots <n>       sample n measurement outcomes
   --seed <n>        seed the random number generator
@@ -158,6 +219,7 @@ options:
   --basis <name>    same as --gates
   --resynth <n>     replace runs of gates by at most n gates, 1 to 6
                     (default 1 from -O2)
+  --cost <model>    what resynthesis minimises: gates | cx | ibm       (default: gates)
   --coupling <map>  route onto hardware: line:N | ring:N | grid:RxC | full:N
                     or an explicit edge list such as 0-1,1-2,2-3
   --verify-each     run the IR verifier after lowering and after every pass
@@ -219,6 +281,13 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
                     Ok(n @ 1..=6) => Some(n),
                     _ => return Err(format!("resynthesis length `{value}` must be 1 to 6")),
                 };
+            }
+
+            "--cost" => {
+                let value = value(&mut args, "--cost needs a model")?;
+                options.cost = Cost::parse(value).ok_or_else(|| {
+                    format!("unknown cost model `{value}`, expected gates, cx or ibm")
+                })?;
             }
 
             "--coupling" => {
@@ -291,6 +360,7 @@ pub struct Target {
     pub gates: Option<GateSet>,
     pub coupling: Option<Coupling>,
     pub resynth: Option<usize>,
+    pub cost: Cost,
 }
 
 pub struct Compilation {
@@ -311,14 +381,10 @@ pub fn compile(source: &str, opt_level: u8) -> Compilation {
 pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Target) -> Compilation {
     let mut diagnostics = Vec::new();
 
-    let started = Instant::now();
-    let (module, parse_errors) = parse_module(source);
-    let parse_time = started.elapsed();
+    let ((module, parse_errors), parse_time) = timed(|| parse_module(source));
     diagnostics.extend(parse_errors);
 
-    let started = Instant::now();
-    let lowered = lower::lower(&module);
-    let lower_time = started.elapsed();
+    let (lowered, lower_time) = timed(|| lower::lower(&module));
     diagnostics.extend(lowered.diagnostics);
 
     let mut program = lowered.program;
@@ -332,9 +398,8 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
         }
     }
 
-    let started = Instant::now();
-    let mut stats = opt::optimise(&mut program, opt_level, verify_each && lowered_cleanly);
-    let opt_time = started.elapsed();
+    let (mut stats, opt_time) =
+        timed(|| opt::optimise(&mut program, opt_level, verify_each && lowered_cleanly));
 
     lowering_violations.append(&mut stats.violations);
     stats.violations = lowering_violations;
@@ -357,14 +422,11 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     }
 
     let native = GateSet::native();
+    let set = target.gates.as_ref().unwrap_or(&native);
     let limit = target.resynth.unwrap_or(usize::from(opt_level >= 2));
-    let removed = synth::resynthesize(
-        &mut program,
-        target.gates.as_ref().unwrap_or(&native),
-        limit,
-    );
-    if removed > 0 {
-        stats.applied.push(("resynthesize", removed));
+    let replaced = synth::resynthesize(&mut program, set, limit, target.cost);
+    if replaced > 0 {
+        stats.applied.push(("resynthesize", replaced));
         stats.gates_after = program.gate_count();
         stats.depth_after = program.depth();
         stats.ops_after = program.op_count();
@@ -380,8 +442,11 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
             ),
         }
     }
-    if let (Some(_), Some(set)) = (&routed, &target.gates) {
-        transpile::transpile(&mut program, set);
+    if routed.is_some() {
+        if let Some(gates) = &target.gates {
+            transpile::transpile(&mut program, gates);
+        }
+        synth::resynthesize(&mut program, set, limit, target.cost);
     }
 
     if verify_each && (transpiled.is_some() || routed.is_some()) {
@@ -402,11 +467,14 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
     }
 }
 
-fn read(path: &PathBuf) -> Option<SourceFile> {
-    match std::fs::read_to_string(path) {
+fn read(path: &PathBuf, output: &mut Output) -> Option<SourceFile> {
+    match fs::read_to_string(path) {
         Ok(text) => Some(SourceFile::new(path.display().to_string(), text)),
         Err(error) => {
-            eprintln!("error: cannot read {}: {error}", path.display());
+            output.eprintln(format_args!(
+                "error: cannot read {}: {error}",
+                path.display()
+            ));
             None
         }
     }
@@ -417,49 +485,44 @@ fn target(options: &Options) -> Target {
         gates: options.gates.clone(),
         coupling: options.coupling.clone(),
         resynth: options.resynth,
+        cost: options.cost,
     }
 }
 
-fn report(file: &SourceFile, compilation: &Compilation, color: bool) -> bool {
+fn report(file: &SourceFile, compilation: &Compilation, color: bool, output: &mut Output) -> bool {
     for violation in &compilation.stats.violations {
-        eprintln!("internal error: verifier: {violation}");
+        output.eprintln(format_args!("internal error: verifier: {violation}"));
     }
 
     let mut errors = 0;
     for diagnostic in &compilation.diagnostics {
-        eprintln!("{}", diagnostic.render_styled(file, color));
+        output.eprintln(format_args!("{}", diagnostic.render_styled(file, color)));
         if diagnostic.severity == Severity::Error {
             errors += 1;
         }
     }
 
     if !compilation.stats.violations.is_empty() {
-        eprintln!(
+        output.eprintln(format_args!(
             "error: aborting after {} verifier violation(s)",
             compilation.stats.violations.len()
-        );
+        ));
         return false;
     }
 
     if errors > 0 {
-        eprintln!(
+        output.eprintln(format_args!(
             "error: aborting due to {errors} previous error{}",
             if errors == 1 { "" } else { "s" }
-        );
+        ));
         return false;
     }
 
     true
 }
 
-fn diff(options: &Options) -> i32 {
+fn diff(options: &Options, left: &SourceFile, right: &SourceFile, output: &mut Output) -> i32 {
     let color = options.color.enabled();
-    let Some(left) = read(&options.input) else {
-        return 1;
-    };
-    let Some(right) = read(options.other.as_ref().unwrap_or(&options.input)) else {
-        return 1;
-    };
 
     let reference = compile_for(&left.text, 0, false, &Target::default());
     let candidate = compile_for(
@@ -468,13 +531,15 @@ fn diff(options: &Options) -> i32 {
         options.verify_each,
         &target(options),
     );
-    if !report(&left, &reference, color) || !report(&right, &candidate, color) {
+    if !report(left, &reference, color, output) || !report(right, &candidate, color, output) {
         return 1;
     }
 
     for program in [&reference.program, &candidate.program] {
         if program.num_qubits as usize > DIFF_QUBITS {
-            eprintln!("error: diff follows every branch and supports at most {DIFF_QUBITS} qubits");
+            output.eprintln(format_args!(
+                "error: diff follows every branch and supports at most {DIFF_QUBITS} qubits"
+            ));
             return 1;
         }
     }
@@ -501,19 +566,21 @@ fn diff(options: &Options) -> i32 {
     };
 
     if !differences.is_empty() {
-        println!("different:");
+        output.println(format_args!("different:"));
         for difference in differences.iter().take(8) {
-            println!("  {difference}");
+            output.println(format_args!("  {difference}"));
         }
     } else if complete {
-        println!("equivalent: {count} {noun} in {checked}");
+        output.println(format_args!("equivalent: {count} {noun} in {checked}"));
     } else {
-        println!(
+        output.println(format_args!(
             "inconclusive: {count} {noun} in {checked}, but {unexplored:.2e} of the probability was not explored"
-        );
+        ));
     }
     if !states {
-        println!("note: final states are not compared because --coupling moves qubits");
+        output.println(format_args!(
+            "note: final states are not compared because --coupling moves qubits"
+        ));
     }
 
     match (differences.is_empty(), complete) {
@@ -524,170 +591,198 @@ fn diff(options: &Options) -> i32 {
 }
 
 pub fn run(options: Options) -> i32 {
+    let mut output = Output::default();
+    let code = match read(&options.input, &mut output) {
+        Some(file) => match &options.other {
+            Some(path) => match read(path, &mut output) {
+                Some(other) => run_source(&options, &file, Some(&other), &mut output),
+                None => 1,
+            },
+            None => run_source(&options, &file, None, &mut output),
+        },
+        None => 1,
+    };
+    eprint!("{}", output.stderr);
+    print!("{}", output.stdout);
+    code
+}
+
+pub fn run_source(
+    options: &Options,
+    file: &SourceFile,
+    other: Option<&SourceFile>,
+    output: &mut Output,
+) -> i32 {
     if options.diff {
-        return diff(&options);
+        return diff(options, file, other.unwrap_or(file), output);
     }
 
-    let Some(file) = read(&options.input) else {
-        return 1;
-    };
     let compilation = compile_for(
         &file.text,
         options.opt_level,
         options.verify_each,
-        &target(&options),
+        &target(options),
     );
 
     let color = options.color.enabled();
-    if !report(&file, &compilation, color) {
+    if !report(file, &compilation, color, output) {
         return 1;
     }
 
     let program = &compilation.program;
 
     if options.verbose {
-        eprintln!(
+        output.eprintln(format_args!(
             "parse {:?}, lower {:?}, optimise {:?}",
             compilation.parse_time, compilation.lower_time, compilation.opt_time
-        );
-        eprint!("{}", compilation.stats);
+        ));
+        output.eprint(format_args!("{}", compilation.stats));
         if let Some(stats) = &compilation.transpiled {
-            eprintln!("{stats}");
+            output.eprintln(format_args!("{stats}"));
         }
         if let Some(stats) = &compilation.routed {
-            eprintln!("{stats}");
+            output.eprintln(format_args!("{stats}"));
         }
     }
 
     let emitted = match options.emit {
         Emit::Check => {
-            println!("ok: {}", summary(program));
+            output.println(format_args!("ok: {}", summary(program)));
             return 0;
         }
         Emit::Ir => format!("{program}"),
         Emit::Qasm3 => match codegen::emit_qasm3(program) {
             Ok(text) => text,
             Err(reason) => {
-                eprintln!("error: cannot emit OpenQASM 3: {reason}");
-                eprintln!("note: --emit qir keeps the whole program");
+                output.eprintln(format_args!("error: cannot emit OpenQASM 3: {reason}"));
+                output.eprintln(format_args!("note: --emit qir keeps the whole program"));
                 return 1;
             }
         },
         Emit::Qir => match codegen::emit_qir(program) {
             Ok(text) => text,
             Err(reason) => {
-                eprintln!("error: cannot emit QIR: {reason}");
+                output.eprintln(format_args!("error: cannot emit QIR: {reason}"));
                 return 1;
             }
         },
         Emit::Json => codegen::emit_json(program),
         Emit::Circuit => codegen::emit_circuit(program),
-        Emit::Run => return execute(&options, &compilation),
+        Emit::Cost => cost::analyse(program).to_string(),
+        Emit::Run => return execute(options, &compilation, output),
     };
 
     match &options.output {
         Some(path) => {
-            if let Err(error) = std::fs::write(path, &emitted) {
-                eprintln!("error: cannot write {}: {error}", path.display());
+            if let Err(error) = fs::write(path, &emitted) {
+                output.eprintln(format_args!(
+                    "error: cannot write {}: {error}",
+                    path.display()
+                ));
                 return 1;
             }
-            eprintln!("wrote {}", path.display());
+            output.eprintln(format_args!("wrote {}", path.display()));
         }
-        None => print!("{emitted}"),
+        None => output.print(emitted),
     }
 
     0
 }
 
-fn execute(options: &Options, compilation: &Compilation) -> i32 {
+fn execute(options: &Options, compilation: &Compilation, output: &mut Output) -> i32 {
     let program = &compilation.program;
 
     let qubits = program.num_qubits as usize;
     if qubits > state::MAX_QUBITS {
-        eprintln!(
+        output.eprintln(format_args!(
             "error: this program needs {qubits} qubits, but the simulator supports at most {}",
             state::MAX_QUBITS
-        );
+        ));
         match state::memory_required(qubits) {
-            Some(bytes) => eprintln!(
+            Some(bytes) => output.eprintln(format_args!(
                 "note: a {qubits} qubit state vector would need {:.1} GiB of memory",
                 bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-            ),
-            None => eprintln!("note: a {qubits} qubit state vector does not fit in memory"),
+            )),
+            None => output.eprintln(format_args!(
+                "note: a {qubits} qubit state vector does not fit in memory"
+            )),
         }
-        eprintln!("note: use --emit qir, qasm3, json or circuit to compile without simulating");
+        output.eprintln(format_args!(
+            "note: use --emit qir, qasm3, json or circuit to compile without simulating"
+        ));
         return 1;
     }
 
-    let seed = options.seed.unwrap_or_else(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(1)
-    });
+    let seed = options.seed.unwrap_or_else(clock_seed);
 
-    println!("source:  {}", options.input.display());
-    println!("kernel:  {}", simd::backend());
-    println!("program: {}", summary(program));
+    output.println(format_args!("source:  {}", options.input.display()));
+    output.println(format_args!("kernel:  {}", simd::backend()));
+    output.println(format_args!("program: {}", summary(program)));
 
     if compilation.stats.changed() {
-        println!(
+        output.println(format_args!(
             "optimised: {} gates removed ({} -> {})",
             compilation.stats.gates_removed(),
             compilation.stats.gates_before,
             compilation.stats.gates_after
-        );
+        ));
     }
 
-    println!();
-    print!("{}", codegen::emit_circuit(program));
+    output.println("");
+    output.print(format_args!("{}", codegen::emit_circuit(program)));
 
-    let started = Instant::now();
-    let outcome = exec::execute(
-        program,
-        ExecConfig {
-            shots: options.shots,
-            seed,
-            keep_state: options.show_state,
-        },
-    );
-    let elapsed = started.elapsed();
+    let (outcome, elapsed) = timed(|| {
+        exec::execute(
+            program,
+            ExecConfig {
+                shots: options.shots,
+                seed,
+                keep_state: options.show_state,
+            },
+        )
+    });
 
     if outcome.aborted {
-        eprintln!("error: execution did not terminate within the step limit");
+        output.eprintln(format_args!(
+            "error: execution did not terminate within the step limit"
+        ));
         return 1;
     }
 
     if let Some(state) = &outcome.final_state {
-        println!();
+        output.println("");
         if !outcome.sampled {
-            println!("state after the last shot:");
+            output.println(format_args!("state after the last shot:"));
         }
-        print!("{state}");
+        output.print(format_args!("{state}"));
 
-        println!();
+        output.println("");
         for qubit in 0..program.num_qubits as usize {
-            println!("  P(q{qubit} = 1) = {:.6}", state.qubit_probability(qubit));
+            output.println(format_args!(
+                "  P(q{qubit} = 1) = {:.6}",
+                state.qubit_probability(qubit)
+            ));
         }
     }
 
     if !outcome.messages.is_empty() {
-        println!();
+        output.println("");
         for message in &outcome.messages {
-            println!("message: {message}");
+            output.println(format_args!("message: {message}"));
         }
     }
 
     if !outcome.outputs.is_empty() {
-        println!();
-        println!("output recording:");
+        output.println("");
+        output.println(format_args!("output recording:"));
         for record in &outcome.outputs {
-            println!("  {record}");
+            output.println(format_args!("  {record}"));
         }
     }
 
-    print_tally("returned", "", &outcome.returns);
+    print_tally(output, "returned", "", &outcome.returns);
     print_tally(
+        output,
         "measurement",
         if outcome.sampled {
             " (sampled from the final state)"
@@ -697,8 +792,10 @@ fn execute(options: &Options, compilation: &Compilation) -> i32 {
         &outcome.counts,
     );
 
-    println!();
-    println!("simulated in {elapsed:.3?}");
+    if !elapsed.is_zero() {
+        output.println("");
+        output.println(format_args!("simulated in {elapsed:.3?}"));
+    }
     0
 }
 
@@ -713,7 +810,7 @@ fn summary(program: &Program) -> String {
     )
 }
 
-fn print_tally(name: &str, note: &str, tally: &BTreeMap<String, u64>) {
+fn print_tally(output: &mut Output, name: &str, note: &str, tally: &BTreeMap<String, u64>) {
     if tally.is_empty() {
         return;
     }
@@ -723,12 +820,12 @@ fn print_tally(name: &str, note: &str, tally: &BTreeMap<String, u64>) {
     let mut rows: Vec<(&String, &u64)> = tally.iter().collect();
     rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
 
-    println!();
-    println!("{name} over {total} shots{note}:");
+    output.println("");
+    output.println(format_args!("{name} over {total} shots{note}:"));
     for (key, count) in rows {
-        println!(
+        output.println(format_args!(
             "  {key:<width$}  {count:>8}   {:.4}",
             *count as f64 / total as f64
-        );
+        ));
     }
 }

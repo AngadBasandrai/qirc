@@ -1,0 +1,1659 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>qirc Playground</title>
+<meta name="description" content="Compile, optimise, route and simulate QIR in the browser with qirc running as WebAssembly.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root {
+  --ground: #edf1f4;
+  --panel: #ffffff;
+  --well: #f6f8fa;
+  --ink: #14202b;
+  --muted: #586775;
+  --line: #d3dbe2;
+  --wire: #9aa8b5;
+  --accent: #0a6a92;
+  --accent-soft: #dcecf3;
+  --accent-ink: #ffffff;
+  --good: #1a7a43;
+  --warn: #9a5500;
+  --bad: #b3261e;
+  --bad-soft: #fbe3e1;
+  --warn-soft: #fbeed8;
+  --syn-comment: #7b8794;
+  --syn-keyword: #7a3e9d;
+  --syn-intrinsic: #0a6a92;
+  --syn-name: #8a4b08;
+  --syn-number: #1a7a43;
+  --syn-string: #a3321f;
+  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --sans: "IBM Plex Sans", system-ui, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground: #0d1217;
+    --panel: #141b22;
+    --well: #10161c;
+    --ink: #e2e8ee;
+    --muted: #8c9aa8;
+    --line: #26313b;
+    --wire: #4a5967;
+    --accent: #52b4dc;
+    --accent-soft: #15303d;
+    --accent-ink: #06141b;
+    --good: #5cc98a;
+    --warn: #e0a24a;
+    --bad: #f07b72;
+    --bad-soft: #3a1c1a;
+    --warn-soft: #362812;
+    --syn-comment: #6c7a88;
+    --syn-keyword: #c792ea;
+    --syn-intrinsic: #52b4dc;
+    --syn-name: #e5b567;
+    --syn-number: #8fd6a4;
+    --syn-string: #f29a8a;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --ground: #0d1217;
+  --panel: #141b22;
+  --well: #10161c;
+  --ink: #e2e8ee;
+  --muted: #8c9aa8;
+  --line: #26313b;
+  --wire: #4a5967;
+  --accent: #52b4dc;
+  --accent-soft: #15303d;
+  --accent-ink: #06141b;
+  --good: #5cc98a;
+  --warn: #e0a24a;
+  --bad: #f07b72;
+  --bad-soft: #3a1c1a;
+  --warn-soft: #362812;
+  --syn-comment: #6c7a88;
+  --syn-keyword: #c792ea;
+  --syn-intrinsic: #52b4dc;
+  --syn-name: #e5b567;
+  --syn-number: #8fd6a4;
+  --syn-string: #f29a8a;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font: 14px/1.5 var(--sans);
+}
+.app {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 100%;
+  max-width: 1480px;
+  margin: 0 auto;
+  padding-inline: 16px;
+  padding-block: 14px 16px;
+}
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px 24px;
+}
+.brand { display: flex; flex-direction: column; gap: 2px; }
+.mark { font: 600 22px/1.1 var(--mono); letter-spacing: -0.02em; }
+.mark b { color: var(--accent); font-weight: 600; }
+.tagline { color: var(--muted); max-width: 64ch; font-size: 13.5px; }
+.header-tools { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+select, input {
+  font: 13px/1.3 var(--mono);
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  min-width: 0;
+}
+input[type="number"] { width: 8ch; }
+.controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px 14px; }
+.emit {
+  display: flex;
+  flex-wrap: wrap;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.emit button {
+  font: 500 12.5px/1 var(--mono);
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-right: 1px solid var(--line);
+  padding: 8px 11px;
+  cursor: pointer;
+}
+.emit button:last-child { border-right: 0; }
+.emit button[aria-checked="true"] { background: var(--accent-soft); color: var(--accent); }
+.command {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 6px 6px 12px;
+}
+.command label { font: 500 13px var(--mono); color: var(--muted); white-space: nowrap; }
+.command input { flex: 1; border: 0; background: transparent; padding: 6px 0; }
+.command input:focus-visible { outline: none; }
+.command:focus-within { border-color: var(--accent); }
+.run {
+  font: 600 13px/1 var(--sans);
+  color: var(--accent-ink);
+  background: var(--accent);
+  border: 0;
+  border-radius: 6px;
+  padding: 9px 16px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.run kbd { font: 500 11px var(--mono); opacity: 0.75; margin-left: 6px; }
+.ghost {
+  font: 500 12px var(--sans);
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ghost:hover { color: var(--ink); }
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+  align-items: baseline;
+  min-height: 22px;
+  font-variant-numeric: tabular-nums;
+}
+.metric { display: flex; align-items: baseline; gap: 7px; }
+.metric span:first-child {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.metric b { font: 500 13px var(--mono); }
+.metric .from { font: 13px var(--mono); color: var(--muted); }
+.metric .better { color: var(--good); }
+.metric .worse { color: var(--warn); }
+.stats .note { font-size: 12.5px; color: var(--muted); }
+.panes {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  flex: 1;
+  min-height: 520px;
+  height: 70vh;
+}
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px 6px 12px;
+  border-bottom: 1px solid var(--line);
+  font: 500 12px var(--mono);
+  color: var(--muted);
+  min-height: 42px;
+}
+.group { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.editor { position: relative; display: flex; flex: 1; min-height: 0; background: var(--well); }
+.editor.dropping { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.gutter {
+  flex: none;
+  overflow: hidden;
+  padding: 12px 8px 12px 10px;
+  min-width: 44px;
+  text-align: right;
+  color: var(--syn-comment);
+  font: 12.5px/1.6 var(--mono);
+  white-space: pre;
+  user-select: none;
+  border-right: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+}
+.gutter .error { color: var(--bad); font-weight: 600; background: var(--bad-soft); }
+.gutter .warning { color: var(--warn); font-weight: 600; background: var(--warn-soft); }
+.code { position: relative; flex: 1; min-width: 0; }
+.code pre, .code textarea {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 12px 14px;
+  font: 12.5px/1.6 var(--mono);
+  white-space: pre;
+  tab-size: 2;
+  border: 0;
+  letter-spacing: 0;
+}
+.code pre { overflow: hidden; color: var(--ink); pointer-events: none; }
+.code textarea {
+  width: 100%;
+  height: 100%;
+  resize: none;
+  outline: none;
+  overflow: auto;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--ink);
+}
+.code textarea::selection { background: var(--accent-soft); color: transparent; }
+.t-comment { color: var(--syn-comment); font-style: italic; }
+.t-keyword { color: var(--syn-keyword); }
+.t-intrinsic { color: var(--syn-intrinsic); font-weight: 500; }
+.t-name { color: var(--syn-name); }
+.t-number { color: var(--syn-number); }
+.t-string { color: var(--syn-string); }
+.tabs { display: flex; gap: 2px; }
+.tabs button {
+  font: 500 12px var(--mono);
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 6px 9px;
+  cursor: pointer;
+}
+.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+.view { flex: 1; min-height: 0; overflow: auto; }
+.view[hidden] { display: none; }
+pre.text {
+  margin: 0;
+  padding: 12px 14px;
+  font: 12.5px/1.6 var(--mono);
+  white-space: pre;
+  font-variant-numeric: tabular-nums;
+}
+#stderr { border-bottom: 1px solid var(--line); background: var(--well); }
+.a-bold { font-weight: 600; }
+.a-red { color: var(--bad); }
+.a-yellow { color: var(--warn); }
+.a-blue { color: var(--accent); }
+a.loc { color: inherit; text-decoration: underline dotted; cursor: pointer; }
+.chip {
+  font: 500 11px/1 var(--mono);
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.chip.good { color: var(--good); }
+.chip.warn { color: var(--warn); }
+.chip.bad { color: var(--bad); }
+.chip.idle { color: var(--muted); }
+.timing { font: 12px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.empty { padding: 18px 14px; color: var(--muted); font-size: 13px; max-width: 60ch; }
+.circuit { padding: 8px 6px 12px; }
+.circuit svg { display: block; }
+.circuit .wire { stroke: var(--wire); stroke-width: 1; }
+.circuit .link { stroke: var(--accent); stroke-width: 1.5; }
+.circuit .box { fill: var(--panel); stroke: var(--accent); stroke-width: 1.2; }
+.circuit .meter { fill: var(--well); stroke: var(--muted); stroke-width: 1.2; }
+.circuit .dot { fill: var(--accent); }
+.circuit .plus { fill: var(--panel); stroke: var(--accent); stroke-width: 1.5; }
+.circuit text { font: 11px var(--mono); fill: var(--ink); }
+.circuit .qlabel { fill: var(--muted); }
+.circuit .block { font-size: 11px; fill: var(--muted); font-weight: 500; }
+.circuit .term { font-size: 10.5px; fill: var(--muted); }
+.circuit .sep { stroke: var(--line); stroke-dasharray: 4 4; }
+.results { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.results h3 { margin: 0; font: 500 12px var(--sans); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.bars { display: grid; grid-template-columns: max-content minmax(60px, 1fr) max-content; gap: 5px 12px; align-items: center; font: 12.5px var(--mono); font-variant-numeric: tabular-nums; }
+.bar { height: 14px; background: var(--accent); border-radius: 3px; min-width: 2px; }
+.bars .value { color: var(--muted); text-align: right; }
+footer { color: var(--muted); font-size: 12.5px; }
+footer code { font-family: var(--mono); }
+footer a { color: var(--accent); }
+.toast { color: var(--good); font-size: 12px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 900px) {
+  .panes { grid-template-columns: minmax(0, 1fr); height: auto; }
+  .editor { min-height: 340px; }
+  .view { min-height: 320px; }
+  .run kbd { display: none; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .emit button, .ghost, .run, .tabs button { transition: background-color 120ms, color 120ms; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">
+      <span class="mark">qirc<b>/</b>play</span>
+      <span class="tagline">Compile, optimise, route and simulate QIR. The compiler runs in your browser as WebAssembly, so your program never leaves this page.</span>
+    </div>
+    <div class="header-tools">
+      <label class="field" for="example">Example
+        <select id="example"></select>
+      </label>
+      <button type="button" class="ghost" id="open">Open .ll</button>
+      <input type="file" id="file" accept=".ll,.txt,text/plain" hidden>
+      <button type="button" class="ghost" id="share" hidden>Copy link</button>
+    </div>
+  </header>
+
+  <div class="controls">
+    <div class="field">Emit
+      <div class="emit" id="emit" role="radiogroup" aria-label="Output">
+        <button type="button" role="radio" data-emit="run">run</button>
+        <button type="button" role="radio" data-emit="circuit">circuit</button>
+        <button type="button" role="radio" data-emit="qasm3">qasm3</button>
+        <button type="button" role="radio" data-emit="qir">qir</button>
+        <button type="button" role="radio" data-emit="ir">ir</button>
+        <button type="button" role="radio" data-emit="json">json</button>
+        <button type="button" role="radio" data-emit="cost">cost</button>
+        <button type="button" role="radio" data-emit="diff">diff</button>
+      </div>
+    </div>
+    <label class="field" for="opt">Optimise
+      <select id="opt">
+        <option value="0">-O0</option>
+        <option value="1">-O1</option>
+        <option value="2" selected>-O2</option>
+        <option value="3">-O3</option>
+      </select>
+    </label>
+    <label class="field" for="gates">Gate set
+      <select id="gates">
+        <option value="">all QIR gates</option>
+        <option value="rz-sx-cx">rz sx cx (IBM)</option>
+        <option value="rz-ry-cz">rz ry cz</option>
+        <option value="h,s,t,cx">h s t cx (Clifford+T)</option>
+        <option value="rx,ry,cy">rx ry cy</option>
+      </select>
+    </label>
+    <label class="field" for="resynth">Resynthesis
+      <select id="resynth">
+        <option value="">default</option>
+        <option value="2">up to 2 gates</option>
+        <option value="3">up to 3 gates</option>
+        <option value="4">up to 4 gates</option>
+        <option value="6">up to 6 gates</option>
+      </select>
+    </label>
+    <label class="field" for="cost">Minimise
+      <select id="cost">
+        <option value="gates">gates</option>
+        <option value="cx">cx count</option>
+        <option value="ibm">ibm weights</option>
+      </select>
+    </label>
+    <label class="field" for="coupling">Coupling
+      <select id="coupling">
+        <option value="">none</option>
+        <option value="line:4">line:4</option>
+        <option value="line:8">line:8</option>
+        <option value="ring:6">ring:6</option>
+        <option value="grid:3x3">grid:3x3</option>
+        <option value="grid:4x4">grid:4x4</option>
+      </select>
+    </label>
+    <label class="field" for="shots" id="shots-field">Shots
+      <input id="shots" type="number" min="0" max="100000" step="100" value="500">
+    </label>
+    <label class="field" for="seed" id="seed-field">Seed
+      <input id="seed" type="number" min="0" step="1" value="7">
+    </label>
+  </div>
+
+  <div class="command">
+    <label for="command">$ qirc</label>
+    <input id="command" spellcheck="false" autocomplete="off" aria-label="Command line arguments">
+    <button type="button" class="run" id="run">Run<kbd>Ctrl Enter</kbd></button>
+  </div>
+
+  <div class="stats" id="stats" aria-live="polite"></div>
+
+  <div class="panes">
+    <section class="pane" aria-label="Program">
+      <div class="pane-head">
+        <span id="filename">program.ll</span>
+        <div class="group">
+          <span class="timing" id="size"></span>
+          <button type="button" class="ghost" id="reset">Reset</button>
+        </div>
+      </div>
+      <div class="editor" id="drop">
+        <div class="gutter" id="gutter" aria-hidden="true"></div>
+        <div class="code">
+          <pre id="highlight" aria-hidden="true"></pre>
+          <textarea id="editor" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" aria-label="QIR source"></textarea>
+        </div>
+      </div>
+    </section>
+    <section class="pane" aria-label="Output">
+      <div class="pane-head">
+        <div class="group">
+          <div class="tabs" role="tablist" aria-label="Views">
+            <button type="button" role="tab" data-view="text" aria-selected="true">output</button>
+            <button type="button" role="tab" data-view="circuit" aria-selected="false">circuit</button>
+            <button type="button" role="tab" data-view="results" aria-selected="false">results</button>
+          </div>
+          <span class="chip idle" id="status">loading</span>
+          <span class="timing" id="timing"></span>
+        </div>
+        <div class="group">
+          <span class="toast" id="toast"></span>
+          <button type="button" class="ghost" id="stop" hidden>Stop</button>
+          <button type="button" class="ghost" id="download" hidden>Save</button>
+          <button type="button" class="ghost" id="copy">Copy</button>
+        </div>
+      </div>
+      <div class="view" id="view-text" role="tabpanel">
+        <pre class="text" id="stderr" hidden></pre>
+        <pre class="text" id="stdout"></pre>
+      </div>
+      <div class="view circuit" id="view-circuit" role="tabpanel" hidden></div>
+      <div class="view" id="view-results" role="tabpanel" hidden></div>
+    </section>
+  </div>
+
+  <footer>Reads Base Profile, Adaptive Profile, Q# and PyQIR output. <code>diff</code> checks the compiled program against the original at <code>-O0</code>, branch by branch. Simulation is limited to 20 qubits here. Drop a <code>.ll</code> file on the editor to open it. <a href="https://github.com/AngadBasandrai/qirc">Source on GitHub</a>.</footer>
+</div>
+
+<script type="text/plain" id="bell" data-example="Bell pair, Base Profile" data-file="bell.ll">
+; ModuleID = 'BellPair'
+source_filename = "BellPair"
+
+%Result = type opaque
+%Qubit = type opaque
+
+define void @main() #0 {
+block_0:
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*)) #1
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*)) #1
+  call void @__quantum__rt__tuple_record_output(i64 2, i8* null)
+  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 0 to %Result*), i8* null)
+  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 1 to %Result*), i8* null)
+  ret void
+}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+
+declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
+
+declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly) #1
+
+declare void @__quantum__rt__tuple_record_output(i64, i8*)
+
+declare void @__quantum__rt__result_record_output(%Result*, i8*)
+
+attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="base_profile" "required_num_qubits"="2" "required_num_results"="2" }
+attributes #1 = { "irreversible" }
+
+!llvm.module.flags = !{!0, !1, !2, !3}
+
+!0 = !{i32 1, !"qir_major_version", i32 1}
+!1 = !{i32 7, !"qir_minor_version", i32 0}
+!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
+!3 = !{i32 1, !"dynamic_result_management", i1 false}
+</script>
+<script type="text/plain" id="teleport" data-example="Teleportation, Adaptive Profile" data-file="teleport.ll">
+; ModuleID = 'Teleport'
+source_filename = "Teleport"
+
+%Result = type opaque
+%Qubit = type opaque
+
+@0 = internal constant [3 x i8] c"r0\00"
+@1 = internal constant [3 x i8] c"r1\00"
+
+define void @main() #0 {
+entry:
+  call void @__quantum__rt__initialize(i8* null)
+  call void @__quantum__qis__ry__body(double 0.78539816339744828, %Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*)) #1
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*)) #1
+  %0 = call i1 @__quantum__qis__read_result__body(%Result* inttoptr (i64 1 to %Result*))
+  br i1 %0, label %then_x, label %join_x
+
+then_x:                                           ; preds = %entry
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  br label %join_x
+
+join_x:                                           ; preds = %then_x, %entry
+  %1 = call i1 @__quantum__qis__read_result__body(%Result* inttoptr (i64 0 to %Result*))
+  br i1 %1, label %then_z, label %join_z
+
+then_z:                                           ; preds = %join_x
+  call void @__quantum__qis__z__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  br label %join_z
+
+join_z:                                           ; preds = %then_z, %join_x
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 2 to %Qubit*), %Result* inttoptr (i64 2 to %Result*)) #1
+  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 2 to %Result*), i8* getelementptr inbounds ([3 x i8], [3 x i8]* @0, i32 0, i32 0))
+  ret void
+}
+
+declare void @__quantum__rt__initialize(i8*)
+
+declare void @__quantum__qis__h__body(%Qubit*)
+
+declare void @__quantum__qis__x__body(%Qubit*)
+
+declare void @__quantum__qis__z__body(%Qubit*)
+
+declare void @__quantum__qis__ry__body(double, %Qubit*)
+
+declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
+
+declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly) #1
+
+declare i1 @__quantum__qis__read_result__body(%Result*)
+
+declare void @__quantum__rt__result_record_output(%Result*, i8*)
+
+attributes #0 = { "entry_point" "output_labeling_schema"="schema_id" "qir_profiles"="adaptive_profile" "required_num_qubits"="3" "required_num_results"="3" }
+attributes #1 = { "irreversible" }
+
+!llvm.module.flags = !{!0, !1, !2, !3}
+
+!0 = !{i32 1, !"qir_major_version", i32 1}
+!1 = !{i32 7, !"qir_minor_version", i32 0}
+!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
+!3 = !{i32 1, !"dynamic_result_management", i1 false}
+</script>
+<script type="text/plain" id="rus" data-example="Repeat until success, a loop" data-file="repeat.ll">
+; ModuleID = 'repeat_until_success'
+source_filename = "repeat_until_success"
+
+%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {
+entry:
+  br label %attempt
+
+attempt:
+  %tries = phi i64 [ 0, %entry ], [ %next, %attempt ]
+  call void @__quantum__qis__reset__body(%Qubit* null)
+  call void @__quantum__qis__ry__body(double 5.000000e-01, %Qubit* null)
+  call void @__quantum__qis__mz__body(%Qubit* null, %Result* null)
+  %hit = call i1 @__quantum__qis__read_result__body(%Result* null)
+  %next = add i64 %tries, 1
+  %limit = icmp sge i64 %next, 50
+  %stop = or i1 %hit, %limit
+  br i1 %stop, label %done, label %attempt
+
+done:
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  ret void
+}
+
+declare void @__quantum__qis__reset__body(%Qubit*)
+declare void @__quantum__qis__ry__body(double, %Qubit*)
+declare void @__quantum__qis__x__body(%Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly)
+declare i1 @__quantum__qis__read_result__body(%Result*)
+
+attributes #0 = { "entry_point" "qir_profiles"="adaptive_profile" "required_num_qubits"="2" "required_num_results"="2" }
+</script>
+<script type="text/plain" id="redundant" data-example="Redundant gates for the optimiser" data-file="redundant.ll">
+; ModuleID = 'redundant'
+source_filename = "redundant"
+
+%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* null)
+  call void @__quantum__qis__h__body(%Qubit* null)
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__rz__body(double 5.000000e-01, %Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__rz__body(double 2.500000e-01, %Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__rz__body(double 0.000000e+00, %Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__t__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__t__adj(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 3 to %Qubit*))
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 3 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 3 to %Qubit*))
+  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 3 to %Qubit*))
+  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 3 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* null)
+  ret void
+}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__x__body(%Qubit*)
+declare void @__quantum__qis__t__body(%Qubit*)
+declare void @__quantum__qis__t__adj(%Qubit*)
+declare void @__quantum__qis__rz__body(double, %Qubit*)
+declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly)
+
+attributes #0 = { "entry_point" "qir_profiles"="base_profile" "required_num_qubits"="4" "required_num_results"="1" }
+</script>
+<script type="text/plain" id="ising" data-example="Ising model from the Q# compiler" data-file="ising.ll">
+%Result = type opaque
+%Qubit = type opaque
+
+@0 = internal constant [4 x i8] c"0_a\00"
+@1 = internal constant [6 x i8] c"1_a0r\00"
+@2 = internal constant [6 x i8] c"2_a1r\00"
+@3 = internal constant [6 x i8] c"3_a2r\00"
+
+define i64 @ENTRYPOINT__main() #0 {
+block_0:
+  call void @__quantum__rt__initialize(i8* null)
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__rzz__body(double 0.8, %Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__rxx__body(double 0.3, %Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__ryy__body(double 0.5, %Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
+  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 2 to %Qubit*), %Result* inttoptr (i64 2 to %Result*))
+  call void @__quantum__rt__array_record_output(i64 3, i8* getelementptr inbounds ([4 x i8], [4 x i8]* @0, i64 0, i64 0))
+  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 0 to %Result*), i8* getelementptr inbounds ([6 x i8], [6 x i8]* @1, i64 0, i64 0))
+  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 1 to %Result*), i8* getelementptr inbounds ([6 x i8], [6 x i8]* @2, i64 0, i64 0))
+  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 2 to %Result*), i8* getelementptr inbounds ([6 x i8], [6 x i8]* @3, i64 0, i64 0))
+  ret i64 0
+}
+
+declare void @__quantum__rt__initialize(i8*)
+
+declare void @__quantum__qis__h__body(%Qubit*)
+
+declare void @__quantum__qis__rzz__body(double, %Qubit*, %Qubit*)
+
+declare void @__quantum__qis__rxx__body(double, %Qubit*, %Qubit*)
+
+declare void @__quantum__qis__ryy__body(double, %Qubit*, %Qubit*)
+
+declare void @__quantum__rt__array_record_output(i64, i8*)
+
+declare void @__quantum__rt__result_record_output(%Result*, i8*)
+
+declare void @__quantum__qis__m__body(%Qubit*, %Result*) #1
+
+attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="base_profile" "required_num_qubits"="3" "required_num_results"="3" }
+attributes #1 = { "irreversible" }
+
+
+!llvm.module.flags = !{!0, !1, !2, !3}
+
+!0 = !{i32 1, !"qir_major_version", i32 1}
+!1 = !{i32 7, !"qir_minor_version", i32 0}
+!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
+!3 = !{i32 1, !"dynamic_result_management", i1 false}
+</script>
+<script type="text/plain" id="qsteleport" data-example="Teleportation from the Q# compiler" data-file="qsharp_teleport.ll">
+%Result = type opaque
+%Qubit = type opaque
+
+@0 = internal constant [4 x i8] c"0_r\00"
+
+define i64 @ENTRYPOINT__main() #0 {
+block_0:
+  call void @__quantum__rt__initialize(i8* null)
+  call void @__quantum__qis__ry__body(double 0.7853981633974483, %Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
+  %var_0 = call i1 @__quantum__rt__read_result(%Result* inttoptr (i64 0 to %Result*))
+  br i1 %var_0, label %block_1, label %block_2
+block_1:
+  call void @__quantum__qis__z__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  br label %block_2
+block_2:
+  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  %var_3 = call i1 @__quantum__rt__read_result(%Result* inttoptr (i64 1 to %Result*))
+  br i1 %var_3, label %block_3, label %block_4
+block_3:
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  br label %block_4
+block_4:
+  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 2 to %Qubit*), %Result* inttoptr (i64 2 to %Result*))
+  call void @__quantum__qis__reset__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__reset__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__reset__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 2 to %Result*), i8* getelementptr inbounds ([4 x i8], [4 x i8]* @0, i64 0, i64 0))
+  ret i64 0
+}
+
+declare void @__quantum__rt__initialize(i8*)
+
+declare void @__quantum__qis__ry__body(double, %Qubit*)
+
+declare void @__quantum__qis__h__body(%Qubit*)
+
+declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
+
+declare void @__quantum__qis__m__body(%Qubit*, %Result*) #1
+
+declare i1 @__quantum__rt__read_result(%Result*)
+
+declare void @__quantum__qis__z__body(%Qubit*)
+
+declare void @__quantum__qis__x__body(%Qubit*)
+
+declare void @__quantum__qis__reset__body(%Qubit*) #1
+
+declare void @__quantum__rt__result_record_output(%Result*, i8*)
+
+attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="adaptive_profile" "required_num_qubits"="3" "required_num_results"="3" }
+attributes #1 = { "irreversible" }
+
+
+!llvm.module.flags = !{!0, !1, !2, !3, !4}
+
+!0 = !{i32 1, !"qir_major_version", i32 1}
+!1 = !{i32 7, !"qir_minor_version", i32 0}
+!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
+!3 = !{i32 1, !"dynamic_result_management", i1 false}
+!4 = !{i32 5, !"int_computations", !{!"i64"}}
+</script>
+<script type="text/plain" id="pyqir" data-example="Circuit from PyQIR" data-file="pyqir.ll">
+; ModuleID = 'bell'
+source_filename = "bell"
+
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(ptr null)
+  call void @__quantum__qis__cnot__body(ptr null, ptr inttoptr (i64 1 to ptr))
+  call void @__quantum__qis__rz__body(double 5.000000e-01, ptr inttoptr (i64 2 to ptr))
+  call void @__quantum__qis__t__body(ptr inttoptr (i64 2 to ptr))
+  call void @__quantum__qis__mz__body(ptr null, ptr null)
+  call void @__quantum__qis__mz__body(ptr inttoptr (i64 1 to ptr), ptr inttoptr (i64 1 to ptr))
+  call void @__quantum__qis__mz__body(ptr inttoptr (i64 2 to ptr), ptr inttoptr (i64 2 to ptr))
+  ret void
+}
+
+declare void @__quantum__qis__h__body(ptr)
+
+declare void @__quantum__qis__cnot__body(ptr, ptr)
+
+declare void @__quantum__qis__rz__body(double, ptr)
+
+declare void @__quantum__qis__t__body(ptr)
+
+declare void @__quantum__qis__mz__body(ptr, ptr writeonly) #1
+
+attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="custom" "required_num_qubits"="3" "required_num_results"="3" }
+attributes #1 = { "irreversible" }
+
+!llvm.module.flags = !{!0, !1, !2, !3}
+
+!0 = !{i32 1, !"qir_major_version", i32 2}
+!1 = !{i32 7, !"qir_minor_version", i32 0}
+!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
+!3 = !{i32 1, !"dynamic_result_management", i1 false}
+</script>
+
+<script>
+const WORKER = `
+let wasm = null;
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+function put(text) {
+  const bytes = encoder.encode(text);
+  const at = wasm.allocate(bytes.length);
+  new Uint8Array(wasm.memory.buffer, at, bytes.length).set(bytes);
+  return [at, bytes.length];
+}
+function call(source, args) {
+  const [sourceAt, sourceLen] = put(source);
+  const [argsAt, argsLen] = put(args);
+  const reply = wasm.run(sourceAt, sourceLen, argsAt, argsLen);
+  wasm.release(sourceAt, sourceLen);
+  wasm.release(argsAt, argsLen);
+  const head = new Uint32Array(wasm.memory.buffer.slice(reply, reply + 12));
+  const stdout = decoder.decode(new Uint8Array(wasm.memory.buffer, reply + 12, head[1]));
+  const stderr = decoder.decode(new Uint8Array(wasm.memory.buffer, reply + 12 + head[1], head[2]));
+  wasm.release(reply, 12 + head[1] + head[2]);
+  return { code: head[0], stdout, stderr };
+}
+onmessage = async (event) => {
+  if (event.data.bytes) {
+    try {
+      const { instance } = await WebAssembly.instantiate(event.data.bytes, {});
+      wasm = instance.exports;
+      postMessage({ ready: true });
+    } catch (error) {
+      postMessage({ failed: String(error) });
+    }
+    return;
+  }
+  const results = [];
+  try {
+    for (const args of event.data.jobs) {
+      const started = performance.now();
+      results.push({ ...call(event.data.source, args), elapsed: performance.now() - started });
+    }
+    postMessage({ results });
+  } catch (error) {
+    postMessage({ crashed: String(error), results });
+  }
+};
+`;
+
+const EMITS = ["run", "circuit", "qasm3", "qir", "ir", "json", "cost", "diff"];
+const CONTROLS = ["opt", "gates", "resynth", "cost", "coupling", "shots", "seed"];
+const EXTENSIONS = { qasm3: "qasm", qir: "ll", json: "json", ir: "txt", circuit: "txt", cost: "txt", run: "txt", diff: "txt" };
+const MAX_HIGHLIGHT = 400000;
+const MAX_DRAWN = 4000;
+
+const $ = (id) => document.getElementById(id);
+const editor = $("editor");
+const highlight = $("highlight");
+const gutter = $("gutter");
+const command = $("command");
+const stdout = $("stdout");
+const stderr = $("stderr");
+const status = $("status");
+const timing = $("timing");
+const exampleSelect = $("example");
+let framed = true;
+try {
+  framed = window.self !== window.top;
+} catch (error) {
+  framed = true;
+}
+
+const examples = [...document.querySelectorAll("script[data-example]")].map((node) => ({
+  id: node.id,
+  name: node.dataset.example,
+  file: node.dataset.file,
+  text: node.textContent.replace(/^\n/, ""),
+}));
+
+let emit = "run";
+let view = "text";
+let current = examples[0];
+let worker = null;
+let ready = null;
+let bytes = null;
+let finish = null;
+let running = false;
+let queued = false;
+let debounce = 0;
+let paint = 0;
+let marks = new Map();
+let last = null;
+
+function escape(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+const TOKENS = new RegExp(
+  [
+    "(;[^\\n]*)",
+    '("(?:[^"\\\\\\n]|\\\\.)*")',
+    "(@__quantum__[A-Za-z0-9_.]+)",
+    '([@%](?:[-A-Za-z0-9_.$]+|"(?:[^"\\\\]|\\\\.)*"))',
+    "\\b(define|declare|call|tail|ret|br|label|switch|type|opaque|attributes|inttoptr|ptrtoint|to|void|i1|i8|i16|i32|i64|double|float|ptr|null|true|false|icmp|fcmp|add|sub|mul|sdiv|udiv|srem|urem|and|or|xor|shl|lshr|ashr|fadd|fsub|fmul|fdiv|phi|select|load|store|alloca|getelementptr|inbounds|zext|sext|trunc|bitcast|sitofp|uitofp|fptosi|unreachable|eq|ne|slt|sle|sgt|sge|ult|ule|ugt|uge|oeq|one|olt|ole|ogt|oge|global|constant|internal|private|nounwind|source_filename|target)\\b",
+    "(#\\d+)",
+    "(-?\\b(?:0x[0-9A-Fa-f]+|\\d+(?:\\.\\d+)?(?:e[-+]?\\d+)?)\\b)",
+  ].join("|"),
+  "g",
+);
+const CLASSES = ["t-comment", "t-string", "t-intrinsic", "t-name", "t-keyword", "t-name", "t-number"];
+
+function colorize(text) {
+  if (text.length > MAX_HIGHLIGHT) return escape(text);
+  let html = "";
+  let at = 0;
+  for (const match of text.matchAll(TOKENS)) {
+    html += escape(text.slice(at, match.index));
+    const group = match.slice(1).findIndex((g) => g !== undefined);
+    html += `<span class="${CLASSES[group]}">${escape(match[0])}</span>`;
+    at = match.index + match[0].length;
+  }
+  return html + escape(text.slice(at));
+}
+
+function repaint() {
+  cancelAnimationFrame(paint);
+  paint = requestAnimationFrame(() => {
+    highlight.innerHTML = colorize(editor.value) + "\n";
+    const lines = editor.value.split("\n").length;
+    let html = "";
+    for (let line = 1; line <= lines; line++) {
+      const mark = marks.get(line);
+      html += mark ? `<span class="${mark}">${line}</span>\n` : line + "\n";
+    }
+    gutter.innerHTML = html;
+    $("size").textContent = lines + (lines === 1 ? " line" : " lines");
+    follow();
+  });
+}
+
+function follow() {
+  highlight.scrollTop = editor.scrollTop;
+  highlight.scrollLeft = editor.scrollLeft;
+  gutter.scrollTop = editor.scrollTop;
+}
+
+function jump(line, column) {
+  const lines = editor.value.split("\n");
+  let offset = 0;
+  for (let i = 0; i < Math.min(line - 1, lines.length); i++) offset += lines[i].length + 1;
+  offset += Math.max(0, Math.min(column - 1, (lines[line - 1] || "").length));
+  editor.focus();
+  editor.setSelectionRange(offset, offset);
+  const height = parseFloat(getComputedStyle(editor).lineHeight) || 20;
+  editor.scrollTop = Math.max(0, (line - 1) * height - editor.clientHeight / 3);
+  follow();
+}
+
+function ansi(text) {
+  let html = "";
+  let open = false;
+  let at = 0;
+  const link = (plain) =>
+    escape(plain).replace(
+      /([\w.\-/]+\.ll):(\d+):(\d+)/g,
+      (whole, file, line, column) => `<a class="loc" data-line="${line}" data-column="${column}">${whole}</a>`,
+    );
+  for (const match of text.matchAll(/\x1b\[([\d;]*)m/g)) {
+    html += link(text.slice(at, match.index));
+    at = match.index + match[0].length;
+    if (open) {
+      html += "</span>";
+      open = false;
+    }
+    const codes = match[1].split(";").filter(Boolean);
+    const classes = [];
+    for (const code of codes) {
+      if (code === "1") classes.push("a-bold");
+      if (code === "31") classes.push("a-red");
+      if (code === "33") classes.push("a-yellow");
+      if (code === "34") classes.push("a-blue");
+    }
+    if (classes.length) {
+      html += `<span class="${classes.join(" ")}">`;
+      open = true;
+    }
+  }
+  html += link(text.slice(at));
+  return open ? html + "</span>" : html;
+}
+
+function locations(text, failed) {
+  const found = new Map();
+  let severity = failed ? "error" : "warning";
+  for (const line of text.replace(/\x1b\[[\d;]*m/g, "").split("\n")) {
+    if (/^error/.test(line)) severity = "error";
+    else if (/^warning/.test(line)) severity = "warning";
+    const at = line.match(/-->\s+\S+?:(\d+):\d+/);
+    if (at && found.get(Number(at[1])) !== "error") found.set(Number(at[1]), severity);
+  }
+  return found;
+}
+
+function remember() {
+  try {
+    const controls = Object.fromEntries(CONTROLS.map((id) => [id, $(id).value]));
+    localStorage.setItem("qirc-play", JSON.stringify({ example: current.id, text: editor.value, emit, view, controls }));
+  } catch (error) {
+    return;
+  }
+}
+
+function recall() {
+  try {
+    return JSON.parse(localStorage.getItem("qirc-play") || "null");
+  } catch (error) {
+    return null;
+  }
+}
+
+function commandFromControls() {
+  const parts = [];
+  if (emit === "diff") parts.push("diff");
+  parts.push(current.file, "-O" + $("opt").value);
+  if (emit !== "run" && emit !== "diff") parts.push("--emit", emit);
+  if ($("gates").value) parts.push("--gates", $("gates").value);
+  if ($("resynth").value) parts.push("--resynth", $("resynth").value);
+  if ($("cost").value !== "gates") parts.push("--cost", $("cost").value);
+  if ($("coupling").value) parts.push("--coupling", $("coupling").value);
+  if (emit === "run") parts.push("--shots", $("shots").value || "0", "--seed", $("seed").value || "0");
+  return parts.join(" ");
+}
+
+function showEmit() {
+  for (const button of $("emit").querySelectorAll("button")) {
+    button.setAttribute("aria-checked", String(button.dataset.emit === emit));
+  }
+  $("shots-field").hidden = emit !== "run";
+  $("seed-field").hidden = emit !== "run";
+}
+
+function showView() {
+  for (const button of document.querySelectorAll(".tabs button")) {
+    button.setAttribute("aria-selected", String(button.dataset.view === view));
+  }
+  for (const name of ["text", "circuit", "results"]) $("view-" + name).hidden = name !== view;
+}
+
+function sync() {
+  command.value = commandFromControls();
+  remember();
+  schedule(0);
+}
+
+function addFile(name, text) {
+  const file = name.replace(/[^\w.\-]/g, "_") || "program.ll";
+  let entry = examples.find((e) => e.id === "file");
+  if (!entry) {
+    entry = { id: "file", name: "", file, text };
+    examples.push(entry);
+    const option = document.createElement("option");
+    option.value = "file";
+    exampleSelect.append(option);
+  }
+  entry.name = "Your file: " + name;
+  entry.file = file;
+  entry.text = text;
+  exampleSelect.querySelector('option[value="file"]').textContent = entry.name;
+  return entry;
+}
+
+function load(example, text) {
+  current = example;
+  exampleSelect.value = example.id;
+  $("filename").textContent = example.file;
+  editor.value = text ?? example.text;
+  editor.scrollTop = 0;
+  marks = new Map();
+  repaint();
+}
+
+function setStatus(kind, text) {
+  status.className = "chip " + kind;
+  status.textContent = text;
+}
+
+function toast(text) {
+  $("toast").textContent = text;
+  setTimeout(() => ($("toast").textContent = ""), 1600);
+}
+
+function startWorker() {
+  if (worker) worker.terminate();
+  worker = new Worker(URL.createObjectURL(new Blob([WORKER], { type: "text/javascript" })));
+  ready = new Promise((resolve, reject) => {
+    worker.onmessage = (event) => {
+      if (event.data.ready) {
+        worker.onmessage = (reply) => finish && finish(reply.data);
+        resolve();
+      } else {
+        reject(new Error(event.data.failed));
+      }
+    };
+  });
+  worker.postMessage({ bytes: bytes.slice(0) });
+  return ready;
+}
+
+function schedule(delay) {
+  clearTimeout(debounce);
+  debounce = setTimeout(run, delay);
+}
+
+function words(text) {
+  return text.trim().split(/\s+/).filter(Boolean);
+}
+
+function jsonJob(tokens) {
+  const kept = [];
+  const valued = new Set(["--emit", "--shots", "--seed", "-o", "--color"]);
+  for (let i = 0; i < tokens.length; i++) {
+    if (i === 0 && tokens[i] === "diff") continue;
+    if (valued.has(tokens[i])) {
+      i++;
+      continue;
+    }
+    if (["--no-state", "-v", "--verbose", "-h", "--help"].includes(tokens[i])) continue;
+    kept.push(tokens[i]);
+  }
+  return [...kept, "--emit", "json", "--color", "never"].join(" ");
+}
+
+async function run() {
+  if (!bytes) return;
+  if (running) {
+    queued = true;
+    return;
+  }
+  running = true;
+  queued = false;
+  const tokens = words(command.value);
+  const main = tokens.includes("--color") ? tokens.join(" ") : [...tokens, "--color", "always"].join(" ");
+  const file = tokens.find((t) => t.endsWith(".ll"));
+  const jobs = [main];
+  if (file) jobs.push(jsonJob(tokens), [file, "-O0", "--emit", "json", "--color", "never"].join(" "));
+  const reveal = setTimeout(() => ($("stop").hidden = false), 400);
+  setStatus("idle", "running");
+  timing.textContent = "";
+  let reply;
+  try {
+    await ready;
+    reply = await new Promise((resolve) => {
+      finish = resolve;
+      worker.postMessage({ source: editor.value, jobs });
+    });
+  } catch (error) {
+    reply = { crashed: String(error), results: [] };
+  }
+  clearTimeout(reveal);
+  $("stop").hidden = true;
+  finish = null;
+  running = false;
+  show(reply, tokens);
+  if (reply.crashed || reply.stopped) startWorker();
+  if (queued) run();
+}
+
+function parse(result) {
+  if (!result || result.code !== 0) return null;
+  try {
+    return JSON.parse(result.stdout);
+  } catch (error) {
+    return null;
+  }
+}
+
+function show(reply, tokens) {
+  const [result, compiledJob, sourceJob] = reply.results || [];
+  if (result) {
+    const ms = result.elapsed;
+    timing.textContent = ms < 1000 ? ms.toFixed(1) + " ms" : (ms / 1000).toFixed(2) + " s";
+  }
+  if (reply.stopped || reply.crashed) {
+    setStatus(reply.stopped ? "warn" : "bad", reply.stopped ? "stopped" : "compiler crashed");
+    stdout.textContent = "";
+    stderr.hidden = !reply.crashed;
+    stderr.textContent = reply.crashed ? "The compiler stopped unexpectedly on this input: " + reply.crashed : "";
+    last = null;
+    return;
+  }
+  last = result;
+  stdout.innerHTML = ansi(result.stdout);
+  stderr.innerHTML = ansi(result.stderr.replace(/\n+$/, ""));
+  stderr.hidden = result.stderr.trim() === "";
+  marks = locations(result.stderr, result.code !== 0);
+  repaint();
+
+  const diffing = tokens[0] === "diff";
+  if (diffing && result.code === 0) setStatus("good", "equivalent");
+  else if (diffing && result.stdout.startsWith("inconclusive")) setStatus("warn", "inconclusive");
+  else if (diffing && result.stdout.startsWith("different")) setStatus("bad", "different");
+  else if (result.code === 0) setStatus(stderr.hidden ? "good" : "warn", stderr.hidden ? "ok" : "ok, with warnings");
+  else if (result.code === 2) setStatus("bad", "bad arguments");
+  else setStatus("bad", "error");
+
+  const compiled = parse(compiledJob);
+  const source = parse(sourceJob);
+  showStats(source, compiled);
+  $("view-circuit").innerHTML = compiled ? drawCircuit(compiled) : `<p class="empty">The circuit appears here once the program compiles.</p>`;
+  $("view-results").innerHTML = drawResults(tokens[0] === "diff" ? "" : result.stdout);
+}
+
+function summarize(program) {
+  let gates = 0;
+  let two = 0;
+  let t = 0;
+  for (const block of program.blocks) {
+    for (const op of block.ops) {
+      if (op.op !== "gate") continue;
+      gates++;
+      if (op.controls.length + op.targets.length > 1) two++;
+      if (!op.controls.length && (op.name === "t" || op.name === "tdg")) t++;
+    }
+  }
+  return { qubits: program.qubits, gates, two, t, depth: program.depth, blocks: program.blocks.length };
+}
+
+function showStats(source, compiled) {
+  const box = $("stats");
+  if (!compiled) {
+    box.innerHTML = "";
+    return;
+  }
+  const after = summarize(compiled);
+  const before = source ? summarize(source) : null;
+  const metric = (label, key) => {
+    const value = after[key];
+    if (!before || before[key] === value) return `<div class="metric"><span>${label}</span><b>${value}</b></div>`;
+    const tone = value < before[key] ? "better" : "worse";
+    return `<div class="metric"><span>${label}</span><span class="from">${before[key]} →</span><b class="${tone}">${value}</b></div>`;
+  };
+  box.innerHTML =
+    metric("qubits", "qubits") +
+    metric("gates", "gates") +
+    metric("two qubit", "two") +
+    metric("t", "t") +
+    metric("depth", "depth") +
+    (after.blocks > 1 ? `<span class="note">${after.blocks} blocks, counted together</span>` : "");
+}
+
+function angle(value) {
+  if (value === null || value === undefined) return "?";
+  const turns = value / Math.PI;
+  for (const d of [1, 2, 3, 4, 6, 8, 16]) {
+    const n = Math.round(turns * d);
+    if (Math.abs(turns * d - n) < 1e-9) {
+      if (n === 0) return "0";
+      const size = Math.abs(n) === 1 ? "" : Math.abs(n);
+      return (n < 0 ? "-" : "") + size + "π" + (d === 1 ? "" : "/" + d);
+    }
+  }
+  return value.toFixed(2);
+}
+
+function gateLabel(op) {
+  const name = op.name === "unitary" ? "U" : op.name;
+  return op.params.length ? `${name}(${op.params.map(angle).join(",")})` : name;
+}
+
+function drawCircuit(program) {
+  const n = program.qubits;
+  if (!n) return `<p class="empty">This program uses no qubits.</p>`;
+  const ROW = 34;
+  const TOP = program.blocks.length > 1 ? 34 : 12;
+  const LEFT = 42;
+  const GAP = 12;
+  const textWidth = (text) => 12 + text.length * 6.9;
+  let x = LEFT;
+  let drawn = 0;
+  let parts = [];
+  let separators = [];
+  let truncated = false;
+  const y = (q) => TOP + q * ROW + ROW / 2;
+
+  for (const [index, block] of program.blocks.entries()) {
+    if (truncated) break;
+    const frontier = new Array(n).fill(0);
+    const columns = [];
+    for (const op of block.ops) {
+      let wires;
+      if (op.op === "gate") wires = [...op.controls, ...op.targets];
+      else if (op.op === "measure" || op.op === "reset") wires = [op.qubit];
+      else continue;
+      if (drawn >= MAX_DRAWN) {
+        truncated = true;
+        break;
+      }
+      drawn++;
+      const lo = Math.min(...wires);
+      const hi = Math.max(...wires);
+      let column = 0;
+      for (let q = lo; q <= hi; q++) column = Math.max(column, frontier[q]);
+      for (let q = lo; q <= hi; q++) frontier[q] = column + 1;
+      columns[column] = columns[column] || [];
+      columns[column].push(op);
+    }
+    if (program.blocks.length > 1) {
+      if (index > 0) separators.push(x - GAP / 2);
+      parts.push(`<text class="block" x="${x}" y="14">${escape(block.label)}</text>`);
+    }
+    for (const ops of columns) {
+      let width = 26;
+      for (const op of ops) {
+        if (op.op === "gate" && !(isTarget(op) || op.name === "swap")) width = Math.max(width, textWidth(gateLabel(op)));
+        if (op.op === "reset") width = Math.max(width, textWidth("|0⟩"));
+        if (op.op === "measure") width = Math.max(width, textWidth(`M→r${op.result}`));
+      }
+      const cx = x + width / 2;
+      for (const op of ops) parts.push(drawOp(op, cx, width, y));
+      x += width + GAP;
+    }
+    if (program.blocks.length > 1) {
+      parts.push(`<text class="term" x="${x}" y="${TOP + n * ROW + 14}" text-anchor="end">${escape(block.terminator)}</text>`);
+      x += 36;
+    }
+  }
+  const width = Math.max(x + 8, 200);
+  const height = TOP + n * ROW + (program.blocks.length > 1 ? 22 : 6);
+  const wires = [];
+  for (let q = 0; q < n; q++) {
+    wires.push(`<line class="wire" x1="${LEFT - 6}" x2="${width - 6}" y1="${y(q)}" y2="${y(q)}"/>`);
+    wires.push(`<text class="qlabel" x="${LEFT - 12}" y="${y(q) + 4}" text-anchor="end">q${q}</text>`);
+  }
+  const lines = separators.map((sx) => `<line class="sep" x1="${sx}" x2="${sx}" y1="20" y2="${TOP + n * ROW}"/>`);
+  const note = truncated ? `<p class="empty">Showing the first ${MAX_DRAWN} operations.</p>` : "";
+  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="Circuit diagram">${wires.join("")}${lines.join("")}${parts.join("")}</svg>${note}`;
+}
+
+function isTarget(op) {
+  return op.controls.length > 0 && (op.name === "x" || op.name === "z");
+}
+
+function drawOp(op, cx, width, y) {
+  const out = [];
+  const box = (q, label, cls = "box") => {
+    const w = Math.max(26, Math.min(width, 12 + label.length * 6.9));
+    out.push(`<rect class="${cls}" x="${cx - w / 2}" y="${y(q) - 12}" width="${w}" height="24" rx="4"/>`);
+    out.push(`<text x="${cx}" y="${y(q) + 4}" text-anchor="middle">${escape(label)}</text>`);
+  };
+  if (op.op === "measure") {
+    box(op.qubit, `M→r${op.result}`, "meter");
+    return out.join("");
+  }
+  if (op.op === "reset") {
+    box(op.qubit, "|0⟩", "meter");
+    return out.join("");
+  }
+  const wires = [...op.controls, ...op.targets];
+  if (wires.length > 1) {
+    out.push(`<line class="link" x1="${cx}" x2="${cx}" y1="${y(Math.min(...wires))}" y2="${y(Math.max(...wires))}"/>`);
+  }
+  for (const q of op.controls) out.push(`<circle class="dot" cx="${cx}" cy="${y(q)}" r="4.5"/>`);
+  if (op.name === "swap" && !op.controls.length) {
+    for (const q of op.targets) {
+      out.push(`<path class="link" d="M${cx - 6} ${y(q) - 6}L${cx + 6} ${y(q) + 6}M${cx + 6} ${y(q) - 6}L${cx - 6} ${y(q) + 6}"/>`);
+    }
+  } else if (isTarget(op) && op.name === "x") {
+    for (const q of op.targets) {
+      out.push(`<circle class="plus" cx="${cx}" cy="${y(q)}" r="9"/>`);
+      out.push(`<path class="link" d="M${cx - 9} ${y(q)}H${cx + 9}M${cx} ${y(q) - 9}V${y(q) + 9}"/>`);
+    }
+  } else if (isTarget(op)) {
+    for (const q of op.targets) out.push(`<circle class="dot" cx="${cx}" cy="${y(q)}" r="4.5"/>`);
+  } else {
+    for (const q of op.targets) box(q, gateLabel(op));
+  }
+  return out.join("");
+}
+
+function table(text, heading) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((l) => l.startsWith(heading));
+  if (start < 0) return null;
+  const rows = [];
+  for (const line of lines.slice(start + 1)) {
+    const match = line.match(/^\s+(.+?)\s+(\d+)\s+([\d.]+)$/);
+    if (!match) break;
+    rows.push({ key: match[1], count: Number(match[2]), share: Number(match[3]) });
+  }
+  return { title: lines[start].replace(/:$/, ""), rows };
+}
+
+function drawResults(text) {
+  const sections = [];
+  const measured = table(text, "measurement over");
+  const returned = table(text, "returned over");
+  for (const section of [measured, returned]) {
+    if (section && section.rows.length) sections.push(section);
+  }
+  if (!sections.length) {
+    const rows = [];
+    for (const line of text.split("\n")) {
+      const match = line.match(/^\s+\|([01]+)>\s.*p = ([\d.]+)/);
+      if (match) rows.push({ key: "|" + match[1] + "⟩", count: null, share: Number(match[2]) });
+    }
+    if (rows.length) sections.push({ title: "final state probabilities", rows: rows.sort((a, b) => b.share - a.share) });
+  }
+  if (!sections.length) {
+    return `<p class="empty">Choose the <b>run</b> emit to simulate the program. Measurement counts, or the final state probabilities when there are no shots, are charted here.</p>`;
+  }
+  return (
+    `<div class="results">` +
+    sections
+      .map((section) => {
+        const top = Math.max(...section.rows.map((r) => r.share)) || 1;
+        const bars = section.rows
+          .slice(0, 64)
+          .map(
+            (r) =>
+              `<span>${escape(r.key)}</span><div class="bar" style="width:${((r.share / top) * 100).toFixed(1)}%"></div><span class="value">${
+                r.count === null ? "" : r.count + "  "
+              }${(r.share * 100).toFixed(1)}%</span>`,
+          )
+          .join("");
+        const more = section.rows.length > 64 ? `<p class="empty">${section.rows.length - 64} more outcomes are in the output.</p>` : "";
+        return `<h3>${escape(section.title)}</h3><div class="bars">${bars}</div>${more}`;
+      })
+      .join("") +
+    `</div>`
+  );
+}
+
+function stop() {
+  if (finish) finish({ stopped: true, results: [] });
+}
+
+async function pack(payload) {
+  const data = new TextEncoder().encode(JSON.stringify(payload));
+  const squeezed = await new Response(new Blob([data]).stream().pipeThrough(new CompressionStream("deflate-raw"))).arrayBuffer();
+  let binary = "";
+  for (const byte of new Uint8Array(squeezed)) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function unpack(text) {
+  const binary = atob(text.replace(/-/g, "+").replace(/_/g, "/"));
+  const data = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  const plain = await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).text();
+  return JSON.parse(plain);
+}
+
+function readFile(file) {
+  if (!file) return;
+  file.text().then((text) => {
+    load(addFile(file.name, text));
+    command.value = commandFromControls();
+    remember();
+    schedule(0);
+  });
+}
+
+for (const example of examples) {
+  const option = document.createElement("option");
+  option.value = example.id;
+  option.textContent = example.name;
+  exampleSelect.append(option);
+}
+
+async function start() {
+  const saved = recall();
+  let shared = null;
+  if (!framed && location.hash.startsWith("#p=") && "DecompressionStream" in window) {
+    try {
+      shared = await unpack(location.hash.slice(3));
+    } catch (error) {
+      shared = null;
+    }
+  }
+  if (saved && saved.controls) {
+    for (const id of CONTROLS) {
+      const value = saved.controls[id];
+      const control = $(id);
+      if (value === undefined) continue;
+      if (control.tagName === "SELECT" && ![...control.options].some((o) => o.value === value)) continue;
+      control.value = value;
+    }
+  }
+  if (saved && EMITS.includes(saved.emit)) emit = saved.emit;
+  if (saved && ["text", "circuit", "results"].includes(saved.view)) view = saved.view;
+  if (shared && typeof shared.source === "string" && typeof shared.command === "string") {
+    const file = words(shared.command).find((t) => t.endsWith(".ll")) || "shared.ll";
+    load(addFile(file, shared.source));
+    showEmit();
+    command.value = shared.command;
+  } else {
+    const savedExample = saved && examples.find((e) => e.id === saved.example);
+    load(savedExample || examples[0], savedExample ? saved.text : undefined);
+    showEmit();
+    command.value = commandFromControls();
+  }
+  showView();
+}
+
+exampleSelect.addEventListener("change", () => {
+  load(examples.find((e) => e.id === exampleSelect.value));
+  sync();
+});
+$("emit").addEventListener("click", (event) => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  emit = button.dataset.emit;
+  showEmit();
+  sync();
+});
+document.querySelector(".tabs").addEventListener("click", (event) => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  view = button.dataset.view;
+  showView();
+  remember();
+});
+for (const id of CONTROLS) $(id).addEventListener("change", sync);
+editor.addEventListener("input", () => {
+  marks = new Map();
+  repaint();
+  remember();
+  schedule(450);
+});
+editor.addEventListener("scroll", follow);
+editor.addEventListener("keydown", (event) => {
+  if (event.key === "Tab" && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    event.preventDefault();
+    editor.setRangeText("  ", editor.selectionStart, editor.selectionEnd, "end");
+    editor.dispatchEvent(new Event("input"));
+  }
+});
+command.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") schedule(0);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    schedule(0);
+  }
+});
+document.addEventListener("click", (event) => {
+  const target = event.target.closest("a.loc");
+  if (!target) return;
+  event.preventDefault();
+  jump(Number(target.dataset.line), Number(target.dataset.column));
+});
+$("run").addEventListener("click", () => schedule(0));
+$("stop").addEventListener("click", stop);
+$("reset").addEventListener("click", () => {
+  load(current);
+  remember();
+  schedule(0);
+});
+$("open").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", () => readFile($("file").files[0]));
+const drop = $("drop");
+drop.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  drop.classList.add("dropping");
+});
+drop.addEventListener("dragleave", () => drop.classList.remove("dropping"));
+drop.addEventListener("drop", (event) => {
+  event.preventDefault();
+  drop.classList.remove("dropping");
+  readFile(event.dataTransfer.files[0]);
+});
+$("copy").addEventListener("click", () => {
+  const text = [stderr.hidden ? "" : stderr.textContent, stdout.textContent].filter(Boolean).join("\n\n");
+  navigator.clipboard.writeText(text).then(
+    () => toast("Copied"),
+    () => window.getSelection().selectAllChildren(stdout),
+  );
+});
+if (!framed) {
+  $("download").hidden = false;
+  $("share").hidden = !("CompressionStream" in window);
+  $("download").addEventListener("click", () => {
+    if (!last) return;
+    const base = current.file.replace(/\.ll$/, "");
+    const tokens = words(command.value);
+    const kind = tokens[tokens.indexOf("--emit") + 1];
+    const extension = tokens.includes("--emit") ? EXTENSIONS[kind] || "txt" : "txt";
+    const name = extension === "ll" ? base + ".compiled.ll" : base + "." + extension;
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(new Blob([last.stdout], { type: "text/plain" }));
+    link.download = name;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  });
+  $("share").addEventListener("click", async () => {
+    const hash = await pack({ source: editor.value, command: command.value });
+    const url = location.href.split("#")[0] + "#p=" + hash;
+    history.replaceState(null, "", url);
+    navigator.clipboard.writeText(url).then(
+      () => toast("Link copied"),
+      () => toast("Link is in the address bar"),
+    );
+  });
+}
+
+start()
+  .then(() => fetch("qirc.wasm"))
+  .then((response) => {
+    if (!response.ok) throw new Error("qirc.wasm returned " + response.status);
+    return response.arrayBuffer();
+  })
+  .then((buffer) => {
+    bytes = buffer;
+    return startWorker();
+  })
+  .then(() => run())
+  .catch((error) => {
+    setStatus("bad", "not loaded");
+    stderr.hidden = false;
+    stderr.textContent = "The compiler could not start: " + error.message + "\nBuild it as described under Playground in the README and serve the web folder over HTTP.";
+  });
+</script>
+</body>
+</html>

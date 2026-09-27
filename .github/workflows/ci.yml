@@ -29,6 +29,18 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
 
+  playground:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - run: cargo fmt --check --manifest-path web/Cargo.toml
+      - run: cargo clippy --release --target wasm32-unknown-unknown --manifest-path web/Cargo.toml -- -D warnings
+      - run: cargo build --release --target wasm32-unknown-unknown --manifest-path web/Cargo.toml
+
   msrv:
     runs-on: ubuntu-latest
     steps:
@@ -59,7 +71,7 @@ jobs:
         run: |
           for file in tests/corpus/*.ll; do
             case "$file" in *syntax_stress*) continue ;; esac
-            for options in "-O3" "-O3 --gates rz-sx-cx --resynth 4" "-O2 --gates rz-ry-cz"; do
+            for options in "-O3" "-O3 --gates rz-sx-cx --resynth 4" "-O2 --gates rz-ry-cz" "-O3 --gates rz-sx-cx --cost cx"; do
               ./target/release/qirc diff "$file" $options
             done
           done

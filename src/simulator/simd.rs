@@ -1,6 +1,8 @@
 use super::matrix::Matrix2;
 
+#[cfg(target_arch = "x86_64")]
 const LANES: usize = 4;
+#[cfg(target_arch = "x86_64")]
 const LANE_BITS: usize = 2;
 
 pub fn backend() -> &'static str {
@@ -79,6 +81,7 @@ fn apply_1q_scalar(re: &mut [f64], im: &mut [f64], m: &Matrix2, target: usize, c
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn lane_active(lane: usize, control_mask: u64) -> f64 {
     if (lane as u64 & control_mask) == control_mask {
         -1.0

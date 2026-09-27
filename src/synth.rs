@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::f64::consts::{FRAC_1_SQRT_2, PI};
+use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, PI};
 
 use crate::codegen::zyz_angles;
 use crate::diag::Span;
 use crate::ir::*;
+use crate::kak::{self, Piece};
 use crate::simulator::matrix::{C64, Matrix2, matrix_for};
 use crate::transpile::GateSet;
 
@@ -32,12 +33,12 @@ const ONE: C64 = C64::new(1.0, 0.0);
 
 #[derive(Clone)]
 pub struct Unitary {
-    dim: usize,
-    cells: Vec<C64>,
+    pub(crate) dim: usize,
+    pub(crate) cells: Vec<C64>,
 }
 
 impl Unitary {
-    fn identity(qubits: usize) -> Unitary {
+    pub(crate) fn identity(qubits: usize) -> Unitary {
         let dim = 1 << qubits;
         let mut cells = vec![ZERO; dim * dim];
         for i in 0..dim {
@@ -112,7 +113,7 @@ impl Unitary {
         }
     }
 
-    fn kron(low: Matrix2, high: Matrix2) -> Unitary {
+    pub(crate) fn kron(low: Matrix2, high: Matrix2) -> Unitary {
         let mut cells = vec![ZERO; 16];
         for row in 0..4 {
             for column in 0..4 {
@@ -141,7 +142,7 @@ impl Unitary {
         Matrix2::new(self.cells[0], self.cells[1], self.cells[2], self.cells[3])
     }
 
-    fn after(&self, earlier: &Unitary) -> Unitary {
+    pub(crate) fn after(&self, earlier: &Unitary) -> Unitary {
         let dim = self.dim;
         let mut cells = vec![ZERO; dim * dim];
         for row in 0..dim {
@@ -158,7 +159,7 @@ impl Unitary {
         Unitary { dim, cells }
     }
 
-    fn adjoint(&self) -> Unitary {
+    pub(crate) fn adjoint(&self) -> Unitary {
         let dim = self.dim;
         let mut cells = vec![ZERO; dim * dim];
         for row in 0..dim {
@@ -214,7 +215,7 @@ impl Unitary {
             .collect()
     }
 
-    fn split(&self) -> Option<(Matrix2, Matrix2)> {
+    pub(crate) fn split(&self) -> Option<(Matrix2, Matrix2)> {
         if self.dim != 4 {
             return None;
         }
@@ -563,6 +564,16 @@ impl Synth {
         }
         let (theta, phi, lambda) = zyz_angles(&u);
         let sx = fixed(GateKind::SX, target, span);
+        if (theta - FRAC_PI_2).abs() < EPSILON {
+            return Some(
+                [
+                    self.angle(Axis::Z, lambda - FRAC_PI_2, target, span)?,
+                    vec![sx],
+                    self.angle(Axis::Z, phi + FRAC_PI_2, target, span)?,
+                ]
+                .concat(),
+            );
+        }
         Some(
             [
                 self.angle(Axis::Z, lambda, target, span)?,
@@ -749,12 +760,12 @@ impl Pairs {
         letters.iter().map(|&l| self.alphabet[l].clone()).collect()
     }
 
-    fn find(&self, u: &Unitary, synth: &Synth, limit: usize) -> Option<Vec<Gate>> {
+    fn find(&self, u: &Unitary, synth: &Synth, limit: usize, cost: Cost) -> Option<Vec<Gate>> {
         let mut best: Option<Vec<Gate>> = None;
         let mut consider = |candidate: Option<Vec<Gate>>| {
             if let Some(gates) = candidate
                 && gates.len() <= limit
-                && best.as_ref().is_none_or(|b| rank(&gates) < rank(b))
+                && best.as_ref().is_none_or(|b| cost.of(&gates) < cost.of(b))
                 && Unitary::of(&gates, &PAIR).is_some_and(|m| m.same(u))
             {
                 best = Some(gates);
@@ -803,11 +814,49 @@ impl Pairs {
     }
 }
 
-fn rank(gates: &[Gate]) -> (usize, usize) {
-    (
-        gates.len(),
-        gates.iter().filter(|g| g.wires().count() > 1).count(),
-    )
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Cost {
+    #[default]
+    Gates,
+    Cx,
+    Ibm,
+}
+
+impl Cost {
+    pub fn parse(name: &str) -> Option<Cost> {
+        match name {
+            "gates" => Some(Cost::Gates),
+            "cx" => Some(Cost::Cx),
+            "ibm" => Some(Cost::Ibm),
+            _ => None,
+        }
+    }
+
+    fn weight(self, gate: &Gate) -> (usize, usize) {
+        let entangler = gate.wires().count() > 1;
+        match self {
+            Cost::Gates => (1, usize::from(entangler)),
+            Cost::Cx => (usize::from(entangler), 1),
+            Cost::Ibm if entangler => (10, 1),
+            Cost::Ibm => match gate.kind {
+                GateKind::Rz
+                | GateKind::R1
+                | GateKind::Z
+                | GateKind::S
+                | GateKind::SDag
+                | GateKind::T
+                | GateKind::TDag => (0, 1),
+                _ => (1, 1),
+            },
+        }
+    }
+
+    pub fn of<'a>(self, gates: impl IntoIterator<Item = &'a Gate>) -> (usize, usize) {
+        gates.into_iter().fold((0, 0), |(a, b), gate| {
+            let (c, d) = self.weight(gate);
+            (a + c, b + d)
+        })
+    }
 }
 
 fn controlled_rotation(
@@ -853,17 +902,19 @@ struct Search {
     synth: Synth,
     pairs: Pairs,
     limit: usize,
+    cost: Cost,
     cache: HashMap<(usize, Vec<i64>), Option<Vec<Gate>>>,
 }
 
 impl Search {
-    fn new(set: &GateSet, limit: usize) -> Search {
+    fn new(set: &GateSet, limit: usize, cost: Cost) -> Search {
         let synth = Synth::new(set);
         let pairs = Pairs::new(set, &synth.fixed, limit.div_ceil(2).min(3));
         Search {
             synth,
             pairs,
             limit,
+            cost,
             cache: HashMap::new(),
         }
     }
@@ -874,11 +925,37 @@ impl Search {
             return found.clone();
         }
         let found = match qubits {
-            1 => self.synth.one(u.matrix2(), PAIR[0], Span::DUMMY),
-            _ => self.pairs.find(u, &self.synth, self.limit),
+            1 => self
+                .synth
+                .one(u.matrix2(), PAIR[0], Span::DUMMY)
+                .filter(|gates| gates.len() <= self.limit),
+            _ => [
+                self.pairs.find(u, &self.synth, self.limit, self.cost),
+                self.kak(u),
+            ]
+            .into_iter()
+            .flatten()
+            .min_by_key(|gates| self.cost.of(gates)),
         };
         self.cache.insert(key, found.clone());
         found
+    }
+
+    fn kak(&self, u: &Unitary) -> Option<Vec<Gate>> {
+        if self.limit < 2 && self.cost == Cost::Gates {
+            return None;
+        }
+        let parts = kak::synthesize(u)?
+            .into_iter()
+            .map(|piece| match piece {
+                Piece::Local(q, m) => self.synth.one(m, PAIR[q], Span::DUMMY),
+                Piece::Cx(c, t) => self.synth.cx(PAIR[c], PAIR[t], Span::DUMMY),
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let gates = parts.concat();
+        Unitary::of(&gates, &PAIR)
+            .is_some_and(|m| m.same(u))
+            .then_some(gates)
     }
 
     fn window(&mut self, ops: &[Op]) -> Option<(Vec<usize>, Vec<Gate>)> {
@@ -891,7 +968,12 @@ impl Search {
             return None;
         }
 
-        let mut suffixes = vec![(last, wires.clone(), Unitary::gate(newest, &wires)?)];
+        let mut suffixes = vec![(
+            last,
+            wires.clone(),
+            Unitary::gate(newest, &wires)?,
+            self.cost.of([newest]),
+        )];
         let mut skipped = Vec::new();
         for index in (last.saturating_sub(MAX_REACH)..last).rev() {
             if suffixes.len() == MAX_WINDOW {
@@ -914,7 +996,9 @@ impl Search {
             {
                 break;
             }
-            let (_, _, later) = &suffixes[suffixes.len() - 1];
+            let (_, _, later, spent) = &suffixes[suffixes.len() - 1];
+            let (a, b) = self.cost.of([gate]);
+            let spent = (spent.0 + a, spent.1 + b);
             let step = Unitary::gate(gate, &grown)?;
             let product = if grown.len() > wires.len() {
                 later.widen(grown.len()).after(&step)
@@ -922,20 +1006,21 @@ impl Search {
                 later.after(&step)
             };
             wires = grown;
-            suffixes.push((index, wires.clone(), product));
+            suffixes.push((index, wires.clone(), product, spent));
         }
 
         for n in (2..=suffixes.len()).rev() {
-            let (_, local, u) = &suffixes[n - 1];
+            let (_, local, u, spent) = &suffixes[n - 1];
+            let spent = *spent;
             let Some(found) = self.best(u, local.len()) else {
                 continue;
             };
-            if found.len() < n && found.len() <= self.limit {
+            if self.cost.of(&found) < spent {
                 let placed = found
                     .into_iter()
                     .map(|g| relabel(g, local, newest.span))
                     .collect();
-                let mut picked: Vec<usize> = suffixes[..n].iter().map(|(i, _, _)| *i).collect();
+                let mut picked: Vec<usize> = suffixes[..n].iter().map(|(i, ..)| *i).collect();
                 picked.reverse();
                 return Some((picked, placed));
             }
@@ -962,12 +1047,12 @@ fn relabel(mut gate: Gate, local: &[QubitId], span: Span) -> Gate {
     gate
 }
 
-pub fn resynthesize(program: &mut Program, set: &GateSet, limit: usize) -> usize {
+pub fn resynthesize(program: &mut Program, set: &GateSet, limit: usize, cost: Cost) -> usize {
     if limit == 0 {
         return 0;
     }
-    let mut search = Search::new(set, limit);
-    let before = program.gate_count();
+    let mut search = Search::new(set, limit, cost);
+    let mut replaced = 0;
 
     for block in &mut program.blocks {
         let mut pending: Vec<Op> = block.ops.drain(..).rev().collect();
@@ -975,6 +1060,7 @@ pub fn resynthesize(program: &mut Program, set: &GateSet, limit: usize) -> usize
         while let Some(op) = pending.pop() {
             out.push(op);
             if let Some((picked, replacement)) = search.window(&out) {
+                replaced += 1;
                 for &i in picked.iter().rev() {
                     out.remove(i);
                 }
@@ -984,7 +1070,7 @@ pub fn resynthesize(program: &mut Program, set: &GateSet, limit: usize) -> usize
         block.ops = out;
     }
 
-    before.saturating_sub(program.gate_count())
+    replaced
 }
 
 pub fn commute(a: &Gate, b: &Gate) -> bool {

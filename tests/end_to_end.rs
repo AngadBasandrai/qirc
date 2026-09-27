@@ -4,6 +4,7 @@ use std::f64::consts::FRAC_PI_8;
 
 use common::{compile, errors, final_state, run};
 use qirc::codegen;
+use qirc::cost;
 use qirc::diag::Severity;
 use qirc::driver::{self, Emit};
 use qirc::ir::*;
@@ -897,7 +898,7 @@ fn transpile_state() {
             driver::Target {
                 gates: Some(set.clone()),
                 coupling: None,
-                resynth: None,
+                ..Default::default()
             },
         ));
         assert_same_state(&baseline, &targeted);
@@ -913,7 +914,7 @@ fn transpile_basis_only() {
             driver::Target {
                 gates: Some(set.clone()),
                 coupling: None,
-                resynth: None,
+                ..Default::default()
             },
         );
 
@@ -989,7 +990,7 @@ attributes #0 = { \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_n
     );
 
     assert!(route::respects(&program, &coupling));
-    assert!(program.gate_count() > 2);
+    assert_eq!(program.gate_count(), 2);
 }
 
 #[test]
@@ -1001,7 +1002,7 @@ fn transpile_then_route() {
         driver::Target {
             gates: Some(GateSet::parse("rz-sx-cx").unwrap()),
             coupling: Some(coupling.clone()),
-            resynth: None,
+            ..Default::default()
         },
     );
 
@@ -1084,4 +1085,68 @@ attributes #0 = { \"entry_point\" \"required_num_qubits\"=\"1\" }
     assert!(!program.is_straight_line());
 
     assert!(run(&program, 1, 1).aborted);
+}
+
+#[test]
+fn cost_counts() {
+    let source = "%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__t__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+  call void @__quantum__qis__cnot__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__t__adj(%Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* null)
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  ret void
+}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__t__body(%Qubit*)
+declare void @__quantum__qis__t__adj(%Qubit*)
+declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+
+attributes #0 = { \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"2\" \"required_num_results\"=\"2\" }
+";
+    let report = cost::analyse(&compile(source, 0));
+    assert_eq!(report.paths.len(), 1);
+    assert_eq!(
+        report.worst,
+        cost::Tally {
+            t: 2,
+            cx: 1,
+            gates: 4,
+            depth: 5,
+            live: 2,
+        }
+    );
+}
+
+#[test]
+fn cost_paths() {
+    let report = cost::analyse(&compile(TELEPORT, 0));
+    assert_eq!(report.paths.len(), 4);
+    assert!(
+        report
+            .paths
+            .iter()
+            .all(|p| p.again.is_none() && p.tally.cx == 2)
+    );
+    let most = report.paths.iter().map(|p| p.tally.gates).max();
+    assert_eq!(Some(report.worst.gates), most);
+
+    let looping = cost::analyse(&compile(
+        include_str!("../examples/repeat_until_success.ll"),
+        1,
+    ));
+    assert!(
+        looping
+            .paths
+            .iter()
+            .any(|p| p.again.as_deref() == Some("attempt"))
+    );
+    assert!(looping.to_string().contains("attempt again"));
 }
