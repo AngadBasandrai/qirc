@@ -16,6 +16,7 @@ pub mod opt;
 pub mod parse;
 mod phase;
 pub mod qasm;
+pub mod qasm2;
 pub mod qis;
 mod qsd;
 pub mod reuse;

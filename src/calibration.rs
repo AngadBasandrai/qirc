@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::ir::{Gate, GateKind, Op};
+use crate::ir::{Gate, GateKind, Op, Program};
+
+const MAX_MITIGATED: usize = 20;
 use crate::route::Coupling;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -103,6 +105,17 @@ impl Calibration {
         Ok(calibration)
     }
 
+    pub fn scaled(&self, factor: f64) -> Calibration {
+        let rate = |e: &f64| (e * factor).min(0.99);
+        let mut scaled = self.clone();
+        scaled.cx.values_mut().for_each(|e| *e = rate(e));
+        scaled.single.values_mut().for_each(|e| *e = rate(e));
+        scaled.readout.values_mut().for_each(|e| *e = rate(e));
+        scaled.t1.values_mut().for_each(|t| *t /= factor);
+        scaled.t2.values_mut().for_each(|t| *t /= factor);
+        scaled
+    }
+
     pub fn coupling(&self) -> Coupling {
         let mut edges: Vec<(usize, usize)> = self.cx.keys().copied().collect();
         edges.sort_unstable();
@@ -194,6 +207,63 @@ impl Calibration {
             }
         }
         (clock.into_values().fold(0.0, f64::max), loss)
+    }
+
+    pub fn mitigate(
+        &self,
+        program: &Program,
+        counts: &BTreeMap<String, u64>,
+    ) -> Option<Vec<(String, f64)>> {
+        let bits = program.num_results as usize;
+        if bits == 0 || bits > MAX_MITIGATED {
+            return None;
+        }
+        let mut flips = vec![0.0; bits];
+        for op in program.ops() {
+            if let Op::Measure { qubit, result, .. } = op
+                && let Some(flip) = flips.get_mut(result.index())
+            {
+                *flip = self.readout(qubit.index());
+            }
+        }
+        let total: u64 = counts.values().sum();
+        let mut dense = vec![0.0; 1 << bits];
+        for (key, &count) in counts {
+            let index = key
+                .chars()
+                .take(bits)
+                .enumerate()
+                .filter(|&(_, c)| c == '1')
+                .fold(0usize, |index, (bit, _)| index | 1 << bit);
+            dense[index] += count as f64 / total.max(1) as f64;
+        }
+        for (bit, &p) in flips.iter().enumerate() {
+            if p <= 0.0 || p >= 0.5 {
+                continue;
+            }
+            let scale = 1.0 / (1.0 - 2.0 * p);
+            for low in (0..dense.len()).filter(|j| j >> bit & 1 == 0) {
+                let high = low | 1 << bit;
+                let (a, b) = (dense[low], dense[high]);
+                dense[low] = scale * ((1.0 - p) * a - p * b);
+                dense[high] = scale * ((1.0 - p) * b - p * a);
+            }
+        }
+        dense.iter_mut().for_each(|v| *v = v.max(0.0));
+        let sum: f64 = dense.iter().sum();
+        let mut out: Vec<(String, f64)> = dense
+            .iter()
+            .enumerate()
+            .filter(|&(_, &v)| sum > 0.0 && v / sum > 1e-9)
+            .map(|(index, &v)| {
+                let key = (0..bits)
+                    .map(|bit| if index >> bit & 1 == 1 { '1' } else { '0' })
+                    .collect();
+                (key, v / sum)
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        Some(out)
     }
 
     pub fn readout(&self, q: usize) -> f64 {

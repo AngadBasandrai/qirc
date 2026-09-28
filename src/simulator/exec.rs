@@ -212,13 +212,20 @@ pub fn execute(program: &Program, config: ExecConfig) -> ExecOutcome {
             None,
             || Tableau::new(qubits),
             Tableau::measure,
+            &mut |_| {},
         )
         .0
     } else if stabilizer(program) {
         execute_sampled(program, config, Tableau::new(qubits)).0
     } else if needs_per_shot(program) {
-        let (mut outcome, state) =
-            shots(program, config, None, || State::new(qubits), State::measure);
+        let (mut outcome, state) = shots(
+            program,
+            config,
+            None,
+            || State::new(qubits),
+            State::measure,
+            &mut |_| {},
+        );
         if config.keep_state {
             outcome.final_state = state;
         }
@@ -233,6 +240,15 @@ pub fn execute_vector(program: &Program, config: ExecConfig) -> ExecOutcome {
         execute_sampled(program, config, State::new(program.num_qubits as usize));
     outcome.final_state = config.keep_state.then_some(state);
     outcome
+}
+
+pub(crate) fn final_tableau(program: &Program) -> Tableau {
+    let config = ExecConfig {
+        shots: 0,
+        seed: 1,
+        keep_state: false,
+    };
+    execute_sampled(program, config, Tableau::new(program.num_qubits as usize)).1
 }
 
 fn control_mask(gate: &Gate) -> u64 {
@@ -342,6 +358,7 @@ pub fn execute_noisy(
             Some(calibration),
             || Tableau::new(qubits),
             Tableau::measure,
+            &mut |_| {},
         )
         .0;
     }
@@ -351,11 +368,31 @@ pub fn execute_noisy(
         Some(calibration),
         || State::new(qubits),
         State::measure,
+        &mut |_| {},
     );
     if config.keep_state {
         outcome.final_state = state;
     }
     outcome
+}
+
+pub fn average_noisy(
+    program: &Program,
+    config: ExecConfig,
+    calibration: &Calibration,
+    value: impl Fn(&State) -> f64,
+) -> f64 {
+    let qubits = program.num_qubits as usize;
+    let mut total = 0.0;
+    shots(
+        program,
+        config,
+        Some(calibration),
+        || State::new(qubits),
+        State::measure,
+        &mut |state| total += value(state),
+    );
+    total / config.shots.max(1) as f64
 }
 
 fn depolarize<S: Backend>(state: &mut S, gate: &Gate, calibration: &Calibration, rng: &mut Rng) {
@@ -377,6 +414,7 @@ fn shots<S: Backend>(
     noise: Option<&Calibration>,
     fresh: impl Fn() -> S,
     measure: fn(&mut S, usize, &mut Rng) -> bool,
+    each: &mut dyn FnMut(&S),
 ) -> (ExecOutcome, Option<S>) {
     let shots = config.shots.max(1);
     let mut rng = Rng::new(config.seed);
@@ -445,6 +483,7 @@ fn shots<S: Backend>(
             *returns.entry(format_returned(&run.returned)).or_insert(0) += 1;
         }
 
+        each(&state);
         if shot + 1 == shots {
             last_state = Some(state);
         }

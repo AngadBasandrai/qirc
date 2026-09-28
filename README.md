@@ -66,7 +66,7 @@ The only direct dependency is `num-complex`.
 qirc <input.ll | input.qasm> [options]
 qirc diff <a> [b] [options]
 
-  --emit <kind>     run | ir | qasm3 | qir | json | circuit | quantikz | svg | cost | check
+  --emit <kind>     run | ir | qasm3 | qasm2 | qir | json | circuit | quantikz | svg | cost | check
                     (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
   --gates <set>     target gate set: rz-sx-cx, rz-ry-cz or a list such as rz,sx,cx
@@ -78,6 +78,8 @@ qirc diff <a> [b] [options]
   --relabel         remove swaps at the end of the program by permuting qubits
   --reuse           reset measured qubits and reuse them to need fewer qubits
   --noisy           simulate with the error rates from --calibration
+  --mitigate        undo the readout errors from --calibration in the counts
+  --zne             extrapolate the --observable to zero noise from 1x, 2x and 3x noise
   --observable <p>  print the exact expectation of a Pauli sum such as 'Z0 Z1 + 0.5 X2'
   --shots <n>       sample n measurement outcomes
   --seed <n>        seed the random number generator
@@ -137,6 +139,8 @@ $ qirc bell.qasm --emit qir -O2 --gates rz-sx-cx
 It reads `qubit`, `bit`, `qreg` and `creg` declarations, the standard gates of `stdgates.inc` and `qelib1.inc` including `u`, `u2`, `u3`, `cp`, `crz`, `cu`, `rzz`, `rxx`, `ryy`, `ccx` and `cswap`, gate definitions with parameters, gates applied to whole registers, all three ways of writing a measurement, `reset`, `barrier`, and `if` on a bit, its negation or a register compared with a number, with an `else`. Angles can use `pi`, arithmetic and functions such as `sin` and `sqrt`. Classical types, `output`, loops and subroutines are reported as unsupported. The classical bits are recorded as one array at the end, and the program uses the Adaptive Profile only if it branches, resets or reuses a measured qubit. Errors point at the source like any other diagnostic, and nesting, expression depth and the size of expanded gate definitions are bounded, so hostile input fails with a message.
 
 Every circuit Qiskit exports for the benchmarks, in both versions, `qirc diff` finds identical to the same circuit built as QIR.
+
+`--emit qasm2` writes OpenQASM 2 with `qelib1.inc` gates for tools that only read that version. OpenQASM 2 has no `else`, loops or classical variables, so it covers straight line programs and a branch on one measurement to a block of gates, which becomes `if(c1==1) x q[2];` with one single bit register per result, as teleportation needs. Anything else is refused with a pointer to `--emit qasm3`. Every corpus program that fits is accepted by Qiskit's OpenQASM 2 parser and reads back into qirc with the same outcome probabilities.
 
 ## Lowering
 
@@ -219,7 +223,11 @@ $ qirc tests/corpus/base_profile_bell.ll --exclude h,cx --emit ir
 
 `--calibration file` reads device error rates, one per line as `cx a b error`, `single q error` or `readout q error`, and routes onto the coupling map its `cx` lines describe unless `--coupling` is also given. The router then measures distance by the error of each coupler, prefers SWAPs on good couplers and keeps the layout with the highest estimated success probability, and `--emit cost` adds a `success` column with the product of one minus the error of every operation on each path. `examples/line5.cal` describes a five qubit line with one poor coupler.
 
-A calibration can also give durations in nanoseconds as `time cx a b ns`, `time single q ns` and `time readout q ns`, and relaxation and dephasing times in microseconds as `t1 q us` and `t2 q us`. With durations, `--emit cost` schedules every operation as early as its qubits allow and adds a `time us` column, and the success estimate also charges each qubit for the time it waits between operations, using the Pauli twirl of amplitude and phase damping: X and Y each with probability (1 - e^(-t/T1))/4 and Z with (1 - e^(-t/T2))/2 minus that. A qubit is only charged once it has been used, since the ground state does not decay. `--noisy` applies the same idle errors during simulation, keeping a clock per qubit in every shot. In a program with branches or loops every block starts from the same layout, and a block that jumps elsewhere swaps its qubits back before the jump, so each successor sees the layout it expects.
+A calibration can also give durations in nanoseconds as `time cx a b ns`, `time single q ns` and `time readout q ns`, and relaxation and dephasing times in microseconds as `t1 q us` and `t2 q us`. With durations, `--emit cost` schedules every operation as early as its qubits allow and adds a `time us` column, and the success estimate also charges each qubit for the time it waits between operations, using the Pauli twirl of amplitude and phase damping: X and Y each with probability (1 - e^(-t/T1))/4 and Z with (1 - e^(-t/T2))/2 minus that. A qubit is only charged once it has been used, since the ground state does not decay. `--noisy` applies the same idle errors during simulation, keeping a clock per qubit in every shot.
+
+`--mitigate` undoes readout errors in the measurement counts, for a noisy simulation or for counts from a device described by the same calibration. Each result bit's flip matrix is inverted and applied across the distribution, negative quasi probabilities are clipped and the rest is renormalised. On a 5 qubit GHZ state with readout errors of 5 to 15 percent, 59 percent of raw shots are correct and the mitigated distribution puts 0.499 and 0.492 on the two correct outcomes.
+
+`--zne` with `--observable` and `--calibration` runs zero noise extrapolation. The program is simulated with the calibration's errors at one, two and three times their rates, with T1 and T2 shortened to match, the expectation value is averaged over the final state of every shot, and a quadratic through the three points is extended to zero noise, which is 3 E1 - 3 E2 + E3. For `Z0 Z4` on a 5 qubit GHZ state on `examples/line5.cal`, the exact value is 1, one times noise gives 0.938 and the extrapolation gives 0.993. In a program with branches or loops every block starts from the same layout, and a block that jumps elsewhere swaps its qubits back before the jump, so each successor sees the layout it expects.
 
 ```
 $ qirc tests/corpus/qsharp_loop.ll --emit qasm3 --basis rz-sx-cx --coupling line:4
@@ -383,7 +391,7 @@ Straight line programs are evolved once and sampled. Programs that branch on a m
 
 A program with more than 20 qubits whose gates are all Clifford (H, S, the Paulis, SX, CNOT, CZ, CY, swap, and rotations by multiples of a quarter turn) runs on a stabilizer tableau instead, up to 5,000 qubits, with branches, resets and measurements. The tableau is stored row by row as bit words, so combining two rows costs a few popcounts, and a straight line program is prepared once and each shot measures a copy. A 1,000 qubit GHZ state takes under a second for 1,000 shots. `qirc diff` uses the same tableau for such programs, following each measurement that is not already determined and comparing final states through the reduced row echelon form of their stabilizer groups, so it can check a compile of a large Clifford circuit exactly.
 
-`--observable` prints the exact expectation value of a sum of Pauli strings, written like `Z0 Z1 + 0.5 X2 - 2*Y3`. Measurements at the end of the program are left out, so the value is taken on the state just before them, and a program that branches on mid circuit measurements is averaged exactly over every branch, weighted by its probability. On the teleportation example the teleported qubit gives 0.707107 for both `Z2` and `X2`, as `ry(pi/4)` should.
+`--observable` prints the exact expectation value of a sum of Pauli strings, written like `Z0 Z1 + 0.5 X2 - 2*Y3`. Measurements at the end of the program are left out, so the value is taken on the state just before them, and a program that branches on mid circuit measurements is averaged exactly over every branch, weighted by its probability. On the teleportation example the teleported qubit gives 0.707107 for both `Z2` and `X2`, as `ry(pi/4)` should. A program without mid circuit measurements is not limited to 30 qubits: each Pauli string only depends on the gates in its backward light cone, so each is simulated on a small circuit over just the qubits of its cone. A 200 qubit layer of `ry` rotations and CNOT pairs gives `Z199 + X0 X1` exactly in 50 ms. A cone of Clifford gates is simulated on the stabilizer tableau instead, however wide it is: after basis changes and CNOTs fold the Pauli string onto one qubit, its value is 0 if measuring that qubit would be random and the sign of the deterministic outcome otherwise, so `Y0 Y1 X2 ... X999` on a 1000 qubit GHZ state gives -1.
 
 Other programs are limited to 30 qubits by the state vector. Larger programs can still be compiled and emitted.
 

@@ -177,3 +177,30 @@ fn hostile_inputs() {
         assert!(found.contains(message), "{found}");
     }
 }
+
+#[test]
+fn qasm2_round_trip() {
+    for source in [
+        include_str!("corpus/base_profile_bell.ll"),
+        TELEPORT_QIR,
+        include_str!("corpus/qsharp_ising.ll"),
+    ] {
+        let program = compile(source, 2);
+        let text = qirc::qasm2::emit(&program).expect("qasm2");
+        assert!(text.starts_with("OPENQASM 2.0;"));
+        let back = compile(&text, 0);
+        let (a, b) = (
+            probabilities(&equiv::explore(&program)),
+            probabilities(&equiv::explore(&back)),
+        );
+        assert_eq!(a.len(), b.len(), "{text}");
+        for ((x, p), (y, q)) in a.iter().zip(&b) {
+            assert_eq!(x, y);
+            assert!((p - q).abs() < 1e-9, "{x}: {p} vs {q}");
+        }
+    }
+    let teleport = qirc::qasm2::emit(&compile(TELEPORT_QIR, 2)).unwrap();
+    assert!(teleport.contains("if(c1==1) x q[2];"), "{teleport}");
+    let looping = compile(include_str!("../examples/repeat_until_success.ll"), 1);
+    assert!(qirc::qasm2::emit(&looping).is_err());
+}
