@@ -20,6 +20,7 @@ use crate::observable::{self, Observable};
 use crate::opt::{self, OptStats};
 use crate::parse::parse_module;
 use crate::qasm;
+use crate::qasm2;
 use crate::reuse::{self, Reused};
 use crate::route::{self, Coupling, Relabelled, RouteStats};
 use crate::sema;
@@ -36,6 +37,7 @@ pub enum Emit {
     Run,
     Ir,
     Qasm3,
+    Qasm2,
     Qir,
     Json,
     Circuit,
@@ -51,6 +53,7 @@ impl Emit {
             "run" => Emit::Run,
             "ir" => Emit::Ir,
             "qasm" | "qasm3" => Emit::Qasm3,
+            "qasm2" => Emit::Qasm2,
             "qir" | "llvm" => Emit::Qir,
             "json" => Emit::Json,
             "circuit" => Emit::Circuit,
@@ -178,6 +181,8 @@ pub struct Options {
     pub relabel: bool,
     pub reuse: bool,
     pub noisy: bool,
+    pub mitigate: bool,
+    pub zne: bool,
     pub observable: Option<Observable>,
     pub coupling: Option<Coupling>,
     pub calibration: Option<Calibration>,
@@ -218,6 +223,8 @@ impl Default for Options {
             relabel: false,
             reuse: false,
             noisy: false,
+            mitigate: false,
+            zne: false,
             observable: None,
             coupling: None,
             calibration: None,
@@ -238,7 +245,8 @@ usage:
                     behaves exactly like a.ll at -O0
 
 options:
-  --emit <kind>     run | ir | qasm3 | qir | json | circuit | quantikz | svg | cost | check
+  --emit <kind>     run | ir | qasm3 | qasm2 | qir | json | circuit | quantikz | svg | cost
+                    | check
                     (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
   --shots <n>       sample n measurement outcomes
@@ -255,6 +263,8 @@ options:
   --relabel         remove swaps at the end of the program by permuting qubits
   --reuse           reset measured qubits and reuse them to need fewer qubits
   --noisy           simulate with the error rates from --calibration
+  --mitigate        undo the readout errors from --calibration in the counts
+  --zne             extrapolate the --observable to zero noise from 1x, 2x and 3x noise
   --observable <p>  print the exact expectation of a Pauli sum such as 'Z0 Z1 + 0.5 X2'
   --calibration <f> device error rates: lines of cx a b e, single q e, readout q e
   --coupling <map>  route onto hardware: line:N | ring:N | grid:RxC | full:N
@@ -333,6 +343,10 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
 
             "--noisy" => options.noisy = true,
 
+            "--mitigate" => options.mitigate = true,
+
+            "--zne" => options.zne = true,
+
             "--observable" => {
                 let value = value(
                     &mut args,
@@ -407,8 +421,11 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
         );
     }
     options.input = input.ok_or_else(|| "no input file given".to_string())?;
-    if options.noisy && options.calibration.is_none() {
-        return Err("--noisy needs --calibration for its error rates".into());
+    if (options.noisy || options.mitigate || options.zne) && options.calibration.is_none() {
+        return Err("--noisy, --mitigate and --zne need --calibration for its error rates".into());
+    }
+    if options.zne && options.observable.is_none() {
+        return Err("--zne needs --observable for the value to extrapolate".into());
     }
     Ok(options)
 }
@@ -773,6 +790,13 @@ pub fn run_source(
                 return 1;
             }
         },
+        Emit::Qasm2 => match qasm2::emit(program) {
+            Ok(text) => text,
+            Err(reason) => {
+                output.eprintln(format_args!("error: cannot emit OpenQASM 2: {reason}"));
+                return 1;
+            }
+        },
         Emit::Qir => match codegen::emit_qir(program) {
             Ok(text) => text,
             Err(reason) => {
@@ -810,6 +834,13 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
 
     let qubits = program.num_qubits as usize;
     if qubits > state::MAX_QUBITS && !exec::stabilizer(program) {
+        if let Some(observable) = &options.observable {
+            return if expectation(output, program, observable) {
+                0
+            } else {
+                1
+            };
+        }
         output.eprintln(format_args!(
             "error: this program needs {qubits} qubits, but the simulator supports at most {}",
             state::MAX_QUBITS
@@ -910,16 +941,36 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
         &outcome.counts,
     );
 
+    if let (true, Some(calibration)) = (options.mitigate, &options.calibration) {
+        match calibration.mitigate(program, &outcome.counts) {
+            Some(rows) if !rows.is_empty() => {
+                let width = rows.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
+                output.println("");
+                output.println("mitigated measurement, readout errors undone:");
+                for (key, share) in rows {
+                    output.println(format_args!("  {key:<width$}  {share:.4}"));
+                }
+            }
+            _ => output.eprintln(format_args!(
+                "note: readout mitigation needs between 1 and 20 measured results"
+            )),
+        }
+    }
+
     if let Some(observable) = &options.observable {
         output.println("");
-        match observable::expectation(program, observable) {
-            Ok(value) => output.println(format_args!(
-                "expectation of {observable}: {:.6}",
-                value + 0.0
-            )),
-            Err(reason) => output.eprintln(format_args!(
-                "error: cannot compute the expectation: {reason}"
-            )),
+        expectation(output, program, observable);
+        if let (true, Some(calibration)) = (options.zne, &options.calibration) {
+            let shots = options.shots.max(1000);
+            match observable::extrapolate(program, observable, calibration, shots, seed) {
+                Ok(([one, two, three], zero)) => {
+                    output.println(format_args!(
+                        "noisy expectation at 1x, 2x and 3x noise over {shots} shots: {one:.6}, {two:.6}, {three:.6}"
+                    ));
+                    output.println(format_args!("zero noise extrapolation: {:.6}", zero + 0.0));
+                }
+                Err(reason) => output.eprintln(format_args!("error: cannot extrapolate: {reason}")),
+            }
         }
     }
 
@@ -928,6 +979,24 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
         output.println(format_args!("simulated in {elapsed:.3?}"));
     }
     0
+}
+
+fn expectation(output: &mut Output, program: &Program, observable: &Observable) -> bool {
+    match observable::expectation(program, observable) {
+        Ok(value) => {
+            output.println(format_args!(
+                "expectation of {observable}: {:.6}",
+                value + 0.0
+            ));
+            true
+        }
+        Err(reason) => {
+            output.eprintln(format_args!(
+                "error: cannot compute the expectation: {reason}"
+            ));
+            false
+        }
+    }
 }
 
 fn summary(program: &Program) -> String {

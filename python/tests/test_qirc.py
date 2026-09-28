@@ -67,9 +67,18 @@ def test_expectation():
         qirc.expectation(BELL, "Q0")
 
 
+def test_zero_noise():
+    device = str(ROOT / "examples" / "line5.cal")
+    ghz = (CORPUS / "qsharp_bell.ll").read_text()
+    exact = qirc.expectation(ghz, "Z0 Z1")
+    noisy = qirc.expectation(ghz, "Z0 Z1", calibration=device, noisy=True, shots=20000, seed=4)
+    zero = qirc.expectation(ghz, "Z0 Z1", calibration=device, zne=True, shots=20000, seed=4)
+    assert abs(exact - zero) < abs(exact - noisy)
+
+
 def test_errors():
-    with pytest.raises(qirc.CompileError, match="QIR0100"):
-        qirc.compile("define garbage {")
+    with pytest.raises(qirc.CompileError, match="mine.ll"):
+        qirc.compile("define garbage {", name="mine.ll")
     with pytest.raises(ValueError, match="unknown"):
         qirc.compile(BELL, gates="nonsense")
     with pytest.raises(TypeError, match="colour"):

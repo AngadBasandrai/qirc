@@ -1446,3 +1446,170 @@ attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"requi
     let [_, y, z] = dephasing.idle(0, 450.0);
     assert!((flipped - (y + z)).abs() < 0.02, "{flipped} vs {}", y + z);
 }
+
+#[test]
+fn readout_mitigation() {
+    let qubit = |i: usize| format!("%Qubit* inttoptr (i64 {i} to %Qubit*)");
+    let mut body = format!("  call void @__quantum__qis__h__body({})\n", qubit(0));
+    for i in 1..4 {
+        body += &format!(
+            "  call void @__quantum__qis__cnot__body({}, {})\n",
+            qubit(i - 1),
+            qubit(i)
+        );
+    }
+    for i in 0..4 {
+        body += &format!(
+            "  call void @__quantum__qis__mz__body({}, %Result* inttoptr (i64 {i} to %Result*))\n",
+            qubit(i)
+        );
+    }
+    let source = format!(
+        "%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {{
+entry:
+{body}  ret void
+}}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+
+attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"4\" \"required_num_results\"=\"4\" }}
+"
+    );
+    let calibration = Calibration::parse(
+        "cx 0 1 0\ncx 1 2 0\ncx 2 3 0\nreadout 0 0.08\nreadout 1 0.12\nreadout 2 0.05\nreadout 3 0.15",
+    )
+    .unwrap();
+    let program = compile(&source, 1);
+    let config = ExecConfig {
+        shots: 40_000,
+        seed: 3,
+        keep_state: false,
+    };
+    let counts = exec::execute_noisy(&program, config, &calibration).counts;
+    let raw = counts.get("0000").copied().unwrap_or(0) as f64 / 40_000.0;
+    assert!(raw < 0.35, "{raw}");
+    let mitigated = calibration.mitigate(&program, &counts).unwrap();
+    let share = |key: &str| {
+        mitigated
+            .iter()
+            .find(|(k, _)| k == key)
+            .map_or(0.0, |(_, p)| *p)
+    };
+    assert!((share("0000") - 0.5).abs() < 0.03, "{mitigated:?}");
+    assert!((share("1111") - 0.5).abs() < 0.03, "{mitigated:?}");
+}
+
+#[test]
+fn zero_noise() {
+    let qubit = |i: usize| format!("%Qubit* inttoptr (i64 {i} to %Qubit*)");
+    let mut body = format!("  call void @__quantum__qis__h__body({})\n", qubit(0));
+    for i in 1..5 {
+        body += &format!(
+            "  call void @__quantum__qis__cnot__body({}, {})\n",
+            qubit(i - 1),
+            qubit(i)
+        );
+    }
+    let source = format!(
+        "%Qubit = type opaque
+
+define void @main() #0 {{
+entry:
+{body}  ret void
+}}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
+
+attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"5\" }}
+"
+    );
+    let calibration = Calibration::parse(include_str!("../examples/line5.cal")).unwrap();
+    let program = compile(&source, 1);
+    let parity = Observable::parse("Z0 Z4").unwrap();
+    let exact = observable::expectation(&program, &parity).unwrap();
+    let ([noisy, twice, thrice], zero) =
+        observable::extrapolate(&program, &parity, &calibration, 20_000, 5).unwrap();
+    assert!((exact - 1.0).abs() < 1e-9);
+    assert!(noisy > twice && twice > thrice, "{noisy} {twice} {thrice}");
+    assert!(
+        (exact - zero).abs() * 3.0 < exact - noisy,
+        "{zero} vs {noisy}"
+    );
+}
+
+#[test]
+fn light_cones() {
+    let qubit = |i: usize| format!("%Qubit* inttoptr (i64 {i} to %Qubit*)");
+    let angle = |i: usize| 0.1 + 0.02 * i as f64;
+    let mut body = String::new();
+    for i in 0..60 {
+        body += &format!(
+            "  call void @__quantum__qis__ry__body(double {:?}, {})\n",
+            angle(i),
+            qubit(i)
+        );
+    }
+    for i in (0..60).step_by(2) {
+        body += &format!(
+            "  call void @__quantum__qis__cnot__body({}, {})\n",
+            qubit(i),
+            qubit(i + 1)
+        );
+    }
+    let source = format!(
+        "%Qubit = type opaque
+
+define void @main() #0 {{
+entry:
+{body}  ret void
+}}
+
+declare void @__quantum__qis__ry__body(double, %Qubit*)
+declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
+
+attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"60\" }}
+"
+    );
+    let program = compile(&source, 0);
+    let value =
+        |text: &str| observable::expectation(&program, &Observable::parse(text).unwrap()).unwrap();
+    for k in [0, 7, 29] {
+        let (a, b) = (angle(2 * k), angle(2 * k + 1));
+        let (even, odd) = (2 * k, 2 * k + 1);
+        assert!((value(&format!("Z{even}")) - a.cos()).abs() < 1e-9);
+        assert!((value(&format!("Z{odd}")) - a.cos() * b.cos()).abs() < 1e-9);
+        assert!((value(&format!("X{even} X{odd}")) - a.sin()).abs() < 1e-9);
+    }
+    let spread = value("Z0 Z59 + 2");
+    let expected = angle(0).cos() * angle(58).cos() * angle(59).cos() + 2.0;
+    assert!((spread - expected).abs() < 1e-9);
+}
+
+#[test]
+fn clifford_cones() {
+    let chain: String = (0..999)
+        .map(|i| format!("cx q[{i}], q[{}];\n", i + 1))
+        .collect();
+    let ghz = |extra: &str| {
+        compile(
+            &format!(
+                "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[1000];\n{extra}h q[0];\n{chain}"
+            ),
+            1,
+        )
+    };
+    let program = ghz("");
+    let value = |text: &str| observable::expectation(&program, &Observable::parse(text).unwrap());
+    let xs: String = (2..1000).map(|q| format!("X{q} ")).collect();
+    assert_eq!(value("Z0 Z999 + 0.5 Z3"), Ok(1.0));
+    assert_eq!(value(&format!("X0 X1 {xs}")), Ok(1.0));
+    assert_eq!(value(&format!("Y0 Y1 {xs}")), Ok(-1.0));
+    let magic = ghz("ry(0.3) q[0];\n");
+    assert!(observable::expectation(&magic, &Observable::parse("Z0 Z999").unwrap()).is_err());
+}

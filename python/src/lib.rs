@@ -34,9 +34,12 @@ fn flags(options: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<String>> {
     };
     for (key, value) in options.iter() {
         let key: String = key.extract()?;
+        if key == "name" {
+            continue;
+        }
         let Some(&(_, flag)) = FLAGS.iter().find(|(name, _)| *name == key) else {
             return Err(PyTypeError::new_err(format!(
-                "unexpected keyword argument `{key}`, expected one of opt, gates, exclude, resynth, cost, coupling, relabel, calibration, reuse or noisy"
+                "unexpected keyword argument `{key}`, expected one of name, opt, gates, exclude, resynth, cost, coupling, relabel, calibration, reuse or noisy"
             )));
         };
         if value.is_none() {
@@ -57,6 +60,13 @@ fn flags(options: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<String>> {
         }
     }
     Ok(args)
+}
+
+fn file_name(options: Option<&Bound<'_, PyDict>>) -> PyResult<String> {
+    match options.map(|o| o.get_item("name")).transpose()?.flatten() {
+        Some(value) => value.extract(),
+        None => Ok("program.ll".into()),
+    }
 }
 
 fn parse(mut args: Vec<String>, options: Option<&Bound<'_, PyDict>>) -> PyResult<Options> {
@@ -110,15 +120,15 @@ fn tally<'py>(py: Python<'py>, t: &Tally) -> PyResult<Bound<'py, PyDict>> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (source, *, emit = "qir", name = "program.ll", **options))]
+#[pyo3(signature = (source, *, emit = "qir", **options))]
 fn compile(
     py: Python<'_>,
     source: &str,
     emit: &str,
-    name: &str,
     options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<String> {
-    let options = parse(vec![name.into(), "--emit".into(), emit.into()], options)?;
+    let name = file_name(options)?;
+    let options = parse(vec![name.clone(), "--emit".into(), emit.into()], options)?;
     let file = SourceFile::new(name, source);
     let (code, output) = py.detach(|| {
         let mut output = Output::default();
@@ -133,19 +143,19 @@ fn compile(
 }
 
 #[pyfunction]
-#[pyo3(signature = (source, *, shots = 1000, seed = None, name = "program.ll", **options))]
+#[pyo3(signature = (source, *, shots = 1000, seed = None, **options))]
 fn run(
     py: Python<'_>,
     source: &str,
     shots: u64,
     seed: Option<u64>,
-    name: &str,
     options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<BTreeMap<String, u64>> {
     if shots == 0 {
         return Err(PyValueError::new_err("shots must be at least 1"));
     }
-    let options = parse(vec![name.into()], options)?;
+    let name = file_name(options)?;
+    let options = parse(vec![name.clone()], options)?;
     let file = SourceFile::new(name, source);
     let compilation = compiled(py, &file, &options)?;
     let program = compilation.program;
@@ -180,15 +190,15 @@ fn run(
 }
 
 #[pyfunction]
-#[pyo3(signature = (source, other = None, *, name = "program.ll", **options))]
+#[pyo3(signature = (source, other = None, *, **options))]
 fn diff(
     py: Python<'_>,
     source: &str,
     other: Option<&str>,
-    name: &str,
     options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<String> {
-    let options = parse(vec!["diff".into(), name.into()], options)?;
+    let name = file_name(options)?;
+    let options = parse(vec!["diff".into(), name.clone()], options)?;
     let file = SourceFile::new(name, source);
     let other = other.map(|text| SourceFile::new("other.ll", text));
     let output = py.detach(|| {
@@ -204,32 +214,43 @@ fn diff(
 }
 
 #[pyfunction]
-#[pyo3(signature = (source, observable, *, name = "program.ll", **options))]
+#[pyo3(signature = (source, observable, *, zne = false, shots = 4000, seed = 1, **options))]
 fn expectation(
     py: Python<'_>,
     source: &str,
     observable: &str,
-    name: &str,
+    zne: bool,
+    shots: u64,
+    seed: u64,
     options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<f64> {
     let observable = Observable::parse(observable).map_err(PyValueError::new_err)?;
-    let options = parse(vec![name.into()], options)?;
+    let name = file_name(options)?;
+    let options = parse(vec![name.clone()], options)?;
     let file = SourceFile::new(name, source);
     let compilation = compiled(py, &file, &options)?;
     let program = compilation.program;
-    py.detach(|| observable::expectation(&program, &observable))
-        .map_err(PyValueError::new_err)
+    py.detach(|| match (&options.calibration, zne, options.noisy) {
+        (Some(c), true, _) => {
+            observable::extrapolate(&program, &observable, c, shots, seed).map(|(_, zero)| zero)
+        }
+        (Some(c), false, true) => {
+            observable::noisy_expectation(&program, &observable, c, shots, seed)
+        }
+        _ => observable::expectation(&program, &observable),
+    })
+    .map_err(PyValueError::new_err)
 }
 
 #[pyfunction(name = "cost")]
-#[pyo3(signature = (source, *, name = "program.ll", **options))]
+#[pyo3(signature = (source, *, **options))]
 fn cost_report<'py>(
     py: Python<'py>,
     source: &str,
-    name: &str,
     options: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let options = parse(vec![name.into()], options)?;
+    let name = file_name(options)?;
+    let options = parse(vec![name.clone()], options)?;
     let file = SourceFile::new(name, source);
     let compilation = compiled(py, &file, &options)?;
     let report = cost::analyse(&compilation.program, options.calibration.as_ref());
