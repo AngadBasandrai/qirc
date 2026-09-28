@@ -9,6 +9,15 @@ pub struct Calibration {
     cx: HashMap<(usize, usize), f64>,
     single: HashMap<usize, f64>,
     readout: HashMap<usize, f64>,
+    cx_time: HashMap<(usize, usize), f64>,
+    single_time: HashMap<usize, f64>,
+    readout_time: HashMap<usize, f64>,
+    t1: HashMap<usize, f64>,
+    t2: HashMap<usize, f64>,
+}
+
+fn average<K>(map: &HashMap<K, f64>) -> f64 {
+    map.values().sum::<f64>() / map.len().max(1) as f64
 }
 
 impl Calibration {
@@ -22,8 +31,14 @@ impl Calibration {
             }
             let shape = || {
                 format!(
-                    "line {number}: expected `cx a b error`, `single q error` or `readout q error`"
+                    "line {number}: expected `cx a b error`, `single q error`, `readout q error`, `time cx a b ns`, `time single q ns`, `time readout q ns`, `t1 q us` or `t2 q us`"
                 )
+            };
+            let length = |word: &str| match word.parse::<f64>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => Ok(v),
+                _ => Err(format!(
+                    "line {number}: `{word}` must be a time of at least 0"
+                )),
             };
             let qubit = |word: &str| word.parse::<usize>().map_err(|_| shape());
             let rate = |word: &str| match word.parse::<f64>() {
@@ -53,6 +68,31 @@ impl Calibration {
                     calibration.readout.insert(q, rate(e)?);
                     q
                 }
+                ["time", "cx", a, b, t] => {
+                    let (a, b) = (qubit(a)?, qubit(b)?);
+                    calibration.cx_time.insert((a.min(b), a.max(b)), length(t)?);
+                    a.max(b)
+                }
+                ["time", "single", q, t] => {
+                    let q = qubit(q)?;
+                    calibration.single_time.insert(q, length(t)?);
+                    q
+                }
+                ["time", "readout", q, t] => {
+                    let q = qubit(q)?;
+                    calibration.readout_time.insert(q, length(t)?);
+                    q
+                }
+                ["t1", q, t] => {
+                    let q = qubit(q)?;
+                    calibration.t1.insert(q, length(t)? * 1000.0);
+                    q
+                }
+                ["t2", q, t] => {
+                    let q = qubit(q)?;
+                    calibration.t2.insert(q, length(t)? * 1000.0);
+                    q
+                }
                 _ => return Err(shape()),
             };
             calibration.qubits = calibration.qubits.max(highest + 1);
@@ -77,6 +117,83 @@ impl Calibration {
             .get(&(a.min(b), a.max(b)))
             .copied()
             .unwrap_or_else(|| self.cx.values().sum::<f64>() / self.cx.len().max(1) as f64)
+    }
+
+    pub fn timed(&self) -> bool {
+        !self.cx_time.is_empty() || !self.single_time.is_empty() || !self.readout_time.is_empty()
+    }
+
+    fn cx_time(&self, a: usize, b: usize) -> f64 {
+        self.cx_time
+            .get(&(a.min(b), a.max(b)))
+            .copied()
+            .unwrap_or_else(|| average(&self.cx_time))
+    }
+
+    pub fn duration(&self, op: &Op) -> f64 {
+        match op {
+            Op::Gate(gate) => {
+                let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
+                match wires[..] {
+                    [q] => self
+                        .single_time
+                        .get(&q)
+                        .copied()
+                        .unwrap_or_else(|| average(&self.single_time)),
+                    [a, b] if gate.kind == GateKind::Swap => 3.0 * self.cx_time(a, b),
+                    [a, b] => self.cx_time(a, b),
+                    _ => {
+                        let mut total = 0.0;
+                        for (i, &a) in wires.iter().enumerate() {
+                            for &b in &wires[i + 1..] {
+                                total += 2.0 * self.cx_time(a, b);
+                            }
+                        }
+                        total
+                    }
+                }
+            }
+            Op::Measure { qubit, .. } | Op::Reset { qubit, .. } => self
+                .readout_time
+                .get(&qubit.index())
+                .copied()
+                .unwrap_or_else(|| average(&self.readout_time)),
+            _ => 0.0,
+        }
+    }
+
+    pub fn idle(&self, q: usize, ns: f64) -> [f64; 3] {
+        let decay = |time: Option<&f64>| time.map_or(0.0, |t| 1.0 - (-ns / t).exp());
+        let damping = decay(self.t1.get(&q));
+        let dephasing = decay(self.t2.get(&q));
+        let flip = damping / 4.0;
+        [flip, flip, (dephasing / 2.0 - flip).max(0.0)]
+    }
+
+    pub fn schedule<'a>(&self, ops: impl IntoIterator<Item = &'a Op>) -> (f64, f64) {
+        let mut clock: HashMap<usize, f64> = HashMap::new();
+        let mut loss = 0.0;
+        for op in ops {
+            let qubits: Vec<usize> = op.qubits().iter().map(|q| q.index()).collect();
+            if qubits.is_empty() {
+                continue;
+            }
+            let start = qubits
+                .iter()
+                .map(|q| clock.get(q).copied().unwrap_or(0.0))
+                .fold(0.0, f64::max);
+            for q in &qubits {
+                if let Some(&last) = clock.get(q) {
+                    let error: f64 = self.idle(*q, start - last).iter().sum();
+                    loss += -(-error).ln_1p();
+                }
+            }
+            let end = start + self.duration(op);
+            for q in qubits {
+                clock.insert(q, end);
+            }
+        }
+        (clock.into_values().fold(0.0, f64::max), loss)
     }
 
     pub fn readout(&self, q: usize) -> f64 {

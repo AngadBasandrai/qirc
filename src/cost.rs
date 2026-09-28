@@ -14,15 +14,19 @@ pub struct Tally {
     pub depth: usize,
     pub live: usize,
     pub success: Option<f64>,
+    pub time: Option<f64>,
 }
 
 impl Tally {
     fn of<'a>(blocks: impl Iterator<Item = &'a Block>, calibration: Option<&Calibration>) -> Tally {
         let blocks: Vec<&Block> = blocks.collect();
-        let mut tally = Tally {
-            success: calibration.map(|c| (-c.infidelity(blocks.iter().flat_map(|b| &b.ops))).exp()),
-            ..Tally::default()
-        };
+        let ops = || blocks.iter().flat_map(|b| &b.ops);
+        let mut tally = Tally::default();
+        if let Some(c) = calibration {
+            let (time, idle) = c.schedule(ops());
+            tally.success = Some((-c.infidelity(ops()) - idle).exp());
+            tally.time = c.timed().then_some(time);
+        }
         let mut frontier: HashMap<QubitId, usize> = HashMap::new();
         let mut open: HashMap<QubitId, usize> = HashMap::new();
         let mut intervals = Vec::new();
@@ -69,6 +73,10 @@ impl Tally {
             live: self.live.max(other.live),
             success: match (self.success, other.success) {
                 (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            time: match (self.time, other.time) {
+                (Some(a), Some(b)) => Some(a.max(b)),
                 (a, b) => a.or(b),
             },
         }
@@ -199,6 +207,9 @@ impl fmt::Display for Report {
                 "{name:<width$}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
                 t.t, t.cx, t.gates, t.depth, t.live
             )?;
+            if let Some(time) = t.time {
+                write!(f, "  {:>9.2}", time / 1000.0)?;
+            }
             match t.success {
                 Some(success) => writeln!(f, "  {success:>8.4}"),
                 None => writeln!(f),
@@ -209,6 +220,9 @@ impl fmt::Display for Report {
             "{:<width$}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
             "path", "t", "cx", "gates", "depth", "live"
         )?;
+        if self.worst.time.is_some() {
+            write!(f, "  {:>9}", "time us")?;
+        }
         if self.worst.success.is_some() {
             writeln!(f, "  {:>8}", "success")?;
         } else {

@@ -2,7 +2,7 @@
 
 A compiler and state vector simulator for [QIR](https://github.com/qir-alliance/qir-spec), the LLVM based intermediate representation used by Q#, PyQIR and other quantum toolchains.
 
-qirc reads `.ll` files, checks them against the QIR profile they declare, optimises the circuit, and then either simulates it or emits OpenQASM 3, QIR or JSON. It can also lower a circuit to a hardware gate set and route it onto a limited qubit connectivity map.
+qirc reads QIR `.ll` files and OpenQASM 2 and 3 programs, checks them against the QIR profile they declare, optimises the circuit, and then either simulates it or emits OpenQASM 3, QIR or JSON. It can also lower a circuit to a hardware gate set and route it onto a limited qubit connectivity map.
 
 Try it in the browser at https://angadbasandrai.github.io/qirc/.
 
@@ -63,10 +63,10 @@ The only direct dependency is `num-complex`.
 ## Usage
 
 ```
-qirc <input.ll> [options]
-qirc diff <a.ll> [b.ll] [options]
+qirc <input.ll | input.qasm> [options]
+qirc diff <a> [b] [options]
 
-  --emit <kind>     run | ir | qasm3 | qir | json | circuit | cost | check
+  --emit <kind>     run | ir | qasm3 | qir | json | circuit | quantikz | svg | cost | check
                     (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
   --gates <set>     target gate set: rz-sx-cx, rz-ry-cz or a list such as rz,sx,cx
@@ -78,6 +78,7 @@ qirc diff <a.ll> [b.ll] [options]
   --relabel         remove swaps at the end of the program by permuting qubits
   --reuse           reset measured qubits and reuse them to need fewer qubits
   --noisy           simulate with the error rates from --calibration
+  --observable <p>  print the exact expectation of a Pauli sum such as 'Z0 Z1 + 0.5 X2'
   --shots <n>       sample n measurement outcomes
   --seed <n>        seed the random number generator
   --no-state        do not print the final state vector
@@ -102,7 +103,7 @@ qirc diff <a.ll> [b.ll] [options]
 | Stage | Source | Produces |
 | --- | --- | --- |
 | Lex | `lex.rs` | tokens with byte spans |
-| Parse | `parse.rs` | LLVM IR AST |
+| Parse | `parse.rs`, `qasm.rs` | LLVM IR AST, or IR straight from OpenQASM |
 | Inline | `inline.rs` | AST with helper functions expanded |
 | Lower | `lower.rs` | quantum IR |
 | Validate | `sema.rs` | profile and range diagnostics |
@@ -124,6 +125,18 @@ error[QIR0300]: the Base Profile forbids branching
    |
    = note: branching needs the Adaptive Profile
 ```
+
+## OpenQASM input
+
+A file whose first statement is `OPENQASM 2.0;` or `OPENQASM 3.0;` is read as OpenQASM instead of LLVM IR, so every command works on it: simulate it, optimise and route it, `qirc diff` it against a QIR program, or turn it into QIR with `--emit qir`.
+
+```
+$ qirc bell.qasm --emit qir -O2 --gates rz-sx-cx
+```
+
+It reads `qubit`, `bit`, `qreg` and `creg` declarations, the standard gates of `stdgates.inc` and `qelib1.inc` including `u`, `u2`, `u3`, `cp`, `crz`, `cu`, `rzz`, `rxx`, `ryy`, `ccx` and `cswap`, gate definitions with parameters, gates applied to whole registers, all three ways of writing a measurement, `reset`, `barrier`, and `if` on a bit, its negation or a register compared with a number, with an `else`. Angles can use `pi`, arithmetic and functions such as `sin` and `sqrt`. Classical types, `output`, loops and subroutines are reported as unsupported. The classical bits are recorded as one array at the end, and the program uses the Adaptive Profile only if it branches, resets or reuses a measured qubit. Errors point at the source like any other diagnostic, and nesting, expression depth and the size of expanded gate definitions are bounded, so hostile input fails with a message.
+
+Every circuit Qiskit exports for the benchmarks, in both versions, `qirc diff` finds identical to the same circuit built as QIR.
 
 ## Lowering
 
@@ -204,7 +217,9 @@ $ qirc tests/corpus/base_profile_bell.ll --exclude h,cx --emit ir
 
 `--reuse` reorders each run of quantum operations to finish the qubits it has started before touching new ones, then packs qubit lifetimes onto as few wires as it can and resets a wire before it is reused. Resetting a qubit that is no longer used cannot change what later measurements see, so the outcome distribution is unchanged, and a Base Profile program becomes Adaptive because it now resets qubits. Bernstein Vazirani on 9 qubits runs on 2. `qirc diff` compares outcome probabilities only, as after routing.
 
-`--calibration file` reads device error rates, one per line as `cx a b error`, `single q error` or `readout q error`, and routes onto the coupling map its `cx` lines describe unless `--coupling` is also given. The router then measures distance by the error of each coupler, prefers SWAPs on good couplers and keeps the layout with the highest estimated success probability, and `--emit cost` adds a `success` column with the product of one minus the error of every operation on each path. `examples/line5.cal` describes a five qubit line with one poor coupler. In a program with branches or loops every block starts from the same layout, and a block that jumps elsewhere swaps its qubits back before the jump, so each successor sees the layout it expects.
+`--calibration file` reads device error rates, one per line as `cx a b error`, `single q error` or `readout q error`, and routes onto the coupling map its `cx` lines describe unless `--coupling` is also given. The router then measures distance by the error of each coupler, prefers SWAPs on good couplers and keeps the layout with the highest estimated success probability, and `--emit cost` adds a `success` column with the product of one minus the error of every operation on each path. `examples/line5.cal` describes a five qubit line with one poor coupler.
+
+A calibration can also give durations in nanoseconds as `time cx a b ns`, `time single q ns` and `time readout q ns`, and relaxation and dephasing times in microseconds as `t1 q us` and `t2 q us`. With durations, `--emit cost` schedules every operation as early as its qubits allow and adds a `time us` column, and the success estimate also charges each qubit for the time it waits between operations, using the Pauli twirl of amplitude and phase damping: X and Y each with probability (1 - e^(-t/T1))/4 and Z with (1 - e^(-t/T2))/2 minus that. A qubit is only charged once it has been used, since the ground state does not decay. `--noisy` applies the same idle errors during simulation, keeping a clock per qubit in every shot. In a program with branches or loops every block starts from the same layout, and a block that jumps elsewhere swaps its qubits back before the jump, so each successor sees the layout it expects.
 
 ```
 $ qirc tests/corpus/qsharp_loop.ll --emit qasm3 --basis rz-sx-cx --coupling line:4
@@ -260,6 +275,18 @@ Every push to `main` rebuilds the module and publishes the page with GitHub Page
 
 The module exports `allocate`, `release` and `run`, which takes the source and the arguments as UTF-8 and returns the exit code, standard output and standard error. The playground simulates at most 20 qubits.
 
+## Circuit diagrams
+
+`--emit circuit` prints an ASCII diagram, `--emit quantikz` writes a LaTeX `quantikz` environment and `--emit svg` a standalone SVG image. The two drawings pack each operation into the earliest column its qubits allow, write angles as fractions of pi where they are, and mark where each block of a branching program starts, as a `\slice` in LaTeX and a dashed line in SVG. The LaTeX needs `\usetikzlibrary{quantikz2}` and compiles with pdflatex.
+
+```
+$ qirc tests/corpus/base_profile_bell.ll --emit quantikz
+\begin{quantikz}
+\lstick{$q_{0}$} & \gate{H} & \ctrl{1} & \meter{} & \qw \\
+\lstick{$q_{1}$} & \qw & \targ{} & \meter{} & \qw
+\end{quantikz}
+```
+
 ## Cost report
 
 `--emit cost` counts what a compiled program costs without simulating it. Every path from the entry block to a return is listed with its T gates, two qubit gates, total gates, depth and the peak number of qubits in use at once, followed by the worst case over all paths. Depth schedules each gate, measurement and reset as early as its qubits allow. A qubit is in use from its first operation until its last, and a reset frees it. A path that jumps back to a block it already passed ends there, so a loop is counted once per pass. At most 256 paths are listed.
@@ -292,17 +319,17 @@ All to all connectivity:
 | pyqir_simple | 3 | 2 / 12 / 7 | 6 / 27 / 18 | 6 / 36 / 22 | 6 / 24 / 14 | 6 / 24 / 14 |
 | qsharp_loop | 4 | 3 / 4 / 4 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 |
 | unrestricted_dynamic | 5 | 4 / 6 / 5 | 4 / 8 / 7 | 4 / 8 / 7 | 4 / 8 / 7 | 4 / 8 / 7 |
-| qft_4 | 4 | 14 / 36 / 24 | 12 / 33 / 23 | 12 / 33 / 23 | 12 / 35 / 24 | 12 / 35 / 24 |
-| qft_6 | 6 | 33 / 84 / 40 | 30 / 73 / 37 | 30 / 73 / 37 | 30 / 77 / 38 | 30 / 77 / 38 |
-| qft_8 | 8 | 60 / 152 / 56 | 56 / 129 / 51 | 56 / 129 / 51 | 56 / 135 / 52 | 56 / 135 / 52 |
-| qft_10 | 10 | 95 / 240 / 72 | 90 / 201 / 65 | 90 / 201 / 65 | 90 / 209 / 66 | 90 / 209 / 66 |
+| qft_4 | 4 | 14 / 36 / 24 | 12 / 33 / 23 | 12 / 33 / 23 | 12 / 34 / 23 | 12 / 34 / 23 |
+| qft_6 | 6 | 33 / 84 / 40 | 30 / 73 / 37 | 30 / 73 / 37 | 30 / 71 / 35 | 30 / 71 / 35 |
+| qft_8 | 8 | 60 / 152 / 56 | 56 / 129 / 51 | 56 / 129 / 51 | 56 / 120 / 47 | 56 / 120 / 47 |
+| qft_10 | 10 | 95 / 240 / 72 | 90 / 201 / 65 | 90 / 201 / 65 | 90 / 181 / 59 | 90 / 181 / 59 |
 | grover_3 | 3 | 4 / 39 / 21 | 24 / 85 / 53 | 20 / 140 / 86 | 24 / 89 / 55 | 23 / 154 / 95 |
 | grover_4 | 4 | 84 / 250 / 171 | 84 / 228 / 166 | 84 / 243 / 183 | 84 / 234 / 171 | 84 / 234 / 171 |
-| grover_5 | 5 | 288 / 941 / 681 | 288 / 788 / 607 | 288 / 849 / 662 | 288 / 788 / 603 | 288 / 788 / 603 |
+| grover_5 | 5 | 288 / 941 / 681 | 288 / 788 / 607 | 288 / 849 / 662 | 288 / 732 / 603 | 288 / 732 / 603 |
 | adder_cdkm_4 | 9 | 24 / 24 / 21 | 64 / 151 / 114 | 47 / 130 / 88 | 50 / 121 / 88 | 50 / 121 / 88 |
 | adder_vbe_3 | 8 | 13 / 13 / 11 | 37 / 87 / 54 | 37 / 87 / 56 | 37 / 94 / 56 | 37 / 127 / 76 |
-| adder_draper_4 | 8 | 48 / 122 / 74 | 40 / 123 / 67 | 40 / 107 / 57 | 44 / 114 / 62 | 40 / 128 / 66 |
-| total |  |  | 740 / 1952 / 1278 | 719 / 2055 / 1353 | 730 / 1947 / 1252 | 725 / 2059 / 1316 |
+| adder_draper_4 | 8 | 48 / 122 / 74 | 40 / 123 / 67 | 40 / 107 / 57 | 43 / 94 / 53 | 40 / 110 / 60 |
+| total |  |  | 740 / 1952 / 1278 | 719 / 2055 / 1353 | 729 / 1821 / 1227 | 725 / 1935 / 1294 |
 
 A line of qubits (`--coupling line:n`, Qiskit `CouplingMap.from_line`, tket `DefaultMappingPass`):
 
@@ -314,21 +341,21 @@ A line of qubits (`--coupling line:n`, Qiskit `CouplingMap.from_line`, tket `Def
 | pyqir_simple | 3 | 2 / 12 / 7 | 7 / 37 / 24 | 9 / 39 / 25 | 7 / 25 / 15 | 7 / 26 / 16 |
 | qsharp_loop | 4 | 3 / 4 / 4 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 |
 | unrestricted_dynamic | 5 | 4 / 6 / 5 | 8 / 12 / 11 | 11 / 15 / 11 | 6 / 10 / 9 | 6 / 10 / 9 |
-| qft_4 | 4 | 14 / 36 / 24 | 19 / 49 / 33 | 24 / 45 / 35 | 19 / 42 / 29 | 19 / 42 / 29 |
-| qft_6 | 6 | 33 / 84 / 40 | 51 / 143 / 69 | 72 / 115 / 71 | 53 / 100 / 56 | 45 / 122 / 64 |
-| qft_8 | 8 | 60 / 152 / 56 | 90 / 312 / 113 | 137 / 210 / 103 | 101 / 180 / 81 | 83 / 221 / 83 |
-| qft_10 | 10 | 95 / 240 / 72 | 147 / 514 / 158 | 222 / 333 / 135 | 159 / 278 / 107 | 135 / 364 / 109 |
+| qft_4 | 4 | 14 / 36 / 24 | 19 / 49 / 33 | 24 / 45 / 35 | 19 / 41 / 29 | 19 / 41 / 29 |
+| qft_6 | 6 | 33 / 84 / 40 | 51 / 143 / 69 | 72 / 115 / 71 | 51 / 92 / 54 | 45 / 109 / 55 |
+| qft_8 | 8 | 60 / 152 / 56 | 90 / 312 / 113 | 137 / 210 / 103 | 97 / 161 / 81 | 83 / 193 / 82 |
+| qft_10 | 10 | 95 / 240 / 72 | 147 / 514 / 158 | 222 / 333 / 135 | 149 / 240 / 106 | 135 / 285 / 104 |
 | grover_3 | 3 | 4 / 39 / 21 | 37 / 128 / 91 | 35 / 155 / 98 | 47 / 110 / 88 | 35 / 194 / 110 |
 | grover_4 | 4 | 84 / 250 / 171 | 165 / 402 / 294 | 171 / 330 / 259 | 209 / 365 / 263 | 171 / 542 / 359 |
-| grover_5 | 5 | 288 / 941 / 681 | 543 / 1409 / 893 | 639 / 1200 / 840 | 698 / 1196 / 916 | 594 / 1528 / 1033 |
+| grover_5 | 5 | 288 / 941 / 681 | 543 / 1409 / 893 | 639 / 1200 / 840 | 681 / 1123 / 867 | 597 / 1407 / 974 |
 | adder_cdkm_4 | 9 | 24 / 24 / 21 | 93 / 251 / 184 | 86 / 169 / 134 | 88 / 159 / 134 | 76 / 176 / 134 |
 | adder_vbe_3 | 8 | 13 / 13 / 11 | 66 / 160 / 101 | 79 / 129 / 91 | 80 / 137 / 95 | 70 / 202 / 120 |
-| adder_draper_4 | 8 | 48 / 122 / 74 | 90 / 202 / 117 | 112 / 179 / 119 | 91 / 161 / 90 | 81 / 193 / 93 |
-| total |  |  | 1321 / 3638 / 2104 | 1602 / 2938 / 1937 | 1563 / 2782 / 1899 | 1327 / 3639 / 2175 |
+| adder_draper_4 | 8 | 48 / 122 / 74 | 90 / 202 / 117 | 112 / 179 / 119 | 86 / 137 / 76 | 81 / 168 / 85 |
+| total |  |  | 1321 / 3638 / 2104 | 1602 / 2938 / 1937 | 1525 / 2619 / 1833 | 1330 / 3372 / 2093 |
 
-All three tools remove SWAP gates by relabelling qubits, which qirc does with `--relabel`. On all to all connectivity qirc needs 11 more CNOTs than tket and 10 fewer than Qiskit in plain mode, with the fewest gates and the lowest depth of the three. Routed on a line, qirc with `--cost cx` is within half a percent of Qiskit on CNOTs and total gates and needs 17% fewer CNOTs than tket, and plain qirc has the fewest gates and the lowest depth.
+All three tools remove SWAP gates by relabelling qubits, which qirc does with `--relabel`. On all to all connectivity plain qirc needs 10 more CNOTs than tket and 11 fewer than Qiskit, and has the fewest gates and the lowest depth of the three by a clear margin, mostly from phase folding. Routed on a line, qirc with `--cost cx` is within 1% of Qiskit on CNOTs with fewer gates and lower depth, and needs 17% fewer CNOTs than tket, and plain qirc has the fewest gates and the lowest depth.
 
-Compile time over the whole set is about 0.2 s for Qiskit, 20 s for tket and 0.7 s for qirc, or 3.2 s routed with `--cost cx`, counting a process start per circuit. To run it, install `qiskit` and `pytket` and build qirc in release mode:
+Compile time over the whole set is about 0.2 s for Qiskit, 19 s for tket and 0.7 s for qirc, or 2.6 s routed with `--cost cx`, counting a process start per circuit. To run it, install `qiskit` and `pytket` and build qirc in release mode:
 
 ```
 python bench/compare.py --qirc target/release/qirc
@@ -356,6 +383,8 @@ Straight line programs are evolved once and sampled. Programs that branch on a m
 
 A program with more than 20 qubits whose gates are all Clifford (H, S, the Paulis, SX, CNOT, CZ, CY, swap, and rotations by multiples of a quarter turn) runs on a stabilizer tableau instead, up to 5,000 qubits, with branches, resets and measurements. The tableau is stored row by row as bit words, so combining two rows costs a few popcounts, and a straight line program is prepared once and each shot measures a copy. A 1,000 qubit GHZ state takes under a second for 1,000 shots. `qirc diff` uses the same tableau for such programs, following each measurement that is not already determined and comparing final states through the reduced row echelon form of their stabilizer groups, so it can check a compile of a large Clifford circuit exactly.
 
+`--observable` prints the exact expectation value of a sum of Pauli strings, written like `Z0 Z1 + 0.5 X2 - 2*Y3`. Measurements at the end of the program are left out, so the value is taken on the state just before them, and a program that branches on mid circuit measurements is averaged exactly over every branch, weighted by its probability. On the teleportation example the teleported qubit gives 0.707107 for both `Z2` and `X2`, as `ry(pi/4)` should.
+
 Other programs are limited to 30 qubits by the state vector. Larger programs can still be compiled and emitted.
 
 With `--calibration` and `--noisy`, every gate is followed by a random Pauli error with the probability the calibration gives for it, uniform over the nonidentity Paulis on its qubits, and every measurement result flips with the readout error of its qubit. Pauli errors are Clifford, so noisy Clifford programs still run on the tableau. For a 5 qubit GHZ state on `examples/line5.cal` the fraction of correct shots is 0.885 against a `--emit cost` estimate of 0.861, which counts every error as fatal.
@@ -379,6 +408,7 @@ The tests include:
 - Relabelled and routed random circuits compared state by state through the reported final layout, and noise aware routing checked to avoid a poor coupler.
 - The stabilizer tableau checked against the state vector on random Clifford circuits, measurement by measurement, and `qirc diff` on 24 qubit Clifford circuits both for compiled programs and for programs with a single extra gate.
 - Phase folding, qubit reuse and noisy simulation, each checked against an exact or statistical expectation.
+- OpenQASM input on hand checked programs, error cases and deeply nested or exponentially expanding input.
 
 ## Limitations
 

@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use compiler::cost::{self, Tally};
 use compiler::diag::{Severity, SourceFile};
 use compiler::driver::{self, Compilation, Options, Output};
+use compiler::observable::{self, Observable};
 use compiler::simulator::exec::{self, ExecConfig};
 use compiler::simulator::state;
 use pyo3::create_exception;
@@ -202,6 +203,24 @@ fn diff(
     Err(CompileError::new_err(output.stderr.trim_end().to_string()))
 }
 
+#[pyfunction]
+#[pyo3(signature = (source, observable, *, name = "program.ll", **options))]
+fn expectation(
+    py: Python<'_>,
+    source: &str,
+    observable: &str,
+    name: &str,
+    options: Option<&Bound<'_, PyDict>>,
+) -> PyResult<f64> {
+    let observable = Observable::parse(observable).map_err(PyValueError::new_err)?;
+    let options = parse(vec![name.into()], options)?;
+    let file = SourceFile::new(name, source);
+    let compilation = compiled(py, &file, &options)?;
+    let program = compilation.program;
+    py.detach(|| observable::expectation(&program, &observable))
+        .map_err(PyValueError::new_err)
+}
+
 #[pyfunction(name = "cost")]
 #[pyo3(signature = (source, *, name = "program.ll", **options))]
 fn cost_report<'py>(
@@ -237,5 +256,6 @@ fn qirc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(diff, m)?)?;
     m.add_function(wrap_pyfunction!(cost_report, m)?)?;
+    m.add_function(wrap_pyfunction!(expectation, m)?)?;
     Ok(())
 }

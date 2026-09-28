@@ -664,7 +664,7 @@ impl Term {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Block {
     pub id: BlockId,
     pub label: String,
@@ -679,7 +679,7 @@ impl Block {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Program {
     pub name: String,
     pub profile: Profile,

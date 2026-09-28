@@ -12,11 +12,14 @@ use crate::calibration::Calibration;
 use crate::codegen;
 use crate::cost;
 use crate::diag::{Diagnostic, Severity, SourceFile};
+use crate::draw;
 use crate::equiv;
 use crate::ir::Program;
 use crate::lower;
+use crate::observable::{self, Observable};
 use crate::opt::{self, OptStats};
 use crate::parse::parse_module;
+use crate::qasm;
 use crate::reuse::{self, Reused};
 use crate::route::{self, Coupling, Relabelled, RouteStats};
 use crate::sema;
@@ -36,6 +39,8 @@ pub enum Emit {
     Qir,
     Json,
     Circuit,
+    Quantikz,
+    Svg,
     Cost,
     Check,
 }
@@ -49,6 +54,8 @@ impl Emit {
             "qir" | "llvm" => Emit::Qir,
             "json" => Emit::Json,
             "circuit" => Emit::Circuit,
+            "quantikz" | "latex" => Emit::Quantikz,
+            "svg" => Emit::Svg,
             "cost" => Emit::Cost,
             "check" => Emit::Check,
             _ => return None,
@@ -171,6 +178,7 @@ pub struct Options {
     pub relabel: bool,
     pub reuse: bool,
     pub noisy: bool,
+    pub observable: Option<Observable>,
     pub coupling: Option<Coupling>,
     pub calibration: Option<Calibration>,
     pub color: Color,
@@ -210,6 +218,7 @@ impl Default for Options {
             relabel: false,
             reuse: false,
             noisy: false,
+            observable: None,
             coupling: None,
             calibration: None,
             color: Color::Auto,
@@ -229,7 +238,7 @@ usage:
                     behaves exactly like a.ll at -O0
 
 options:
-  --emit <kind>     run | ir | qasm3 | qir | json | circuit | cost | check
+  --emit <kind>     run | ir | qasm3 | qir | json | circuit | quantikz | svg | cost | check
                     (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
   --shots <n>       sample n measurement outcomes
@@ -246,6 +255,7 @@ options:
   --relabel         remove swaps at the end of the program by permuting qubits
   --reuse           reset measured qubits and reuse them to need fewer qubits
   --noisy           simulate with the error rates from --calibration
+  --observable <p>  print the exact expectation of a Pauli sum such as 'Z0 Z1 + 0.5 X2'
   --calibration <f> device error rates: lines of cx a b e, single q e, readout q e
   --coupling <map>  route onto hardware: line:N | ring:N | grid:RxC | full:N
                     or an explicit edge list such as 0-1,1-2,2-3
@@ -322,6 +332,14 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
             "--reuse" => options.reuse = true,
 
             "--noisy" => options.noisy = true,
+
+            "--observable" => {
+                let value = value(
+                    &mut args,
+                    "--observable needs a Pauli sum such as \"Z0 Z1 + 0.5 X2\"",
+                )?;
+                options.observable = Some(Observable::parse(value)?);
+            }
 
             "--calibration" => {
                 let path = value(&mut args, "--calibration needs a file")?;
@@ -432,13 +450,17 @@ pub fn compile(source: &str, opt_level: u8) -> Compilation {
 pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Target) -> Compilation {
     let mut diagnostics = Vec::new();
 
-    let ((module, parse_errors), parse_time) = timed(|| parse_module(source));
-    diagnostics.extend(parse_errors);
-
-    let (lowered, lower_time) = timed(|| lower::lower(&module));
-    diagnostics.extend(lowered.diagnostics);
-
-    let mut program = lowered.program;
+    let (mut program, parse_time, lower_time) = if qasm::is_qasm(source) {
+        let ((program, errors), time) = timed(|| qasm::lower(source));
+        diagnostics.extend(errors);
+        (program, time, Duration::ZERO)
+    } else {
+        let ((module, parse_errors), parse_time) = timed(|| parse_module(source));
+        diagnostics.extend(parse_errors);
+        let (lowered, lower_time) = timed(|| lower::lower(&module));
+        diagnostics.extend(lowered.diagnostics);
+        (lowered.program, parse_time, lower_time)
+    };
     diagnostics.extend(sema::validate(&program));
 
     let mut lowering_violations = Vec::new();
@@ -760,6 +782,8 @@ pub fn run_source(
         },
         Emit::Json => codegen::emit_json(program),
         Emit::Circuit => codegen::emit_circuit(program),
+        Emit::Quantikz => draw::quantikz(program),
+        Emit::Svg => draw::svg(program),
         Emit::Cost => cost::analyse(program, options.calibration.as_ref()).to_string(),
         Emit::Run => return execute(options, &compilation, output),
     };
@@ -885,6 +909,19 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
         },
         &outcome.counts,
     );
+
+    if let Some(observable) = &options.observable {
+        output.println("");
+        match observable::expectation(program, observable) {
+            Ok(value) => output.println(format_args!(
+                "expectation of {observable}: {:.6}",
+                value + 0.0
+            )),
+            Err(reason) => output.eprintln(format_args!(
+                "error: cannot compute the expectation: {reason}"
+            )),
+        }
+    }
 
     if !elapsed.is_zero() {
         output.println("");

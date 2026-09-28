@@ -60,6 +60,13 @@ def test_noisy():
     assert set(noisy) > {"00", "11"}
 
 
+def test_expectation():
+    assert abs(qirc.expectation(BELL, "Z0 Z1") - 1) < 1e-9
+    assert abs(qirc.expectation(TELEPORT, "X2", opt=2) - 0.7071067811865476) < 1e-9
+    with pytest.raises(ValueError, match="Pauli"):
+        qirc.expectation(BELL, "Q0")
+
+
 def test_errors():
     with pytest.raises(qirc.CompileError, match="QIR0100"):
         qirc.compile("define garbage {")
