@@ -940,6 +940,11 @@ fn render_term(program: &Program, term: &Term) -> String {
     }
 }
 
+pub(crate) fn keep_marked(ops: &mut Vec<Op>, keep: &[bool]) {
+    let mut keep = keep.iter();
+    ops.retain(|_| keep.next().copied().unwrap_or(true));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

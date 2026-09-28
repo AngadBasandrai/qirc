@@ -3,7 +3,7 @@ use std::fmt::Write;
 
 use crate::ir::*;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 enum Cell {
     Wire,
     Gate(String),
@@ -48,43 +48,16 @@ fn angle(value: f64, latex: bool) -> String {
 }
 
 fn label(gate: &Gate, latex: bool) -> String {
+    let pick = |plain: String, tex: String| if latex { tex } else { plain };
     let name = match gate.kind {
         GateKind::Unitary(_) => "U".to_string(),
-        GateKind::SDag => {
-            if latex {
-                "S^\\dagger".into()
-            } else {
-                "S†".into()
-            }
-        }
-        GateKind::TDag => {
-            if latex {
-                "T^\\dagger".into()
-            } else {
-                "T†".into()
-            }
-        }
-        GateKind::SXDag => {
-            if latex {
-                "\\sqrt{X}^\\dagger".into()
-            } else {
-                "SX†".into()
-            }
-        }
-        GateKind::SX => {
-            if latex {
-                "\\sqrt{X}".into()
-            } else {
-                "SX".into()
-            }
-        }
+        GateKind::SDag => pick("S†".into(), "S^\\dagger".into()),
+        GateKind::TDag => pick("T†".into(), "T^\\dagger".into()),
+        GateKind::SXDag => pick("SX†".into(), "\\sqrt{X}^\\dagger".into()),
+        GateKind::SX => pick("SX".into(), "\\sqrt{X}".into()),
         GateKind::Rx | GateKind::Ry | GateKind::Rz => {
             let axis = &gate.kind.name()[1..];
-            if latex {
-                format!("R_{axis}")
-            } else {
-                format!("R{axis}")
-            }
+            pick(format!("R{axis}"), format!("R_{axis}"))
         }
         GateKind::R1 => "P".into(),
         kind => kind.name().to_uppercase(),

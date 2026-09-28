@@ -1299,24 +1299,24 @@ attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_
     assert_eq!(outcome.counts.keys().collect::<Vec<_>>(), [secret]);
 }
 
-#[test]
-fn noisy_ghz() {
+fn ghz(qubits: usize, measured: bool) -> String {
     let qubit = |i: usize| format!("%Qubit* inttoptr (i64 {i} to %Qubit*)");
     let mut body = format!("  call void @__quantum__qis__h__body({})\n", qubit(0));
-    for i in 1..5 {
+    for i in 1..qubits {
         body += &format!(
             "  call void @__quantum__qis__cnot__body({}, {})\n",
             qubit(i - 1),
             qubit(i)
         );
     }
-    for i in 0..5 {
+    let results = if measured { qubits } else { 0 };
+    for i in 0..results {
         body += &format!(
             "  call void @__quantum__qis__mz__body({}, %Result* inttoptr (i64 {i} to %Result*))\n",
             qubit(i)
         );
     }
-    let source = format!(
+    format!(
         "%Qubit = type opaque
 %Result = type opaque
 
@@ -1329,9 +1329,14 @@ declare void @__quantum__qis__h__body(%Qubit*)
 declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
 declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
 
-attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"5\" \"required_num_results\"=\"5\" }}
+attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"{qubits}\" \"required_num_results\"=\"{results}\" }}
 "
-    );
+    )
+}
+
+#[test]
+fn noisy_ghz() {
+    let source = ghz(5, true);
     let calibration = Calibration::parse(include_str!("../examples/line5.cal")).unwrap();
     let program = compile(&source, 1);
     let estimate = cost::analyse(&program, Some(&calibration))
@@ -1449,37 +1454,7 @@ attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"requi
 
 #[test]
 fn readout_mitigation() {
-    let qubit = |i: usize| format!("%Qubit* inttoptr (i64 {i} to %Qubit*)");
-    let mut body = format!("  call void @__quantum__qis__h__body({})\n", qubit(0));
-    for i in 1..4 {
-        body += &format!(
-            "  call void @__quantum__qis__cnot__body({}, {})\n",
-            qubit(i - 1),
-            qubit(i)
-        );
-    }
-    for i in 0..4 {
-        body += &format!(
-            "  call void @__quantum__qis__mz__body({}, %Result* inttoptr (i64 {i} to %Result*))\n",
-            qubit(i)
-        );
-    }
-    let source = format!(
-        "%Qubit = type opaque
-%Result = type opaque
-
-define void @main() #0 {{
-entry:
-{body}  ret void
-}}
-
-declare void @__quantum__qis__h__body(%Qubit*)
-declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
-declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
-
-attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"4\" \"required_num_results\"=\"4\" }}
-"
-    );
+    let source = ghz(4, true);
     let calibration = Calibration::parse(
         "cx 0 1 0\ncx 1 2 0\ncx 2 3 0\nreadout 0 0.08\nreadout 1 0.12\nreadout 2 0.05\nreadout 3 0.15",
     )
@@ -1506,29 +1481,7 @@ attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_
 
 #[test]
 fn zero_noise() {
-    let qubit = |i: usize| format!("%Qubit* inttoptr (i64 {i} to %Qubit*)");
-    let mut body = format!("  call void @__quantum__qis__h__body({})\n", qubit(0));
-    for i in 1..5 {
-        body += &format!(
-            "  call void @__quantum__qis__cnot__body({}, {})\n",
-            qubit(i - 1),
-            qubit(i)
-        );
-    }
-    let source = format!(
-        "%Qubit = type opaque
-
-define void @main() #0 {{
-entry:
-{body}  ret void
-}}
-
-declare void @__quantum__qis__h__body(%Qubit*)
-declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
-
-attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_num_qubits\"=\"5\" }}
-"
-    );
+    let source = ghz(5, false);
     let calibration = Calibration::parse(include_str!("../examples/line5.cal")).unwrap();
     let program = compile(&source, 1);
     let parity = Observable::parse("Z0 Z4").unwrap();
@@ -1610,6 +1563,92 @@ fn clifford_cones() {
     assert_eq!(value("Z0 Z999 + 0.5 Z3"), Ok(1.0));
     assert_eq!(value(&format!("X0 X1 {xs}")), Ok(1.0));
     assert_eq!(value(&format!("Y0 Y1 {xs}")), Ok(-1.0));
-    let magic = ghz("ry(0.3) q[0];\n");
-    assert!(observable::expectation(&magic, &Observable::parse("Z0 Z999").unwrap()).is_err());
+    let tilted = ghz("ry(0.3) q[0];\n");
+    let parity = Observable::parse(&format!("X0 X1 {xs}")).unwrap();
+    let value = observable::expectation(&tilted, &parity).unwrap();
+    assert!((value - 0.3f64.cos()).abs() < 1e-9);
+}
+
+#[test]
+fn classical_kernel() {
+    let (a, b): (u128, u128) = (0xDEAD_BEEF_0123_4567, 0xFEDC_BA98_7654_3210);
+    let n = 64;
+    let (x, y, out) = (|i: usize| 1 + 2 * i, |i: usize| 2 + 2 * i, 2 * n + 1);
+    let mut gates: Vec<(&str, Vec<usize>)> = Vec::new();
+    for i in 0..n {
+        if a >> i & 1 == 1 {
+            gates.push(("x", vec![x(i)]));
+        }
+        if b >> i & 1 == 1 {
+            gates.extend([("x", vec![y(i)]), ("t", vec![y(i)])]);
+        }
+    }
+    let majority = |c, t, s| {
+        [
+            ("cx", vec![s, t]),
+            ("cx", vec![s, c]),
+            ("ccx", vec![c, t, s]),
+        ]
+    };
+    let unmajority = |c, t, s| {
+        [
+            ("ccx", vec![c, t, s]),
+            ("cx", vec![s, c]),
+            ("cx", vec![c, t]),
+        ]
+    };
+    gates.extend(majority(0, y(0), x(0)));
+    for i in 1..n {
+        gates.extend(majority(x(i - 1), y(i), x(i)));
+    }
+    gates.extend([("cx", vec![x(n - 1), out]), ("cz", vec![out, y(3)])]);
+    for i in (1..n).rev() {
+        gates.extend(unmajority(x(i - 1), y(i), x(i)));
+    }
+    gates.extend(unmajority(0, y(0), x(0)));
+    let body: String = gates
+        .iter()
+        .map(|(gate, wires)| {
+            let wires: Vec<String> = wires.iter().map(|q| format!("q[{q}]")).collect();
+            format!(
+                "{gate} {};
+",
+                wires.join(", ")
+            )
+        })
+        .collect();
+    let circuit = format!(
+        "OPENQASM 2.0;
+include \"qelib1.inc\";
+qreg q[{}];
+creg s[{}];
+{body}",
+        2 * n + 2,
+        n + 1
+    );
+    let measures: String = (0..n)
+        .map(|i| (y(i), i))
+        .chain([(out, n)])
+        .map(|(q, i)| {
+            format!(
+                "measure q[{q}] -> s[{i}];
+"
+            )
+        })
+        .collect();
+    let program = compile(&format!("{circuit}{measures}"), 1);
+    assert_eq!(exec::kernel(&program), "classical bits");
+    let outcome = run(&program, 50, 1);
+    let (key, &count) = outcome.counts.iter().next().unwrap();
+    let sum = key
+        .chars()
+        .rev()
+        .fold(0u128, |total, bit| 2 * total + u128::from(bit == '1'));
+    assert_eq!((sum, count), (a + b, 50));
+    let unmeasured = compile(&circuit, 1);
+    let value =
+        |text: &str| observable::expectation(&unmeasured, &Observable::parse(text).unwrap());
+    let sign = |i: usize| if (a + b) >> i & 1 == 1 { -1.0 } else { 1.0 };
+    assert_eq!(value(&format!("Z{} Z{out}", y(5))), Ok(sign(5) * sign(64)));
+    assert_eq!(value(&format!("X{}", y(5))), Ok(0.0));
 }

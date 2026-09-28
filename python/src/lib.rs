@@ -62,16 +62,19 @@ fn flags(options: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<String>> {
     Ok(args)
 }
 
-fn file_name(options: Option<&Bound<'_, PyDict>>) -> PyResult<String> {
-    match options.map(|o| o.get_item("name")).transpose()?.flatten() {
-        Some(value) => value.extract(),
-        None => Ok("program.ll".into()),
-    }
-}
-
-fn parse(mut args: Vec<String>, options: Option<&Bound<'_, PyDict>>) -> PyResult<Options> {
+fn prepare(
+    source: &str,
+    mut args: Vec<String>,
+    options: Option<&Bound<'_, PyDict>>,
+) -> PyResult<(Options, SourceFile)> {
+    let name: String = match options.map(|o| o.get_item("name")).transpose()?.flatten() {
+        Some(value) => value.extract()?,
+        None => "program.ll".into(),
+    };
+    args.push(name.clone());
     args.extend(flags(options)?);
-    driver::parse_args(&args).map_err(PyValueError::new_err)
+    let options = driver::parse_args(&args).map_err(PyValueError::new_err)?;
+    Ok((options, SourceFile::new(name, source)))
 }
 
 fn warn(py: Python<'_>, text: &str) -> PyResult<()> {
@@ -127,9 +130,7 @@ fn compile(
     emit: &str,
     options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<String> {
-    let name = file_name(options)?;
-    let options = parse(vec![name.clone(), "--emit".into(), emit.into()], options)?;
-    let file = SourceFile::new(name, source);
+    let (options, file) = prepare(source, vec!["--emit".into(), emit.into()], options)?;
     let (code, output) = py.detach(|| {
         let mut output = Output::default();
         let code = driver::run_source(&options, &file, None, &mut output);
@@ -154,12 +155,10 @@ fn run(
     if shots == 0 {
         return Err(PyValueError::new_err("shots must be at least 1"));
     }
-    let name = file_name(options)?;
-    let options = parse(vec![name.clone()], options)?;
-    let file = SourceFile::new(name, source);
+    let (options, file) = prepare(source, Vec::new(), options)?;
     let compilation = compiled(py, &file, &options)?;
     let program = compilation.program;
-    if program.num_qubits as usize > state::MAX_QUBITS && !exec::stabilizer(&program) {
+    if program.num_qubits as usize > state::MAX_QUBITS && !exec::scalable(&program) {
         return Err(PyValueError::new_err(format!(
             "this program needs {} qubits, the simulator supports at most {}",
             program.num_qubits,
@@ -197,9 +196,7 @@ fn diff(
     other: Option<&str>,
     options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<String> {
-    let name = file_name(options)?;
-    let options = parse(vec!["diff".into(), name.clone()], options)?;
-    let file = SourceFile::new(name, source);
+    let (options, file) = prepare(source, vec!["diff".into()], options)?;
     let other = other.map(|text| SourceFile::new("other.ll", text));
     let output = py.detach(|| {
         let mut output = Output::default();
@@ -225,9 +222,7 @@ fn expectation(
     options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<f64> {
     let observable = Observable::parse(observable).map_err(PyValueError::new_err)?;
-    let name = file_name(options)?;
-    let options = parse(vec![name.clone()], options)?;
-    let file = SourceFile::new(name, source);
+    let (options, file) = prepare(source, Vec::new(), options)?;
     let compilation = compiled(py, &file, &options)?;
     let program = compilation.program;
     py.detach(|| match (&options.calibration, zne, options.noisy) {
@@ -249,9 +244,7 @@ fn cost_report<'py>(
     source: &str,
     options: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let name = file_name(options)?;
-    let options = parse(vec![name.clone()], options)?;
-    let file = SourceFile::new(name, source);
+    let (options, file) = prepare(source, Vec::new(), options)?;
     let compilation = compiled(py, &file, &options)?;
     let report = cost::analyse(&compilation.program, options.calibration.as_ref());
 

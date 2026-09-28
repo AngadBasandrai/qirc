@@ -385,7 +385,10 @@ footer a { color: var(--accent); }
         <button type="button" role="radio" data-emit="qir">qir</button>
         <button type="button" role="radio" data-emit="ir">ir</button>
         <button type="button" role="radio" data-emit="json">json</button>
+        <button type="button" role="radio" data-emit="qasm2">qasm2</button>
+        <button type="button" role="radio" data-emit="stim">stim</button>
         <button type="button" role="radio" data-emit="quantikz">latex</button>
+        <button type="button" role="radio" data-emit="svg">svg</button>
         <button type="button" role="radio" data-emit="cost">cost</button>
         <button type="button" role="radio" data-emit="diff">diff</button>
       </div>
@@ -438,6 +441,24 @@ footer a { color: var(--accent); }
         <option value="">off</option>
         <option value="on">on</option>
       </select>
+    </label>
+    <label class="field" for="reuse">Reuse
+      <select id="reuse">
+        <option value="">off</option>
+        <option value="on">on</option>
+      </select>
+    </label>
+    <label class="field" for="device">Device
+      <select id="device">
+        <option value="">ideal</option>
+        <option value="cal">line5.cal</option>
+        <option value="noisy">line5.cal, noisy</option>
+        <option value="mitigate">noisy, mitigated</option>
+        <option value="zne">noisy, zero noise</option>
+      </select>
+    </label>
+    <label class="field" for="observable" id="observable-field">Observable
+      <input id="observable" type="text" spellcheck="false" autocomplete="off" placeholder="Z0 Z1 + 0.5 X2">
     </label>
     <label class="field" for="shots" id="shots-field">Shots
       <input id="shots" type="number" min="0" max="100000" step="100" value="500">
@@ -499,7 +520,7 @@ footer a { color: var(--accent); }
     </section>
   </div>
 
-  <footer>Reads Base Profile, Adaptive Profile, Q# and PyQIR output and OpenQASM 2 and 3. <code>diff</code> checks the compiled program against the original at <code>-O0</code>, branch by branch. Simulation is limited to 20 qubits here. Drop a <code>.ll</code> or <code>.qasm</code> file on the editor to open it. <a href="https://github.com/AngadBasandrai/qirc">Source on GitHub</a>.</footer>
+  <footer>Reads Base Profile, Adaptive Profile, Q# and PyQIR output and OpenQASM 2 and 3. <code>diff</code> checks the compiled program against the original at <code>-O0</code>, branch by branch. The state vector is limited to 20 qubits here, but Clifford programs run on a stabilizer tableau up to 5,000 qubits, programs of permutation and phase gates such as adders run on a bit vector at any width, and expectation values follow each Pauli term's light cone. <code>line5.cal</code> is a five qubit device with gate, readout and T1 and T2 errors. Drop a <code>.ll</code> or <code>.qasm</code> file on the editor to open it. <a href="https://github.com/AngadBasandrai/qirc">Source on GitHub</a>.</footer>
 </div>
 
 <script type="text/plain" id="bell" data-example="Bell pair, Base Profile" data-file="bell.ll">
@@ -823,6 +844,371 @@ attributes #1 = { "irreversible" }
 !3 = !{i32 1, !"dynamic_result_management", i1 false}
 !4 = !{i32 5, !"int_computations", !{!"i64"}}
 </script>
+<script type="text/plain" id="ghz1000" data-example="GHZ on 1000 qubits, stabilizer tableau" data-file="ghz1000.ll" data-settings='{"emit": "run", "observable": "X0 X1 Y2 + Z0 Z999", "device": "", "coupling": "", "gates": ""}'>
+; A 1000 qubit GHZ state built by a loop that qirc unrolls at compile time.
+; Every gate is Clifford, so it runs on the stabilizer tableau.
+; Try the observable X0*X1*Y2 or Z0*Z999, or switch to stim.
+
+%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* null)
+  br label %chain
+
+chain:
+  %i = phi i64 [ 0, %entry ], [ %next, %chain ]
+  %next = add i64 %i, 1
+  %control = inttoptr i64 %i to %Qubit*
+  %target = inttoptr i64 %next to %Qubit*
+  call void @__quantum__qis__cnot__body(%Qubit* %control, %Qubit* %target)
+  %done = icmp eq i64 %next, 999
+  br i1 %done, label %measure, label %chain
+
+measure:
+  call void @__quantum__qis__mz__body(%Qubit* null, %Result* null)
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 999 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  ret void
+}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+
+attributes #0 = { "entry_point" "qir_profiles"="adaptive_profile" "required_num_qubits"="1000" "required_num_results"="2" }
+</script>
+
+<script type="text/plain" id="adder" data-example="32 bit adder on a bit vector" data-file="adder.qasm" data-settings='{"emit": "run", "observable": "", "device": "", "coupling": "", "gates": ""}'>
+// A 32 bit ripple carry adder on 66 qubits, 3141592653 + 2718281828.
+// Every gate only permutes basis states, so qirc runs it on a bit vector
+// whatever its width. The result register reads the sum, lowest bit first.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[66];
+creg sum[33];
+x q[1];
+x q[5];
+x q[7];
+x q[13];
+x q[19];
+x q[21];
+x q[27];
+x q[29];
+x q[31];
+x q[45];
+x q[49];
+x q[51];
+x q[55];
+x q[57];
+x q[59];
+x q[63];
+x q[6];
+x q[12];
+x q[14];
+x q[26];
+x q[28];
+x q[32];
+x q[34];
+x q[38];
+x q[52];
+x q[60];
+x q[64];
+cx q[1], q[2];
+cx q[1], q[0];
+ccx q[0], q[2], q[1];
+cx q[3], q[4];
+cx q[3], q[1];
+ccx q[1], q[4], q[3];
+cx q[5], q[6];
+cx q[5], q[3];
+ccx q[3], q[6], q[5];
+cx q[7], q[8];
+cx q[7], q[5];
+ccx q[5], q[8], q[7];
+cx q[9], q[10];
+cx q[9], q[7];
+ccx q[7], q[10], q[9];
+cx q[11], q[12];
+cx q[11], q[9];
+ccx q[9], q[12], q[11];
+cx q[13], q[14];
+cx q[13], q[11];
+ccx q[11], q[14], q[13];
+cx q[15], q[16];
+cx q[15], q[13];
+ccx q[13], q[16], q[15];
+cx q[17], q[18];
+cx q[17], q[15];
+ccx q[15], q[18], q[17];
+cx q[19], q[20];
+cx q[19], q[17];
+ccx q[17], q[20], q[19];
+cx q[21], q[22];
+cx q[21], q[19];
+ccx q[19], q[22], q[21];
+cx q[23], q[24];
+cx q[23], q[21];
+ccx q[21], q[24], q[23];
+cx q[25], q[26];
+cx q[25], q[23];
+ccx q[23], q[26], q[25];
+cx q[27], q[28];
+cx q[27], q[25];
+ccx q[25], q[28], q[27];
+cx q[29], q[30];
+cx q[29], q[27];
+ccx q[27], q[30], q[29];
+cx q[31], q[32];
+cx q[31], q[29];
+ccx q[29], q[32], q[31];
+cx q[33], q[34];
+cx q[33], q[31];
+ccx q[31], q[34], q[33];
+cx q[35], q[36];
+cx q[35], q[33];
+ccx q[33], q[36], q[35];
+cx q[37], q[38];
+cx q[37], q[35];
+ccx q[35], q[38], q[37];
+cx q[39], q[40];
+cx q[39], q[37];
+ccx q[37], q[40], q[39];
+cx q[41], q[42];
+cx q[41], q[39];
+ccx q[39], q[42], q[41];
+cx q[43], q[44];
+cx q[43], q[41];
+ccx q[41], q[44], q[43];
+cx q[45], q[46];
+cx q[45], q[43];
+ccx q[43], q[46], q[45];
+cx q[47], q[48];
+cx q[47], q[45];
+ccx q[45], q[48], q[47];
+cx q[49], q[50];
+cx q[49], q[47];
+ccx q[47], q[50], q[49];
+cx q[51], q[52];
+cx q[51], q[49];
+ccx q[49], q[52], q[51];
+cx q[53], q[54];
+cx q[53], q[51];
+ccx q[51], q[54], q[53];
+cx q[55], q[56];
+cx q[55], q[53];
+ccx q[53], q[56], q[55];
+cx q[57], q[58];
+cx q[57], q[55];
+ccx q[55], q[58], q[57];
+cx q[59], q[60];
+cx q[59], q[57];
+ccx q[57], q[60], q[59];
+cx q[61], q[62];
+cx q[61], q[59];
+ccx q[59], q[62], q[61];
+cx q[63], q[64];
+cx q[63], q[61];
+ccx q[61], q[64], q[63];
+cx q[63], q[65];
+ccx q[61], q[64], q[63];
+cx q[63], q[61];
+cx q[61], q[64];
+ccx q[59], q[62], q[61];
+cx q[61], q[59];
+cx q[59], q[62];
+ccx q[57], q[60], q[59];
+cx q[59], q[57];
+cx q[57], q[60];
+ccx q[55], q[58], q[57];
+cx q[57], q[55];
+cx q[55], q[58];
+ccx q[53], q[56], q[55];
+cx q[55], q[53];
+cx q[53], q[56];
+ccx q[51], q[54], q[53];
+cx q[53], q[51];
+cx q[51], q[54];
+ccx q[49], q[52], q[51];
+cx q[51], q[49];
+cx q[49], q[52];
+ccx q[47], q[50], q[49];
+cx q[49], q[47];
+cx q[47], q[50];
+ccx q[45], q[48], q[47];
+cx q[47], q[45];
+cx q[45], q[48];
+ccx q[43], q[46], q[45];
+cx q[45], q[43];
+cx q[43], q[46];
+ccx q[41], q[44], q[43];
+cx q[43], q[41];
+cx q[41], q[44];
+ccx q[39], q[42], q[41];
+cx q[41], q[39];
+cx q[39], q[42];
+ccx q[37], q[40], q[39];
+cx q[39], q[37];
+cx q[37], q[40];
+ccx q[35], q[38], q[37];
+cx q[37], q[35];
+cx q[35], q[38];
+ccx q[33], q[36], q[35];
+cx q[35], q[33];
+cx q[33], q[36];
+ccx q[31], q[34], q[33];
+cx q[33], q[31];
+cx q[31], q[34];
+ccx q[29], q[32], q[31];
+cx q[31], q[29];
+cx q[29], q[32];
+ccx q[27], q[30], q[29];
+cx q[29], q[27];
+cx q[27], q[30];
+ccx q[25], q[28], q[27];
+cx q[27], q[25];
+cx q[25], q[28];
+ccx q[23], q[26], q[25];
+cx q[25], q[23];
+cx q[23], q[26];
+ccx q[21], q[24], q[23];
+cx q[23], q[21];
+cx q[21], q[24];
+ccx q[19], q[22], q[21];
+cx q[21], q[19];
+cx q[19], q[22];
+ccx q[17], q[20], q[19];
+cx q[19], q[17];
+cx q[17], q[20];
+ccx q[15], q[18], q[17];
+cx q[17], q[15];
+cx q[15], q[18];
+ccx q[13], q[16], q[15];
+cx q[15], q[13];
+cx q[13], q[16];
+ccx q[11], q[14], q[13];
+cx q[13], q[11];
+cx q[11], q[14];
+ccx q[9], q[12], q[11];
+cx q[11], q[9];
+cx q[9], q[12];
+ccx q[7], q[10], q[9];
+cx q[9], q[7];
+cx q[7], q[10];
+ccx q[5], q[8], q[7];
+cx q[7], q[5];
+cx q[5], q[8];
+ccx q[3], q[6], q[5];
+cx q[5], q[3];
+cx q[3], q[6];
+ccx q[1], q[4], q[3];
+cx q[3], q[1];
+cx q[1], q[4];
+ccx q[0], q[2], q[1];
+cx q[1], q[0];
+cx q[0], q[2];
+measure q[2] -> sum[0];
+measure q[4] -> sum[1];
+measure q[6] -> sum[2];
+measure q[8] -> sum[3];
+measure q[10] -> sum[4];
+measure q[12] -> sum[5];
+measure q[14] -> sum[6];
+measure q[16] -> sum[7];
+measure q[18] -> sum[8];
+measure q[20] -> sum[9];
+measure q[22] -> sum[10];
+measure q[24] -> sum[11];
+measure q[26] -> sum[12];
+measure q[28] -> sum[13];
+measure q[30] -> sum[14];
+measure q[32] -> sum[15];
+measure q[34] -> sum[16];
+measure q[36] -> sum[17];
+measure q[38] -> sum[18];
+measure q[40] -> sum[19];
+measure q[42] -> sum[20];
+measure q[44] -> sum[21];
+measure q[46] -> sum[22];
+measure q[48] -> sum[23];
+measure q[50] -> sum[24];
+measure q[52] -> sum[25];
+measure q[54] -> sum[26];
+measure q[56] -> sum[27];
+measure q[58] -> sum[28];
+measure q[60] -> sum[29];
+measure q[62] -> sum[30];
+measure q[64] -> sum[31];
+measure q[65] -> sum[32];
+</script>
+
+<script type="text/plain" id="ladder" data-example="Toffoli ladder, relative phase Toffolis" data-file="ladder.qasm" data-settings='{"emit": "cost", "gates": "h,s,t,cx", "coupling": "", "device": ""}'>
+// A six control X gate built from a ladder of Toffolis on four ancillas.
+// Lowered to h s t cx, each Toffoli that the ladder later undoes becomes
+// a relative phase Toffoli, and the cost view counts 39 T gates and 30 CNOTs
+// where a plain decomposition needs 63 and 54.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg c[6];
+qreg a[4];
+qreg t[1];
+h c[0];
+h c[1];
+h c[2];
+h c[3];
+h c[4];
+h c[5];
+ccx c[0], c[1], a[0];
+ccx c[2], a[0], a[1];
+ccx c[3], a[1], a[2];
+ccx c[4], a[2], a[3];
+ccx c[5], a[3], t[0];
+ccx c[4], a[2], a[3];
+ccx c[3], a[1], a[2];
+ccx c[2], a[0], a[1];
+ccx c[0], c[1], a[0];
+</script>
+
+<script type="text/plain" id="stim" data-example="Clifford teleportation to Stim" data-file="teleport_clifford.qasm" data-settings='{"emit": "stim", "gates": "", "coupling": "", "device": ""}'>
+// Teleportation with only Clifford gates, which qirc can write as a Stim
+// circuit: the corrections become feedback on measurement records. Stim
+// cannot make noise depend on a measurement, so for a noisy Stim circuit
+// pick the GHZ example with zero noise, the noisy device and emit stim.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[3];
+creg m0[1];
+creg m1[1];
+creg out[1];
+h q[0];
+s q[0];
+h q[1];
+cx q[1], q[2];
+cx q[0], q[1];
+h q[0];
+measure q[0] -> m0[0];
+measure q[1] -> m1[0];
+if(m1==1) x q[2];
+if(m0==1) z q[2];
+sdg q[2];
+h q[2];
+measure q[2] -> out[0];
+</script>
+
+<script type="text/plain" id="zne" data-example="Noisy GHZ with zero noise extrapolation" data-file="ghz5.qasm" data-settings='{"emit": "run", "observable": "Z0 Z4", "device": "zne", "gates": "", "coupling": ""}'>
+// A five qubit GHZ state on the line5.cal device. The observable Z0 Z4 is 1
+// on an ideal device. With noise it drops, and zero noise extrapolation runs
+// the circuit at one, two and three times the noise and extends to zero.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[5];
+h q[0];
+cx q[0], q[1];
+cx q[1], q[2];
+cx q[2], q[3];
+cx q[3], q[4];
+</script>
+
 <script type="text/plain" id="pyqir" data-example="Circuit from PyQIR" data-file="pyqir.ll">
 ; ModuleID = 'bell'
 source_filename = "bell"
@@ -907,9 +1293,9 @@ onmessage = async (event) => {
 };
 `;
 
-const EMITS = ["run", "circuit", "qasm3", "qir", "ir", "json", "quantikz", "cost", "diff"];
-const CONTROLS = ["opt", "gates", "resynth", "cost", "coupling", "relabel", "shots", "seed"];
-const EXTENSIONS = { qasm3: "qasm", qir: "ll", json: "json", ir: "txt", circuit: "txt", quantikz: "tex", cost: "txt", run: "txt", diff: "txt" };
+const EMITS = ["run", "circuit", "qasm3", "qir", "ir", "json", "qasm2", "stim", "quantikz", "svg", "cost", "diff"];
+const CONTROLS = ["opt", "gates", "resynth", "cost", "coupling", "relabel", "reuse", "device", "observable", "shots", "seed"];
+const EXTENSIONS = { qasm3: "qasm", qasm2: "qasm", stim: "stim", qir: "ll", json: "json", ir: "txt", circuit: "txt", quantikz: "tex", svg: "svg", cost: "txt", run: "txt", diff: "txt" };
 const MAX_HIGHLIGHT = 400000;
 const MAX_DRAWN = 4000;
 
@@ -934,6 +1320,7 @@ const examples = [...document.querySelectorAll("script[data-example]")].map((nod
   id: node.id,
   name: node.dataset.example,
   file: node.dataset.file,
+  settings: JSON.parse(node.dataset.settings || "{}"),
   text: node.textContent.replace(/^\n/, ""),
 }));
 
@@ -1088,6 +1475,16 @@ function commandFromControls() {
   if ($("cost").value !== "gates") parts.push("--cost", $("cost").value);
   if ($("coupling").value) parts.push("--coupling", $("coupling").value);
   if ($("relabel").value) parts.push("--relabel");
+  if ($("reuse").value) parts.push("--reuse");
+  const device = $("device").value;
+  if (device) parts.push("--calibration", "line5.cal");
+  if (device && device !== "cal") parts.push("--noisy");
+  if (device === "mitigate") parts.push("--mitigate");
+  const observable = $("observable").value.trim();
+  if (emit === "run" && observable) {
+    parts.push("--observable", observable.replace(/\s+/g, "*"));
+    if (device === "zne") parts.push("--zne");
+  }
   if (emit === "run") parts.push("--shots", $("shots").value || "0", "--seed", $("seed").value || "0");
   return parts.join(" ");
 }
@@ -1098,6 +1495,7 @@ function showEmit() {
   }
   $("shots-field").hidden = emit !== "run";
   $("seed-field").hidden = emit !== "run";
+  $("observable-field").hidden = emit !== "run";
 }
 
 function showView() {
@@ -1563,7 +1961,16 @@ async function start() {
 }
 
 exampleSelect.addEventListener("change", () => {
-  load(examples.find((e) => e.id === exampleSelect.value));
+  const example = examples.find((e) => e.id === exampleSelect.value);
+  load(example);
+  for (const [id, value] of Object.entries({ device: "", observable: "", ...example.settings })) {
+    if (id === "emit") {
+      emit = value;
+      showEmit();
+    } else {
+      $(id).value = value;
+    }
+  }
   sync();
 });
 $("emit").addEventListener("click", (event) => {

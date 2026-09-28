@@ -3,8 +3,11 @@ use std::fmt;
 use crate::codegen::zyz_angles;
 use crate::diag::Span;
 use crate::ir::*;
+use crate::phase;
 use crate::simulator::matrix::{Matrix2, matrix_for};
 use crate::synth::Synth;
+
+const PAIR_WINDOW: usize = 1024;
 
 const NATIVE: [(GateKind, usize); 27] = [
     (GateKind::I, 0),
@@ -153,13 +156,22 @@ pub fn transpile(program: &mut Program, set: &GateSet) -> TranspileStats {
 
     for block in &mut program.blocks {
         let mut rewritten = Vec::with_capacity(block.ops.len());
+        let paired = if set.has(GateKind::X, 2) {
+            vec![None; block.ops.len()]
+        } else {
+            relative_pairs(&block.ops)
+        };
 
-        for op in block.ops.drain(..) {
+        for (op, paired) in block.ops.drain(..).zip(paired) {
             let Op::Gate(gate) = op else {
                 rewritten.push(op);
                 continue;
             };
-            match translate(&gate, set, &synth) {
+            let lowered = match paired {
+                Some(controls) => lower(relative_toffoli(&gate, controls), &synth),
+                None => translate(&gate, set, &synth),
+            };
+            match lowered {
                 Some(gates) => rewritten.extend(gates.into_iter().map(Op::Gate)),
                 None => {
                     let name = gate_name(&gate);
@@ -198,8 +210,12 @@ pub(crate) fn translate(gate: &Gate, set: &GateSet, synth: &Synth) -> Option<Vec
         return synth.turn(gate.kind, gate.params[0], gate.targets[0], gate.span);
     }
 
+    lower(canonical(gate)?, synth)
+}
+
+fn lower(parts: Vec<Gate>, synth: &Synth) -> Option<Vec<Gate>> {
     let mut out = Vec::new();
-    for part in fuse(canonical(gate)?) {
+    for part in fuse(parts) {
         let piece = match part.controls.as_slice() {
             [] => synth.one(
                 matrix_for(part.kind, &part.constant_params()),
@@ -314,6 +330,66 @@ fn controlled_unitary(matrix: Matrix2, control: QubitId, target: QubitId, span: 
     ]
 }
 
+fn is_toffoli(op: &Op) -> Option<&Gate> {
+    match op {
+        Op::Gate(gate)
+            if gate.kind == GateKind::X && gate.controls.len() == 2 && gate.params.is_empty() =>
+        {
+            Some(gate)
+        }
+        _ => None,
+    }
+}
+
+fn relative_pairs(ops: &[Op]) -> Vec<Option<[QubitId; 2]>> {
+    let mut paired = vec![None; ops.len()];
+    for (start, op) in ops.iter().enumerate() {
+        let Some(first) = is_toffoli(op).filter(|_| paired[start].is_none()) else {
+            continue;
+        };
+        let wires: Vec<QubitId> = first.wires().collect();
+        for (offset, later) in ops[start + 1..].iter().take(PAIR_WINDOW).enumerate() {
+            if let Some(second) = is_toffoli(later)
+                && second.targets == first.targets
+                && second.controls.iter().all(|c| first.controls.contains(c))
+            {
+                let controls = [first.controls[0], first.controls[1]];
+                paired[start] = Some(controls);
+                paired[start + 1 + offset] = Some(controls);
+                break;
+            }
+            let touched = later.qubits().iter().any(|q| wires.contains(q));
+            let harmless = match later {
+                Op::Gate(gate) => {
+                    phase::diagonal(gate.kind) || gate.targets.iter().all(|q| !wires.contains(q))
+                }
+                _ => false,
+            };
+            if touched && !harmless {
+                break;
+            }
+        }
+    }
+    paired
+}
+
+fn relative_toffoli(gate: &Gate, [a, b]: [QubitId; 2]) -> Vec<Gate> {
+    let span = gate.span;
+    let target = gate.targets[0];
+    let one = |m, q| unitary(m, q, span);
+    vec![
+        one(Matrix2::h(), target),
+        one(Matrix2::t(), target),
+        cx(b, target, span),
+        one(Matrix2::t_dagger(), target),
+        cx(a, target, span),
+        one(Matrix2::t(), target),
+        cx(b, target, span),
+        one(Matrix2::t_dagger(), target),
+        one(Matrix2::h(), target),
+    ]
+}
+
 fn toffoli(a: QubitId, b: QubitId, target: QubitId, span: Span) -> Vec<Gate> {
     let one = |m, q| unitary(m, q, span);
     vec![
@@ -340,6 +416,9 @@ mod tests {
     use std::slice;
 
     use super::*;
+    use crate::qasm;
+    use crate::simulator::exec::{self, ExecConfig};
+    use crate::simulator::matrix::C64;
     use crate::synth::Unitary;
 
     const WIRES: [QubitId; 3] = [QubitId(0), QubitId(1), QubitId(2)];
@@ -457,5 +536,44 @@ mod tests {
         assert!(set.has(GateKind::X, 1));
         assert_eq!(set.name(), "native without h,ccx");
         assert!(GateSet::parse("rz,bogus").is_err());
+    }
+
+    #[test]
+    fn relative_toffolis() {
+        let source = "OPENQASM 2.0;
+include \"qelib1.inc\";
+qreg q[7];
+h q[0];
+h q[1];
+h q[2];
+h q[3];
+ccx q[0], q[1], q[4];
+ccx q[2], q[4], q[5];
+t q[4];
+ccx q[3], q[5], q[6];
+ccx q[4], q[2], q[5];
+ccx q[1], q[0], q[4];
+";
+        let original = qasm::lower(source).0;
+        let mut lowered = original.clone();
+        transpile(&mut lowered, &GateSet::parse("h,s,t,cx").unwrap());
+        let count = |kind: GateKind| lowered.gates().filter(|g| g.kind == kind).count();
+        assert_eq!(
+            (
+                count(GateKind::T) + count(GateKind::TDag),
+                count(GateKind::X)
+            ),
+            (24, 18)
+        );
+        let state = |program: &Program| {
+            exec::execute_vector(program, ExecConfig::default())
+                .final_state
+                .unwrap()
+        };
+        let (a, b) = (state(&original), state(&lowered));
+        let overlap: C64 = (0..a.len())
+            .map(|i| a.amplitude(i).conj() * b.amplitude(i))
+            .sum();
+        assert!((overlap.norm() - 1.0).abs() < 1e-9);
     }
 }

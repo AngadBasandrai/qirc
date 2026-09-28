@@ -26,11 +26,13 @@ use crate::route::{self, Coupling, Relabelled, RouteStats};
 use crate::sema;
 use crate::simulator::exec::{self, ExecConfig};
 use crate::simulator::state;
+use crate::stim;
 use crate::synth::{self, Cost};
 use crate::transpile::{self, GateSet, TranspileStats};
 use crate::verify;
 
 const DIFF_QUBITS: usize = 20;
+const MAX_DRAWN: usize = 200_000;
 
 #[derive(PartialEq, Debug)]
 pub enum Emit {
@@ -38,6 +40,7 @@ pub enum Emit {
     Ir,
     Qasm3,
     Qasm2,
+    Stim,
     Qir,
     Json,
     Circuit,
@@ -54,6 +57,7 @@ impl Emit {
             "ir" => Emit::Ir,
             "qasm" | "qasm3" => Emit::Qasm3,
             "qasm2" => Emit::Qasm2,
+            "stim" => Emit::Stim,
             "qir" | "llvm" => Emit::Qir,
             "json" => Emit::Json,
             "circuit" => Emit::Circuit,
@@ -245,8 +249,8 @@ usage:
                     behaves exactly like a.ll at -O0
 
 options:
-  --emit <kind>     run | ir | qasm3 | qasm2 | qir | json | circuit | quantikz | svg | cost
-                    | check
+  --emit <kind>     run | ir | qasm3 | qasm2 | stim | qir | json | circuit | quantikz | svg
+                    | cost | check
                     (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
   --shots <n>       sample n measurement outcomes
@@ -275,6 +279,15 @@ options:
 ";
 
 pub fn parse_args(args: &[String]) -> Result<Options, String> {
+    parse_args_with(args, |path| {
+        fs::read_to_string(path).map_err(|error| format!("cannot read calibration {path}: {error}"))
+    })
+}
+
+pub fn parse_args_with(
+    args: &[String],
+    read: impl Fn(&str) -> Result<String, String>,
+) -> Result<Options, String> {
     let mut options = Options::default();
     let mut input: Option<PathBuf> = None;
     let mut excluded: Option<&str> = None;
@@ -357,8 +370,7 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
 
             "--calibration" => {
                 let path = value(&mut args, "--calibration needs a file")?;
-                let text = fs::read_to_string(path)
-                    .map_err(|error| format!("cannot read calibration {path}: {error}"))?;
+                let text = read(path)?;
                 options.calibration = Some(
                     Calibration::parse(&text)
                         .map_err(|error| format!("calibration {path}: {error}"))?,
@@ -797,6 +809,16 @@ pub fn run_source(
                 return 1;
             }
         },
+        Emit::Stim => {
+            let noise = options.calibration.as_ref().filter(|_| options.noisy);
+            match stim::emit(program, noise) {
+                Ok(text) => text,
+                Err(reason) => {
+                    output.eprintln(format_args!("error: cannot emit Stim: {reason}"));
+                    return 1;
+                }
+            }
+        }
         Emit::Qir => match codegen::emit_qir(program) {
             Ok(text) => text,
             Err(reason) => {
@@ -833,7 +855,7 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
     let program = &compilation.program;
 
     let qubits = program.num_qubits as usize;
-    if qubits > state::MAX_QUBITS && !exec::stabilizer(program) {
+    if qubits > state::MAX_QUBITS && !exec::scalable(program) {
         if let Some(observable) = &options.observable {
             return if expectation(output, program, observable) {
                 0
@@ -876,7 +898,15 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
     }
 
     output.println("");
-    output.print(format_args!("{}", codegen::emit_circuit(program)));
+    let depth = program.depth();
+    if program.num_qubits as usize * depth <= MAX_DRAWN {
+        output.print(format_args!("{}", codegen::emit_circuit(program)));
+    } else {
+        output.println(format_args!(
+            "circuit: {} qubits by depth {depth} is too large to draw here, use --emit circuit",
+            program.num_qubits
+        ));
+    }
 
     let config = ExecConfig {
         shots: options.shots,

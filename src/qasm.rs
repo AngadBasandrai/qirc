@@ -18,11 +18,11 @@ gate cu(theta, phi, lambda, gamma) c, t { p(gamma) c; cu3(theta, phi, lambda) c,
 gate rccx a, b, c { u2(0, pi) c; p(pi / 4) c; cx b, c; p(-pi / 4) c; cx a, c; p(pi / 4) c; cx b, c; p(-pi / 4) c; u2(0, pi) c; }
 ";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 enum Token {
     Name(String),
     Number(f64),
-    Text(String),
+    Text,
     Symbol(&'static str),
 }
 
@@ -85,10 +85,7 @@ fn lex(source: &str) -> Result<Vec<(Token, Span)>, Diagnostic> {
                 Diagnostic::error("unterminated string")
                     .primary(Span::new(start, start + 1), "starts here")
             })?;
-            tokens.push((
-                Token::Text(source[at + 1..at + 1 + end].to_string()),
-                Span::new(start, at + end + 2),
-            ));
+            tokens.push((Token::Text, Span::new(start, at + end + 2)));
             at += end + 2;
         } else if let Some(symbol) = SYMBOLS.iter().find(|s| source[at..].starts_with(**s)) {
             at += symbol.len();
@@ -106,7 +103,7 @@ fn lex(source: &str) -> Result<Vec<(Token, Span)>, Diagnostic> {
     Ok(tokens)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum Angle {
     Number(f64),
     Name(String, Span),
@@ -160,14 +157,14 @@ impl Angle {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Wire {
     name: String,
     index: Option<usize>,
     span: Span,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Call {
     name: String,
     params: Vec<Angle>,
@@ -183,7 +180,7 @@ struct Definition {
     size: usize,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(PartialEq)]
 enum Kind {
     Qubit,
     Bit,
@@ -235,6 +232,13 @@ impl Parser<'_> {
         } else {
             Err(Diagnostic::error(format!("expected `{symbol}`")).primary(self.span(), "here"))
         }
+    }
+
+    fn skip_statement(&mut self) -> Result<(), Diagnostic> {
+        while !self.symbol(";") && self.peek().is_some() {
+            self.at += 1;
+        }
+        self.expect(";").map(|_| ())
     }
 
     fn name(&mut self) -> Result<(String, Span), Diagnostic> {
@@ -477,6 +481,16 @@ impl Builder {
         }
     }
 
+    fn budget(&self, extra: usize, span: Span) -> Result<(), Diagnostic> {
+        if self.emitted.saturating_add(extra) > MAX_OPS {
+            return Err(Diagnostic::error(format!(
+                "the program expands to more than {MAX_OPS} operations"
+            ))
+            .primary(span, "while expanding this"));
+        }
+        Ok(())
+    }
+
     fn apply(
         &mut self,
         call: &Call,
@@ -488,12 +502,7 @@ impl Builder {
             return Err(Diagnostic::error("gate definitions nest too deeply")
                 .primary(call.span, "while expanding this"));
         }
-        if self.emitted > MAX_OPS {
-            return Err(Diagnostic::error(format!(
-                "the program expands to more than {MAX_OPS} operations"
-            ))
-            .primary(call.span, "while expanding this"));
-        }
+        self.budget(0, call.span)?;
         let params = call
             .params
             .iter()
@@ -629,12 +638,7 @@ impl Builder {
                             .primary(span, "not a standard gate or one defined in this file")
                     })?;
                     want(definition.params.len(), definition.qubits.len())?;
-                    if self.emitted.saturating_add(definition.size) > MAX_OPS {
-                        return Err(Diagnostic::error(format!(
-                            "the program expands to more than {MAX_OPS} operations"
-                        ))
-                        .primary(span, "while expanding this"));
-                    }
+                    self.budget(definition.size, span)?;
                     let env: HashMap<String, f64> = definition
                         .params
                         .iter()
@@ -689,6 +693,12 @@ impl Builder {
         let operand = parser.operand()?;
         let bits = self.resolve(&operand, Kind::Bit)?;
         let checks = if parser.symbol("==") || parser.symbol("!=") {
+            if negated {
+                return Err(Diagnostic::error(
+                    "`!` and a comparison cannot be combined, write the value to compare with",
+                )
+                .primary(operand.span, "here"));
+            }
             if parser.symbol("!=") {
                 return Err(Diagnostic::error(
                     "`!=` conditions are not supported, write the equal case",
@@ -803,11 +813,7 @@ impl Builder {
             None => return Ok(()),
         };
         match word.as_str() {
-            "OPENQASM" => {
-                parser.next();
-                parser.expect(";")?;
-            }
-            "include" => {
+            "OPENQASM" | "include" => {
                 parser.next();
                 parser.expect(";")?;
             }
@@ -861,10 +867,7 @@ impl Builder {
                 while !parser.symbol("}") {
                     let (inner, span) = parser.name()?;
                     if inner == "barrier" {
-                        while !parser.symbol(";") {
-                            parser.next();
-                        }
-                        parser.at += 1;
+                        parser.skip_statement()?;
                         continue;
                     }
                     body.push(parser.call(inner, span)?);
@@ -898,12 +901,7 @@ impl Builder {
                         .primary(span, "here"),
                 );
             }
-            "barrier" => {
-                while !parser.symbol(";") && parser.peek().is_some() {
-                    parser.next();
-                }
-                parser.expect(";")?;
-            }
+            "barrier" => parser.skip_statement()?,
             "reset" => {
                 let operand = parser.operand()?;
                 parser.expect(";")?;
@@ -994,7 +992,7 @@ pub fn lower(source: &str) -> (Program, Vec<Diagnostic>) {
         emitted: 0,
     };
     builder.block("entry".into());
-    let prelude = lex(PRELUDE).unwrap_or_default();
+    let prelude = lex(PRELUDE).unwrap();
     let mut parser = Parser {
         tokens: &prelude,
         at: 0,
@@ -1002,9 +1000,7 @@ pub fn lower(source: &str) -> (Program, Vec<Diagnostic>) {
         nesting: 0,
     };
     while parser.peek().is_some() {
-        if builder.statement(&mut parser, 0).is_err() {
-            break;
-        }
+        builder.statement(&mut parser, 0).unwrap();
     }
     let parsed = lex(source).and_then(|tokens| {
         let mut parser = Parser {

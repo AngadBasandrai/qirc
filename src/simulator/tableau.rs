@@ -1,7 +1,7 @@
 use std::f64::consts::FRAC_PI_2;
 
 use super::state::Rng;
-use crate::ir::{Gate, GateKind};
+use crate::ir::{Const, Gate, GateKind};
 
 pub const MAX_QUBITS: usize = 5000;
 
@@ -22,9 +22,18 @@ fn toggle(words: &mut [u64], q: usize) {
     words[q / 64] ^= 1u64 << (q % 64);
 }
 
-fn quarter_turns(angle: f64) -> Option<usize> {
+pub(crate) fn quarter_turns(angle: f64) -> Option<usize> {
     let turns = angle / FRAC_PI_2;
     ((turns - turns.round()).abs() < 1e-9).then(|| (turns.round() as i64).rem_euclid(4) as usize)
+}
+
+pub(crate) fn clifford(gate: &Gate) -> Option<Vec<f64>> {
+    let params = gate
+        .params
+        .iter()
+        .map(|p| p.constant().map(Const::as_f64))
+        .collect::<Option<Vec<f64>>>()?;
+    supports(gate, &params).then_some(params)
 }
 
 pub fn supports(gate: &Gate, params: &[f64]) -> bool {

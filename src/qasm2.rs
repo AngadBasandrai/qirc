@@ -90,6 +90,71 @@ fn quantum(op: &Op, registers: &dyn Fn(ResultId) -> String) -> Result<Option<Str
     })
 }
 
+pub(crate) enum Step<'a> {
+    Op(&'a Op),
+    If {
+        result: ResultId,
+        value: bool,
+        gate: &'a Gate,
+    },
+}
+
+pub(crate) fn steps(program: &Program) -> (Vec<Step<'_>>, bool) {
+    let mut steps = Vec::new();
+    let mut visited = HashSet::new();
+    let mut current = program.entry;
+    loop {
+        if !visited.insert(current) {
+            return (steps, false);
+        }
+        let block = program.block(current);
+        steps.extend(block.ops.iter().map(Step::Op));
+        match &block.term {
+            Term::Ret(_) | Term::Unreachable => return (steps, true),
+            Term::Br(next) => current = *next,
+            Term::CondBr {
+                cond: Operand::Value(value),
+                if_true,
+                if_false,
+            } => {
+                let Some(result) = block.ops.iter().find_map(|op| match op {
+                    Op::Assign {
+                        dest,
+                        expr: Expr::ReadResult(result),
+                        ..
+                    } if dest == value => Some(*result),
+                    _ => None,
+                }) else {
+                    return (steps, false);
+                };
+                let guarded = |arm: BlockId, join: BlockId| {
+                    let body = program.block(arm);
+                    (matches!(body.term, Term::Br(target) if target == join)
+                        && body.ops.iter().all(|op| matches!(op, Op::Gate(_))))
+                    .then_some(body)
+                };
+                let (body, value, join) =
+                    match (guarded(*if_true, *if_false), guarded(*if_false, *if_true)) {
+                        (Some(body), _) => (body, true, *if_false),
+                        (None, Some(body)) => (body, false, *if_true),
+                        (None, None) => return (steps, false),
+                    };
+                steps.extend(body.ops.iter().filter_map(|op| match op {
+                    Op::Gate(gate) => Some(Step::If {
+                        result,
+                        value,
+                        gate,
+                    }),
+                    _ => None,
+                }));
+                visited.insert(body.id);
+                current = join;
+            }
+            _ => return (steps, false),
+        }
+    }
+}
+
 pub fn emit(program: &Program) -> Result<String, String> {
     let branching = program.blocks.len() > 1;
     let registers = |result: ResultId| {
@@ -110,65 +175,33 @@ pub fn emit(program: &Program) -> Result<String, String> {
     }
     out.push('\n');
 
-    let unsupported = || {
-        "OpenQASM 2 can only branch on one measurement to a block of gates, use --emit qasm3"
-            .to_string()
-    };
-    let mut visited = HashSet::new();
-    let mut current = program.entry;
-    loop {
-        if !visited.insert(current) {
-            return Err(unsupported());
-        }
-        let block = program.block(current);
-        for op in &block.ops {
-            if let Some(line) = quantum(op, &registers)? {
-                writeln!(out, "{line}").unwrap();
-            }
-        }
-        match &block.term {
-            Term::Ret(_) | Term::Unreachable => break,
-            Term::Br(next) => current = *next,
-            Term::CondBr {
-                cond: Operand::Value(value),
-                if_true,
-                if_false,
-            } => {
-                let result = block
-                    .ops
-                    .iter()
-                    .find_map(|op| match op {
-                        Op::Assign {
-                            dest,
-                            expr: Expr::ReadResult(result),
-                            ..
-                        } if dest == value => Some(*result),
-                        _ => None,
-                    })
-                    .ok_or_else(unsupported)?;
-                let guarded = |arm: BlockId, join: BlockId| {
-                    let body = program.block(arm);
-                    (matches!(body.term, Term::Br(target) if target == join)
-                        && body.ops.iter().all(|op| matches!(op, Op::Gate(_))))
-                    .then_some(body)
-                };
-                let (body, expected, join) =
-                    match (guarded(*if_true, *if_false), guarded(*if_false, *if_true)) {
-                        (Some(body), _) => (body, 1, *if_false),
-                        (None, Some(body)) => (body, 0, *if_true),
-                        (None, None) => return Err(unsupported()),
-                    };
-                for op in &body.ops {
-                    if let Op::Gate(gate) = op {
-                        writeln!(out, "if(c{}=={expected}) {}", result.0, gate_line(gate)?)
-                            .unwrap();
-                    }
+    let (steps, whole) = steps(program);
+    for step in steps {
+        match step {
+            Step::Op(op) => {
+                if let Some(line) = quantum(op, &registers)? {
+                    writeln!(out, "{line}").unwrap();
                 }
-                visited.insert(body.id);
-                current = join;
             }
-            _ => return Err(unsupported()),
+            Step::If {
+                result,
+                value,
+                gate,
+            } => writeln!(
+                out,
+                "if(c{}=={}) {}",
+                result.0,
+                u8::from(value),
+                gate_line(gate)?
+            )
+            .unwrap(),
         }
+    }
+    if !whole {
+        return Err(
+            "OpenQASM 2 can only branch on one measurement to a block of gates, use --emit qasm3"
+                .into(),
+        );
     }
     Ok(out)
 }

@@ -1,6 +1,7 @@
 mod common;
 
 use common::{compile, errors, run};
+use qirc::calibration::Calibration;
 use qirc::driver;
 use qirc::equiv;
 use qirc::ir::Profile;
@@ -172,6 +173,14 @@ fn hostile_inputs() {
         (deep, "nests too deeply"),
         (nested, "nest too deeply"),
         (doubling, "more than 5000000 operations"),
+        (
+            "OPENQASM 2.0;\nqreg q[1];\ngate g a { barrier a".into(),
+            "expected `;`",
+        ),
+        (
+            "OPENQASM 3.0;\nqubit q;\nbit c;\nif (!c == 1) x q;\n".into(),
+            "cannot be combined",
+        ),
     ] {
         let found = errors(&driver::compile(&source, 1)).join("\n");
         assert!(found.contains(message), "{found}");
@@ -203,4 +212,43 @@ fn qasm2_round_trip() {
     assert!(teleport.contains("if(c1==1) x q[2];"), "{teleport}");
     let looping = compile(include_str!("../examples/repeat_until_success.ll"), 1);
     assert!(qirc::qasm2::emit(&looping).is_err());
+}
+
+#[test]
+fn stim() {
+    let teleport = compile(
+        "OPENQASM 2.0;
+include \"qelib1.inc\";
+qreg q[3];
+creg c0[1];
+creg c1[1];
+creg c2[1];
+h q[1];
+cx q[1], q[2];
+cx q[0], q[1];
+h q[0];
+measure q[0] -> c0[0];
+measure q[1] -> c1[0];
+if(c1==1) x q[2];
+if(c0==0) z q[2];
+measure q[2] -> c2[0];
+",
+        0,
+    );
+    assert_eq!(
+        qirc::stim::emit(&teleport, None).unwrap(),
+        "H 1\nCX 1 2\nCX 0 1\nH 0\nM 0\nM 1\nCX rec[-1] 2\nZ 2\nCZ rec[-2] 2\nM 2\n"
+    );
+    let calibration = Calibration::parse("cx 0 1 0.05\nsingle 0 0.01\nreadout 0 0.02\n").unwrap();
+    let flip = compile(
+        "OPENQASM 2.0;\nqreg q[1];\ncreg c[1];\nx q[0];\nmeasure q[0] -> c[0];\nreset q[0];\n",
+        0,
+    );
+    assert_eq!(
+        qirc::stim::emit(&flip, Some(&calibration)).unwrap(),
+        "X 0\nDEPOLARIZE1(0.01) 0\nM(0.02) 0\nR 0\nX_ERROR(0.02) 0\n"
+    );
+    assert!(qirc::stim::emit(&teleport, Some(&calibration)).is_err());
+    let rotation = compile("OPENQASM 2.0;\nqreg q[1];\nrx(0.3) q[0];\n", 0);
+    assert!(qirc::stim::emit(&rotation, None).is_err());
 }
