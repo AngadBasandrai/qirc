@@ -2,11 +2,14 @@ use std::fmt;
 
 use crate::calibration::Calibration;
 use crate::equiv;
-use crate::ir::{Expr, Op, Program, QubitId, ResultId, Term};
+use crate::ir::{Expr, Op, Program, QubitId, ResultId, Term, keep_marked};
+use crate::pauli;
 use crate::route::remap;
+use crate::simulator::bits::{self, Bits};
 use crate::simulator::exec::{self, ExecConfig};
 use crate::simulator::matrix::C64;
 use crate::simulator::state::{self, State};
+use crate::simulator::tableau::Tableau;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Pauli {
@@ -15,23 +18,23 @@ enum Pauli {
     Z,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 struct Product {
     weight: f64,
     paulis: Vec<(usize, Pauli)>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct Observable {
     terms: Vec<Product>,
     qubits: usize,
 }
 
 impl Product {
-    fn value(&self, state: &State, wire: impl Fn(usize) -> usize) -> f64 {
+    fn value(&self, state: &State, wire: &[usize]) -> f64 {
         let (mut x, mut z, mut ys) = (0usize, 0usize, 0);
         for &(q, pauli) in &self.paulis {
-            let bit = 1 << wire(q);
+            let bit = 1 << wire[q];
             match pauli {
                 Pauli::X => x |= bit,
                 Pauli::Z => z |= bit,
@@ -61,8 +64,33 @@ impl Product {
         self.weight * (phase * sum).re
     }
 
+    fn propagated(&self, program: &Program, wire: &[usize]) -> Result<f64, String> {
+        let paulis: Vec<(usize, bool, bool)> = self
+            .paulis
+            .iter()
+            .map(|&(q, pauli)| (wire[q], pauli != Pauli::Z, pauli != Pauli::X))
+            .collect();
+        Ok(self.weight * pauli::propagate(program, &paulis)?)
+    }
+
+    fn classical_value(&self, bits: &Bits, wire: &[usize]) -> f64 {
+        if self.paulis.iter().any(|&(_, pauli)| pauli != Pauli::Z) {
+            return 0.0;
+        }
+        let ones = self
+            .paulis
+            .iter()
+            .filter(|&&(q, _)| bits.get(wire[q]))
+            .count();
+        if ones % 2 == 1 {
+            -self.weight
+        } else {
+            self.weight
+        }
+    }
+
     fn stabilizer_value(&self, program: &Program, wire: &[usize]) -> f64 {
-        let mut tableau = exec::final_tableau(program);
+        let mut tableau = exec::finish(program, Tableau::new(program.num_qubits as usize));
         let wires: Vec<usize> = self
             .paulis
             .iter()
@@ -150,7 +178,11 @@ impl Observable {
     }
 
     fn value(&self, state: &State) -> f64 {
-        self.terms.iter().map(|term| term.value(state, |q| q)).sum()
+        let identity: Vec<usize> = (0..self.qubits).collect();
+        self.terms
+            .iter()
+            .map(|term| term.value(state, &identity))
+            .sum()
     }
 }
 
@@ -203,24 +235,24 @@ fn terminal(program: &Program) -> Program {
                 _ => later.extend(op.qubits()),
             }
         }
-        let mut index = 0;
-        block.ops.retain(|_| {
-            index += 1;
-            keep[index - 1]
-        });
+        keep_marked(&mut block.ops, &keep);
     }
     stripped
 }
 
-fn check(program: &Program, observable: &Observable, whole: bool) -> Result<(), String> {
-    let qubits = program.num_qubits as usize;
-    if observable.qubits > qubits {
+fn check(program: &Program, observable: &Observable) -> Result<(), String> {
+    if observable.qubits > program.num_qubits as usize {
         return Err(format!(
-            "the observable names qubit {} but the program has {qubits}",
-            observable.qubits - 1
+            "the observable names qubit {} but the program has {}",
+            observable.qubits - 1,
+            program.num_qubits
         ));
     }
-    if whole && qubits > state::MAX_QUBITS {
+    Ok(())
+}
+
+fn fits(program: &Program) -> Result<(), String> {
+    if program.num_qubits as usize > state::MAX_QUBITS {
         return Err(format!(
             "expectation values need a state vector, which supports at most {} qubits",
             state::MAX_QUBITS
@@ -284,7 +316,8 @@ pub fn noisy_expectation(
     shots: u64,
     seed: u64,
 ) -> Result<f64, String> {
-    check(program, observable, true)?;
+    check(program, observable)?;
+    fits(program)?;
     let config = ExecConfig {
         shots,
         seed,
@@ -313,7 +346,7 @@ pub fn extrapolate(
 }
 
 pub fn expectation(program: &Program, observable: &Observable) -> Result<f64, String> {
-    check(program, observable, false)?;
+    check(program, observable)?;
     let stripped = terminal(program);
     let straight = stripped.blocks.len() == 1
         && !exec::needs_per_shot(&stripped)
@@ -327,21 +360,22 @@ pub fn expectation(program: &Program, observable: &Observable) -> Result<f64, St
                 continue;
             }
             let (sub, wire) = cone(&stripped, &qubits);
-            total += if exec::stabilizer(&sub) {
+            total += if sub.gates().all(bits::supports) {
+                term.classical_value(
+                    &exec::finish(&sub, Bits::new(sub.num_qubits as usize)),
+                    &wire,
+                )
+            } else if exec::stabilizer(&sub) {
                 term.stabilizer_value(&sub, &wire)
             } else if sub.num_qubits as usize > state::MAX_QUBITS {
-                return Err(format!(
-                    "the light cone of a term reaches {} qubits and is not Clifford, more than the {} a state vector supports",
-                    sub.num_qubits,
-                    state::MAX_QUBITS
-                ));
+                term.propagated(&sub, &wire)?
             } else {
-                term.value(&final_state(&sub)?, |q| wire[q])
+                term.value(&final_state(&sub)?, &wire)
             };
         }
         return Ok(total);
     }
-    check(program, observable, true)?;
+    fits(program)?;
     let outcomes = equiv::explore(&stripped);
     if outcomes.unexplored > 1e-9 {
         return Err("the program has too many measurement branches to average exactly".into());
@@ -373,25 +407,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stabilizer_terms() {
+    fn random_terms(
+        circuits: usize,
+        gates: &[(&str, usize)],
+        mut check: impl FnMut(&str, &Product, &Program, &State),
+    ) {
         let mut rng = Rng::new(3);
         let mut pick = |n: usize| rng.next_u64() as usize % n;
-        let gates = [
-            "h", "s", "sdg", "x", "y", "z", "sx", "cx", "cz", "cy", "swap",
-        ];
-        let identity: Vec<usize> = (0..5).collect();
-        for _ in 0..100 {
-            let mut source = String::from("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[5];\n");
+        for _ in 0..circuits {
+            let mut source = String::from(
+                "OPENQASM 2.0;
+include \"qelib1.inc\";
+qreg q[5];
+",
+            );
             for _ in 0..25 {
-                let a = pick(5);
-                let b = (a + 1 + pick(4)) % 5;
-                match gates[pick(gates.len())] {
-                    gate @ ("cx" | "cz" | "cy" | "swap") => {
-                        source += &format!("{gate} q[{a}], q[{b}];\n")
-                    }
-                    gate => source += &format!("{gate} q[{a}];\n"),
-                }
+                let (gate, arity) = gates[pick(gates.len())];
+                let first = pick(5);
+                let wires: Vec<String> = (0..arity)
+                    .map(|k| format!("q[{}]", (first + k) % 5))
+                    .collect();
+                source += &format!(
+                    "{gate} {};
+",
+                    wires.join(", ")
+                );
             }
             let (program, diagnostics) = qasm::lower(&source);
             assert!(diagnostics.is_empty());
@@ -403,13 +443,58 @@ mod tests {
                     text += &format!("{q} ");
                 }
                 let term = &Observable::parse(&text).unwrap().terms[0];
-                if term.paulis.is_empty() {
-                    continue;
+                if !term.paulis.is_empty() {
+                    check(&source, term, &program, &state);
                 }
-                let exact = term.value(&state, |q| q);
-                let tableau = term.stabilizer_value(&program, &identity);
-                assert!((exact - tableau).abs() < 1e-9, "{text}\n{source}");
             }
         }
+    }
+
+    #[test]
+    fn stabilizer_terms() {
+        let gates = [
+            ("h", 1),
+            ("s", 1),
+            ("sdg", 1),
+            ("x", 1),
+            ("y", 1),
+            ("z", 1),
+            ("sx", 1),
+            ("cx", 2),
+            ("cz", 2),
+            ("cy", 2),
+            ("swap", 2),
+        ];
+        let identity: Vec<usize> = (0..5).collect();
+        random_terms(100, &gates, |source, term, program, state| {
+            let exact = term.value(state, &identity);
+            let tableau = term.stabilizer_value(program, &identity);
+            assert!((exact - tableau).abs() < 1e-9, "{source}");
+        });
+    }
+
+    #[test]
+    fn propagation() {
+        let gates = [
+            ("h", 1),
+            ("t", 1),
+            ("sdg", 1),
+            ("sx", 1),
+            ("y", 1),
+            ("rx(0.3)", 1),
+            ("ry(1.1)", 1),
+            ("u3(0.4, 0.2, 1.3)", 1),
+            ("cx", 2),
+            ("cz", 2),
+            ("crz(0.5)", 2),
+            ("swap", 2),
+            ("ccx", 3),
+        ];
+        let identity: Vec<usize> = (0..5).collect();
+        random_terms(30, &gates, |source, term, program, state| {
+            let exact = term.value(state, &identity);
+            let propagated = term.propagated(program, &identity).unwrap();
+            assert!((exact - propagated).abs() < 1e-9, "{source}");
+        });
     }
 }

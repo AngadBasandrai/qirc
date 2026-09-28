@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::bits::{self, Bits};
 use super::matrix::{Matrix2, matrix_for};
 use super::simd;
 use super::state::{Rng, Sampler, State};
 use super::tableau::{self, Tableau};
-use crate::calibration::Calibration;
+use crate::calibration::{Calibration, Clock};
 use crate::ir::*;
 
 const STABILIZER_ABOVE: usize = 20;
@@ -53,7 +54,19 @@ impl Backend for Tableau {
     }
 }
 
-trait Sample: Backend {
+impl Backend for Bits {
+    fn gate(&mut self, gate: &Gate, _: &[f64]) {
+        self.apply(gate);
+    }
+
+    fn pauli(&mut self, qubit: usize, x: bool, _: bool) {
+        if x {
+            Bits::flip(self, qubit);
+        }
+    }
+}
+
+pub(crate) trait Sample: Backend {
     type Sampler;
     fn sampler(&self) -> Self::Sampler;
     fn sample(
@@ -104,21 +117,42 @@ impl Sample for Tableau {
     }
 }
 
+impl Sample for Bits {
+    type Sampler = ();
+
+    fn sampler(&self) {}
+
+    fn sample(&self, _: &(), plan: &[(QubitId, ResultId)], _: &mut Rng, results: &mut [bool]) {
+        for (qubit, result) in plan {
+            if let Some(slot) = results.get_mut(result.index()) {
+                *slot = self.get(qubit.index());
+            }
+        }
+    }
+}
+
+fn classical(program: &Program) -> bool {
+    let qubits = program.num_qubits as usize;
+    qubits > STABILIZER_ABOVE && qubits <= bits::MAX_QUBITS && program.gates().all(bits::supports)
+}
+
+pub fn scalable(program: &Program) -> bool {
+    classical(program) || stabilizer(program)
+}
+
 pub fn stabilizer(program: &Program) -> bool {
     let qubits = program.num_qubits as usize;
     qubits > STABILIZER_ABOVE
         && qubits <= tableau::MAX_QUBITS
-        && program.gates().all(|gate| {
-            gate.params
-                .iter()
-                .map(|p| p.constant().map(Const::as_f64))
-                .collect::<Option<Vec<f64>>>()
-                .is_some_and(|params| tableau::supports(gate, &params))
-        })
+        && program
+            .gates()
+            .all(|gate| tableau::clifford(gate).is_some())
 }
 
 pub fn kernel(program: &Program) -> &'static str {
-    if stabilizer(program) {
+    if classical(program) {
+        "classical bits"
+    } else if stabilizer(program) {
         "stabilizer tableau"
     } else {
         simd::backend()
@@ -205,7 +239,28 @@ pub fn needs_per_shot(program: &Program) -> bool {
 
 pub fn execute(program: &Program, config: ExecConfig) -> ExecOutcome {
     let qubits = program.num_qubits as usize;
-    if stabilizer(program) && needs_per_shot(program) {
+    if classical(program) && needs_per_shot(program) {
+        let once = ExecConfig { shots: 1, ..config };
+        let mut outcome = shots(
+            program,
+            once,
+            None,
+            || Bits::new(qubits),
+            Bits::measure,
+            &mut |_| {},
+        )
+        .0;
+        for count in outcome
+            .counts
+            .values_mut()
+            .chain(outcome.returns.values_mut())
+        {
+            *count *= config.shots.max(1);
+        }
+        outcome
+    } else if classical(program) {
+        execute_sampled(program, config, Bits::new(qubits)).0
+    } else if stabilizer(program) && needs_per_shot(program) {
         shots(
             program,
             config,
@@ -242,13 +297,13 @@ pub fn execute_vector(program: &Program, config: ExecConfig) -> ExecOutcome {
     outcome
 }
 
-pub(crate) fn final_tableau(program: &Program) -> Tableau {
+pub(crate) fn finish<S: Sample>(program: &Program, state: S) -> S {
     let config = ExecConfig {
         shots: 0,
         seed: 1,
         keep_state: false,
     };
-    execute_sampled(program, config, Tableau::new(program.num_qubits as usize)).1
+    execute_sampled(program, config, state).1
 }
 
 fn control_mask(gate: &Gate) -> u64 {
@@ -351,6 +406,17 @@ pub fn execute_noisy(
     calibration: &Calibration,
 ) -> ExecOutcome {
     let qubits = program.num_qubits as usize;
+    if classical(program) {
+        return shots(
+            program,
+            config,
+            Some(calibration),
+            || Bits::new(qubits),
+            Bits::measure,
+            &mut |_| {},
+        )
+        .0;
+    }
     if stabilizer(program) {
         return shots(
             program,
@@ -431,8 +497,7 @@ fn shots<S: Backend>(
 
     for shot in 0..shots {
         let mut state = fresh();
-        let mut clock: Vec<Option<f64>> = vec![None; program.num_qubits as usize];
-        let mut started = 0.0;
+        let mut clock = Clock::default();
         let run = run_with(
             program,
             &mut state,
@@ -445,16 +510,11 @@ fn shots<S: Backend>(
                 let Some(calibration) = noise else {
                     return;
                 };
-                let qubits: Vec<usize> = op.qubits().iter().map(|q| q.index()).collect();
                 if !done {
-                    started = qubits.iter().filter_map(|&q| clock[q]).fold(0.0, f64::max);
-                    for &q in &qubits {
-                        if let Some(last) = clock[q] {
-                            let [x, y, z] = calibration.idle(q, started - last);
-                            let draw = errors.next_unit();
-                            if draw < x + y + z {
-                                state.pauli(q, draw < x + y, draw >= x);
-                            }
+                    for (q, [x, y, z]) in clock.begin(calibration, op) {
+                        let draw = errors.next_unit();
+                        if draw < x + y + z {
+                            state.pauli(q, draw < x + y, draw >= x);
                         }
                     }
                     return;
@@ -462,10 +522,7 @@ fn shots<S: Backend>(
                 if let Op::Gate(gate) = op {
                     depolarize(state, gate, calibration, &mut errors);
                 }
-                let end = started + calibration.duration(op);
-                for q in qubits {
-                    clock[q] = Some(end);
-                }
+                clock.end(calibration, op);
             },
         );
         if run.aborted {
@@ -815,4 +872,79 @@ fn render_output(
     }
 
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qasm;
+
+    #[test]
+    fn noisy_bits() {
+        let (program, diagnostics) = qasm::lower(
+            "OPENQASM 2.0;
+include \"qelib1.inc\";
+qreg q[5];
+creg c[5];
+x q[0];
+x q[1];
+ccx q[0], q[1], q[2];
+t q[2];
+swap q[2], q[3];
+cz q[3], q[4];
+cx q[3], q[4];
+y q[0];
+measure q -> c;
+reset q[1];
+cx q[4], q[1];
+",
+        );
+        assert!(diagnostics.is_empty());
+        let calibration = Calibration::parse(
+            "cx 0 1 0.03\ncx 1 2 0.02\ncx 2 3 0.04\ncx 3 4 0.03\nsingle 2 0.01\nreadout 3 0.05\n\
+             time cx 2 3 300\ntime cx 3 4 300\ntime readout 3 1000\nt1 4 20\nt2 4 15\n",
+        )
+        .unwrap();
+        let config = ExecConfig {
+            shots: 40_000,
+            seed: 9,
+            keep_state: false,
+        };
+        let run = |bits: bool| {
+            let noise = Some(&calibration);
+            if bits {
+                shots(
+                    &program,
+                    config,
+                    noise,
+                    || Bits::new(5),
+                    Bits::measure,
+                    &mut |_| {},
+                )
+                .0
+            } else {
+                shots(
+                    &program,
+                    config,
+                    noise,
+                    || State::new(5),
+                    State::measure,
+                    &mut |_| {},
+                )
+                .0
+            }
+        };
+        let (bits, vector) = (run(true).counts, run(false).counts);
+        let keys: HashSet<&String> = bits.keys().chain(vector.keys()).collect();
+        let distance: u64 = keys
+            .into_iter()
+            .map(|key| {
+                bits.get(key)
+                    .unwrap_or(&0)
+                    .abs_diff(*vector.get(key).unwrap_or(&0))
+            })
+            .sum();
+        assert!(bits.len() > 4);
+        assert!(distance < 1600, "{distance}");
+    }
 }

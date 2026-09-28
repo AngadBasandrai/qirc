@@ -302,11 +302,7 @@ pub(crate) fn drop_before_measure(program: &mut Program) -> usize {
                 }
             }
         }
-        let mut index = 0;
-        block.ops.retain(|_| {
-            index += 1;
-            keep[index - 1]
-        });
+        keep_marked(&mut block.ops, &keep);
     }
     removed
 }

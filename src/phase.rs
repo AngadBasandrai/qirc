@@ -100,7 +100,7 @@ fn fold_block(ops: &mut Vec<Op>, qubits: usize) -> usize {
     let mut parity: Vec<(Vec<u32>, bool)> = (0..qubits as u32).map(|q| (vec![q], false)).collect();
     let mut terms: HashMap<Vec<u32>, Term> = HashMap::new();
     let mut finished = Vec::new();
-    let mut gone = vec![false; ops.len()];
+    let mut keep = vec![true; ops.len()];
     let mut renew = |parity: &mut Vec<(Vec<u32>, bool)>, q: usize| {
         parity[q] = (vec![fresh], false);
         fresh += 1;
@@ -108,53 +108,61 @@ fn fold_block(ops: &mut Vec<Op>, qubits: usize) -> usize {
 
     for (index, op) in ops.iter().enumerate() {
         let wires = op.qubits();
-        let Op::Gate(gate) = op else {
-            if !wires.is_empty() {
-                finished.extend(terms.drain().map(|(_, term)| term));
-                for q in wires {
-                    renew(&mut parity, q.index());
+        let tracked = match op {
+            Op::Gate(gate) => match (
+                slope(gate),
+                gate.kind,
+                &gate.controls[..],
+                &gate.targets[..],
+            ) {
+                (Some(slope), ..) => {
+                    let (p, flipped) = &parity[gate.targets[0].index()];
+                    let signed = if *flipped { -slope } else { slope };
+                    if p.is_empty() {
+                        keep[index] = false;
+                    } else if let Some(term) = terms.get_mut(p) {
+                        term.angle += signed;
+                        keep[index] = false;
+                    } else {
+                        terms.insert(
+                            p.clone(),
+                            Term {
+                                at: index,
+                                flipped: *flipped,
+                                angle: signed,
+                            },
+                        );
+                    }
+                    true
                 }
-            }
-            continue;
+                (None, kind, ..) if diagonal(kind) => true,
+                (None, GateKind::X, [], [t]) => {
+                    parity[t.index()].1 ^= true;
+                    true
+                }
+                (None, GateKind::X, [c], [t]) => {
+                    let control = parity[c.index()].clone();
+                    let target = &mut parity[t.index()];
+                    target.0 = xor(&target.0, &control.0);
+                    target.1 ^= control.1;
+                    true
+                }
+                (None, GateKind::Swap, [], [a, b]) => {
+                    parity.swap(a.index(), b.index());
+                    true
+                }
+                (None, GateKind::H, [], [t]) => {
+                    renew(&mut parity, t.index());
+                    true
+                }
+                _ => false,
+            },
+            _ => wires.is_empty(),
         };
-        if let Some(slope) = slope(gate) {
-            let (p, flipped) = &parity[gate.targets[0].index()];
-            let signed = if *flipped { -slope } else { slope };
-            if p.is_empty() {
-                gone[index] = true;
-            } else if let Some(term) = terms.get_mut(p) {
-                term.angle += signed;
-                gone[index] = true;
-            } else {
-                terms.insert(
-                    p.clone(),
-                    Term {
-                        at: index,
-                        flipped: *flipped,
-                        angle: signed,
-                    },
-                );
-            }
-            continue;
-        }
-        if diagonal(gate.kind) {
-            continue;
-        }
-        match (gate.kind, &gate.controls[..], &gate.targets[..]) {
-            (GateKind::X, [], [t]) => parity[t.index()].1 ^= true,
-            (GateKind::X, [c], [t]) => {
-                let control = parity[c.index()].clone();
-                let target = &mut parity[t.index()];
-                target.0 = xor(&target.0, &control.0);
-                target.1 ^= control.1;
-            }
-            (GateKind::Swap, [], [a, b]) => parity.swap(a.index(), b.index()),
-            (GateKind::H, [], [t]) => renew(&mut parity, t.index()),
-            _ => {
-                finished.extend(terms.drain().map(|(_, term)| term));
-                for q in wires {
-                    renew(&mut parity, q.index());
-                }
+        if !tracked {
+            finished.extend(terms.drain().map(|(_, term)| term));
+            for q in wires {
+                renew(&mut parity, q.index());
             }
         }
     }
@@ -167,22 +175,16 @@ fn fold_block(ops: &mut Vec<Op>, qubits: usize) -> usize {
             term.angle
         });
         if angle.abs() < EPSILON {
-            gone[term.at] = true;
+            keep[term.at] = false;
         } else if let Op::Gate(gate) = &mut ops[term.at]
-            && slope(gate).is_none_or(|s| (wrap(s) - angle).abs() > 1e-12)
+            && slope(gate).is_none_or(|s| (wrap(s) - angle).abs() > EPSILON)
         {
             rewrite(gate, angle);
         }
     }
 
-    let removed = gone.iter().filter(|g| **g).count();
-    if removed > 0 {
-        let mut index = 0;
-        ops.retain(|_| {
-            index += 1;
-            !gone[index - 1]
-        });
-    }
+    let removed = keep.iter().filter(|k| !**k).count();
+    keep_marked(ops, &keep);
     removed
 }
 

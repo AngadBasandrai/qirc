@@ -5,6 +5,7 @@ use qirc::driver::{self, Emit, Output};
 use qirc::simulator::exec;
 
 const MAX_QUBITS: u32 = 20;
+const LINE5: &str = include_str!("../../examples/line5.cal");
 
 #[unsafe(no_mangle)]
 extern "C" fn allocate(len: usize) -> *mut u8 {
@@ -46,7 +47,13 @@ unsafe extern "C" fn run(
 
 fn execute(source: &str, args: &str, output: &mut Output) -> i32 {
     let words: Vec<String> = args.split_whitespace().map(String::from).collect();
-    let options = match driver::parse_args(&words) {
+    let device = |path: &str| match path {
+        "line5.cal" => Ok(LINE5.to_string()),
+        _ => Err(format!(
+            "the playground only has the calibration line5.cal, not {path}"
+        )),
+    };
+    let options = match driver::parse_args_with(&words, device) {
         Ok(options) => options,
         Err(message) if message.is_empty() => {
             output.stdout.push_str(driver::USAGE);
@@ -61,7 +68,7 @@ fn execute(source: &str, args: &str, output: &mut Output) -> i32 {
     if options.diff || matches!(options.emit, Emit::Run) {
         let program = driver::compile(source, 0).program;
         let qubits = program.num_qubits;
-        if qubits > MAX_QUBITS && !exec::stabilizer(&program) {
+        if qubits > MAX_QUBITS && !exec::scalable(&program) {
             output.stderr.push_str(&format!(
                 "error: this program needs {qubits} qubits, the playground simulates at most {MAX_QUBITS}\n"
             ));

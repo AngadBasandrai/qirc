@@ -66,7 +66,8 @@ The only direct dependency is `num-complex`.
 qirc <input.ll | input.qasm> [options]
 qirc diff <a> [b] [options]
 
-  --emit <kind>     run | ir | qasm3 | qasm2 | qir | json | circuit | quantikz | svg | cost | check
+  --emit <kind>     run | ir | qasm3 | qasm2 | stim | qir | json | circuit | quantikz | svg
+                    | cost | check
                     (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
   --gates <set>     target gate set: rz-sx-cx, rz-ry-cz or a list such as rz,sx,cx
@@ -142,6 +143,8 @@ Every circuit Qiskit exports for the benchmarks, in both versions, `qirc diff` f
 
 `--emit qasm2` writes OpenQASM 2 with `qelib1.inc` gates for tools that only read that version. OpenQASM 2 has no `else`, loops or classical variables, so it covers straight line programs and a branch on one measurement to a block of gates, which becomes `if(c1==1) x q[2];` with one single bit register per result, as teleportation needs. Anything else is refused with a pointer to `--emit qasm3`. Every corpus program that fits is accepted by Qiskit's OpenQASM 2 parser and reads back into qirc with the same outcome probabilities.
 
+`--emit stim` writes a Clifford program as a [Stim](https://github.com/quantumlib/Stim) circuit for error correction tools. Rotations by quarter turns become `S`, `SQRT_X` or `SQRT_Y` gates, measurements become `M` and resets `R`, and an X, Y or Z gate that depends on one measurement becomes feedback such as `CX rec[-1] 2`. Stim numbers measurements in the order they happen, so after routing the records can come in a different order from the result numbers. With `--noisy` and a calibration the circuit carries the same noise the simulator uses: `DEPOLARIZE1` and `DEPOLARIZE2` after each gate, `M(p)` for readout errors, `X_ERROR` after a reset, and `PAULI_CHANNEL_1` for idle decoherence from T1 and T2. On 200 random programs, half with feedback and half with noise on `examples/line5.cal`, Stim's samples match qirc's to within 0.007 in total variation.
+
 ## Lowering
 
 The frontend parses the subset of textual LLVM IR that QIR producers emit: typed and opaque pointers, `inttoptr` and `getelementptr` constant expressions, parameter attributes, attribute groups, metadata, `phi`, `switch`, varargs calls, packed structs and quoted identifiers.
@@ -202,7 +205,7 @@ On `tests/corpus/pyqir_simple.ll`, `-O3` takes the circuit from 12 gates at dept
 
 ## Targeting hardware
 
-`--gates` rebuilds every gate from a target set: a preset such as `rz-sx-cx` for IBM style devices or `rz-ry-cz`, or any list of gates such as `rx,ry,cy`. `--exclude` removes gates from the full QIR set instead, and `--basis` is kept as a name for `--gates`. Multi qubit gates reduce to CNOTs and single qubit matrices first. The CNOT is then mapped onto whichever entangler the set has, and each single qubit matrix is rebuilt from Euler angles over two rotation axes, from one axis plus a fixed gate, or by an exact search over fixed gates such as `h,s,t`. A gate the set cannot express exactly is reported and left as written.
+`--gates` rebuilds every gate from a target set: a preset such as `rz-sx-cx` for IBM style devices or `rz-ry-cz`, or any list of gates such as `rx,ry,cy`. `--exclude` removes gates from the full QIR set instead, and `--basis` is kept as a name for `--gates`. Multi qubit gates reduce to CNOTs and single qubit matrices first. The CNOT is then mapped onto whichever entangler the set has, and each single qubit matrix is rebuilt from Euler angles over two rotation axes, from one axis plus a fixed gate, or by an exact search over fixed gates such as `h,s,t`. A gate the set cannot express exactly is reported and left as written. A Toffoli that a later identical Toffoli undoes, with only gates in between that use its three qubits as controls or only add phases to them, is lowered together with its partner as a pair of relative phase Toffolis, each 3 CNOTs and 4 T gates instead of 6 and 7, because the phases the two halves add cancel. A six control X gate built from a ladder of Toffolis on ancillas drops from 63 T gates and 54 CNOTs to 39 and 30 on `h,s,t,cx`. On 600 random programs full of such pairs, with phases, rotations and conflicting gates in between, `qirc diff` finds every result equivalent.
 
 ```
 $ qirc tests/corpus/base_profile_bell.ll --exclude h,cx --emit ir
@@ -334,10 +337,10 @@ All to all connectivity:
 | grover_3 | 3 | 4 / 39 / 21 | 24 / 85 / 53 | 20 / 140 / 86 | 24 / 89 / 55 | 23 / 154 / 95 |
 | grover_4 | 4 | 84 / 250 / 171 | 84 / 228 / 166 | 84 / 243 / 183 | 84 / 234 / 171 | 84 / 234 / 171 |
 | grover_5 | 5 | 288 / 941 / 681 | 288 / 788 / 607 | 288 / 849 / 662 | 288 / 732 / 603 | 288 / 732 / 603 |
-| adder_cdkm_4 | 9 | 24 / 24 / 21 | 64 / 151 / 114 | 47 / 130 / 88 | 50 / 121 / 88 | 50 / 121 / 88 |
-| adder_vbe_3 | 8 | 13 / 13 / 11 | 37 / 87 / 54 | 37 / 87 / 56 | 37 / 94 / 56 | 37 / 127 / 76 |
+| adder_cdkm_4 | 9 | 24 / 24 / 21 | 64 / 151 / 114 | 47 / 130 / 88 | 44 / 107 / 84 | 44 / 107 / 84 |
+| adder_vbe_3 | 8 | 13 / 13 / 11 | 37 / 87 / 54 | 37 / 87 / 56 | 25 / 63 / 41 | 25 / 85 / 55 |
 | adder_draper_4 | 8 | 48 / 122 / 74 | 40 / 123 / 67 | 40 / 107 / 57 | 43 / 94 / 53 | 40 / 110 / 60 |
-| total |  |  | 740 / 1952 / 1278 | 719 / 2055 / 1353 | 729 / 1821 / 1227 | 725 / 1935 / 1294 |
+| total |  |  | 740 / 1952 / 1278 | 719 / 2055 / 1353 | 711 / 1776 / 1208 | 707 / 1879 / 1269 |
 
 A line of qubits (`--coupling line:n`, Qiskit `CouplingMap.from_line`, tket `DefaultMappingPass`):
 
@@ -356,14 +359,14 @@ A line of qubits (`--coupling line:n`, Qiskit `CouplingMap.from_line`, tket `Def
 | grover_3 | 3 | 4 / 39 / 21 | 37 / 128 / 91 | 35 / 155 / 98 | 47 / 110 / 88 | 35 / 194 / 110 |
 | grover_4 | 4 | 84 / 250 / 171 | 165 / 402 / 294 | 171 / 330 / 259 | 209 / 365 / 263 | 171 / 542 / 359 |
 | grover_5 | 5 | 288 / 941 / 681 | 543 / 1409 / 893 | 639 / 1200 / 840 | 681 / 1123 / 867 | 597 / 1407 / 974 |
-| adder_cdkm_4 | 9 | 24 / 24 / 21 | 93 / 251 / 184 | 86 / 169 / 134 | 88 / 159 / 134 | 76 / 176 / 134 |
-| adder_vbe_3 | 8 | 13 / 13 / 11 | 66 / 160 / 101 | 79 / 129 / 91 | 80 / 137 / 95 | 70 / 202 / 120 |
+| adder_cdkm_4 | 9 | 24 / 24 / 21 | 93 / 251 / 184 | 86 / 169 / 134 | 78 / 141 / 123 | 66 / 163 / 127 |
+| adder_vbe_3 | 8 | 13 / 13 / 11 | 66 / 160 / 101 | 79 / 129 / 91 | 52 / 90 / 64 | 44 / 151 / 85 |
 | adder_draper_4 | 8 | 48 / 122 / 74 | 90 / 202 / 117 | 112 / 179 / 119 | 86 / 137 / 76 | 81 / 168 / 85 |
-| total |  |  | 1321 / 3638 / 2104 | 1602 / 2938 / 1937 | 1525 / 2619 / 1833 | 1330 / 3372 / 2093 |
+| total |  |  | 1321 / 3638 / 2104 | 1602 / 2938 / 1937 | 1487 / 2554 / 1791 | 1294 / 3308 / 2051 |
 
-All three tools remove SWAP gates by relabelling qubits, which qirc does with `--relabel`. On all to all connectivity plain qirc needs 10 more CNOTs than tket and 11 fewer than Qiskit, and has the fewest gates and the lowest depth of the three by a clear margin, mostly from phase folding. Routed on a line, qirc with `--cost cx` is within 1% of Qiskit on CNOTs with fewer gates and lower depth, and needs 17% fewer CNOTs than tket, and plain qirc has the fewest gates and the lowest depth.
+All three tools remove SWAP gates by relabelling qubits, which qirc does with `--relabel`. On all to all connectivity plain qirc needs 8 fewer CNOTs than tket and 29 fewer than Qiskit, and has the fewest gates and the lowest depth of the three by a clear margin, from phase folding and from lowering Toffolis that compute and later uncompute the same bit as relative phase Toffolis, which halves their CNOTs. Routed on a line, qirc with `--cost cx` needs 2% fewer CNOTs than Qiskit with fewer gates and lower depth, and 19% fewer than tket, and plain qirc has the fewest gates and the lowest depth.
 
-Compile time over the whole set is about 0.2 s for Qiskit, 19 s for tket and 0.7 s for qirc, or 2.6 s routed with `--cost cx`, counting a process start per circuit. To run it, install `qiskit` and `pytket` and build qirc in release mode:
+Compile time over the whole set is about 0.3 s for Qiskit, 26 s for tket and 0.9 s for qirc, or 2.9 s routed with `--cost cx`, counting a process start per circuit. To run it, install `qiskit` and `pytket` and build qirc in release mode:
 
 ```
 python bench/compare.py --qirc target/release/qirc
@@ -391,7 +394,9 @@ Straight line programs are evolved once and sampled. Programs that branch on a m
 
 A program with more than 20 qubits whose gates are all Clifford (H, S, the Paulis, SX, CNOT, CZ, CY, swap, and rotations by multiples of a quarter turn) runs on a stabilizer tableau instead, up to 5,000 qubits, with branches, resets and measurements. The tableau is stored row by row as bit words, so combining two rows costs a few popcounts, and a straight line program is prepared once and each shot measures a copy. A 1,000 qubit GHZ state takes under a second for 1,000 shots. `qirc diff` uses the same tableau for such programs, following each measurement that is not already determined and comparing final states through the reduced row echelon form of their stabilizer groups, so it can check a compile of a large Clifford circuit exactly.
 
-`--observable` prints the exact expectation value of a sum of Pauli strings, written like `Z0 Z1 + 0.5 X2 - 2*Y3`. Measurements at the end of the program are left out, so the value is taken on the state just before them, and a program that branches on mid circuit measurements is averaged exactly over every branch, weighted by its probability. On the teleportation example the teleported qubit gives 0.707107 for both `Z2` and `X2`, as `ry(pi/4)` should. A program without mid circuit measurements is not limited to 30 qubits: each Pauli string only depends on the gates in its backward light cone, so each is simulated on a small circuit over just the qubits of its cone. A 200 qubit layer of `ry` rotations and CNOT pairs gives `Z199 + X0 X1` exactly in 50 ms. A cone of Clifford gates is simulated on the stabilizer tableau instead, however wide it is: after basis changes and CNOTs fold the Pauli string onto one qubit, its value is 0 if measuring that qubit would be random and the sign of the deterministic outcome otherwise, so `Y0 Y1 X2 ... X999` on a 1000 qubit GHZ state gives -1.
+A program with more than 20 qubits whose gates only permute basis states (X, Y, Toffoli and other multi controlled X gates, swaps) or only add phases (Z, S, T, Rz, CZ and other controlled phases) runs on a plain bit vector instead, with no limit on its width, since such gates keep a basis state a basis state. Arithmetic like a ripple carry adder falls in this class even though its Toffolis are not Clifford: two 5000 bit numbers add on 10,002 qubits in 64 ms, and noise still applies, as a bit flip for X and Y errors and nothing for Z errors, which only change the phase. The run prints the circuit only when it has at most 200,000 cells of qubits by depth, and points to `--emit circuit` otherwise.
+
+`--observable` prints the exact expectation value of a sum of Pauli strings, written like `Z0 Z1 + 0.5 X2 - 2*Y3`. Measurements at the end of the program are left out, so the value is taken on the state just before them, and a program that branches on mid circuit measurements is averaged exactly over every branch, weighted by its probability. On the teleportation example the teleported qubit gives 0.707107 for both `Z2` and `X2`, as `ry(pi/4)` should. A program without mid circuit measurements is not limited to 30 qubits: each Pauli string only depends on the gates in its backward light cone, so each is simulated on a small circuit over just the qubits of its cone. A 200 qubit layer of `ry` rotations and CNOT pairs gives `Z199 + X0 X1` exactly in 50 ms. A cone of permutation and phase gates is a basis state, where a string with an X or Y gives 0 and a string of Z gives the sign of the parity of its bits. A cone of Clifford gates is simulated on the stabilizer tableau instead, however wide it is: after basis changes and CNOTs fold the Pauli string onto one qubit, its value is 0 if measuring that qubit would be random and the sign of the deterministic outcome otherwise, so `Y0 Y1 X2 ... X999` on a 1000 qubit GHZ state gives -1. A cone that is neither Clifford nor small enough for a state vector is lowered to `rz`, `sx` and `cx` and the Pauli string is pushed backwards through it in the Heisenberg picture: a CNOT maps each string to one string, a rotation splits a string that anticommutes with it into a cosine and a sine part, and at the start only strings of I and Z count. This stays exact while few rotations touch the cone, so `rz(0.3)`, `t` and `rx(0.2)` on a 100 qubit GHZ state give `X0 ... X99 + Z0 Z99` = 1.446627 in 80 ms, and it gives up once a term expands past 65536 strings.
 
 Other programs are limited to 30 qubits by the state vector. Larger programs can still be compiled and emitted.
 

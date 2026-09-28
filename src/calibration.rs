@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 
 use crate::ir::{Gate, GateKind, Op, Program};
+use crate::route::Coupling;
 
 const MAX_MITIGATED: usize = 20;
-use crate::route::Coupling;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Calibration {
@@ -18,8 +19,42 @@ pub struct Calibration {
     t2: HashMap<usize, f64>,
 }
 
-fn average<K>(map: &HashMap<K, f64>) -> f64 {
-    map.values().sum::<f64>() / map.len().max(1) as f64
+fn lookup<K: Eq + Hash>(map: &HashMap<K, f64>, key: K) -> f64 {
+    map.get(&key)
+        .copied()
+        .unwrap_or_else(|| map.values().sum::<f64>() / map.len().max(1) as f64)
+}
+
+#[derive(Default)]
+pub(crate) struct Clock {
+    free: Vec<Option<f64>>,
+    start: f64,
+}
+
+impl Clock {
+    pub(crate) fn begin(&mut self, calibration: &Calibration, op: &Op) -> Vec<(usize, [f64; 3])> {
+        let qubits: Vec<usize> = op.qubits().iter().map(|q| q.index()).collect();
+        if let Some(&top) = qubits.iter().max()
+            && top >= self.free.len()
+        {
+            self.free.resize(top + 1, None);
+        }
+        self.start = qubits
+            .iter()
+            .filter_map(|&q| self.free[q])
+            .fold(0.0, f64::max);
+        qubits
+            .iter()
+            .filter_map(|&q| self.free[q].map(|last| (q, calibration.idle(q, self.start - last))))
+            .collect()
+    }
+
+    pub(crate) fn end(&mut self, calibration: &Calibration, op: &Op) {
+        let end = self.start + calibration.duration(op);
+        for q in op.qubits() {
+            self.free[q.index()] = Some(end);
+        }
+    }
 }
 
 impl Calibration {
@@ -126,10 +161,7 @@ impl Calibration {
     }
 
     pub fn cx(&self, a: usize, b: usize) -> f64 {
-        self.cx
-            .get(&(a.min(b), a.max(b)))
-            .copied()
-            .unwrap_or_else(|| self.cx.values().sum::<f64>() / self.cx.len().max(1) as f64)
+        lookup(&self.cx, (a.min(b), a.max(b)))
     }
 
     pub fn timed(&self) -> bool {
@@ -137,22 +169,15 @@ impl Calibration {
     }
 
     fn cx_time(&self, a: usize, b: usize) -> f64 {
-        self.cx_time
-            .get(&(a.min(b), a.max(b)))
-            .copied()
-            .unwrap_or_else(|| average(&self.cx_time))
+        lookup(&self.cx_time, (a.min(b), a.max(b)))
     }
 
-    pub fn duration(&self, op: &Op) -> f64 {
+    fn duration(&self, op: &Op) -> f64 {
         match op {
             Op::Gate(gate) => {
                 let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
                 match wires[..] {
-                    [q] => self
-                        .single_time
-                        .get(&q)
-                        .copied()
-                        .unwrap_or_else(|| average(&self.single_time)),
+                    [q] => lookup(&self.single_time, q),
                     [a, b] if gate.kind == GateKind::Swap => 3.0 * self.cx_time(a, b),
                     [a, b] => self.cx_time(a, b),
                     _ => {
@@ -166,11 +191,9 @@ impl Calibration {
                     }
                 }
             }
-            Op::Measure { qubit, .. } | Op::Reset { qubit, .. } => self
-                .readout_time
-                .get(&qubit.index())
-                .copied()
-                .unwrap_or_else(|| average(&self.readout_time)),
+            Op::Measure { qubit, .. } | Op::Reset { qubit, .. } => {
+                lookup(&self.readout_time, qubit.index())
+            }
             _ => 0.0,
         }
     }
@@ -184,29 +207,15 @@ impl Calibration {
     }
 
     pub fn schedule<'a>(&self, ops: impl IntoIterator<Item = &'a Op>) -> (f64, f64) {
-        let mut clock: HashMap<usize, f64> = HashMap::new();
+        let mut clock = Clock::default();
         let mut loss = 0.0;
         for op in ops {
-            let qubits: Vec<usize> = op.qubits().iter().map(|q| q.index()).collect();
-            if qubits.is_empty() {
-                continue;
+            for (_, idle) in clock.begin(self, op) {
+                loss += -(-idle.iter().sum::<f64>()).ln_1p();
             }
-            let start = qubits
-                .iter()
-                .map(|q| clock.get(q).copied().unwrap_or(0.0))
-                .fold(0.0, f64::max);
-            for q in &qubits {
-                if let Some(&last) = clock.get(q) {
-                    let error: f64 = self.idle(*q, start - last).iter().sum();
-                    loss += -(-error).ln_1p();
-                }
-            }
-            let end = start + self.duration(op);
-            for q in qubits {
-                clock.insert(q, end);
-            }
+            clock.end(self, op);
         }
-        (clock.into_values().fold(0.0, f64::max), loss)
+        (clock.free.into_iter().flatten().fold(0.0, f64::max), loss)
     }
 
     pub fn mitigate(
