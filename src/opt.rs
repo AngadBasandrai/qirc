@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::mem;
 
 use crate::ir::*;
 use crate::phase;
@@ -180,47 +181,59 @@ fn rewrite_pairs(
     let mut hits = 0;
 
     for block in &mut program.blocks {
+        let mut ops: Vec<Option<Op>> = mem::take(&mut block.ops).into_iter().map(Some).collect();
         let mut index = 0;
 
-        while index < block.ops.len() {
-            let Some((partner, crossed, rewrite)) = pair_at(&block.ops, index, &mut decide) else {
+        while index < ops.len() {
+            let Some((partner, crossed, rewrite)) = pair_at(&ops, index, &mut decide) else {
                 index += 1;
                 continue;
             };
 
             match rewrite {
                 Rewrite::Replace(gate) if crossed => {
-                    block.ops[partner] = Op::Gate(gate);
-                    block.ops.remove(index);
+                    ops[partner] = Some(Op::Gate(gate));
+                    ops[index] = None;
                 }
                 Rewrite::Replace(gate) => {
-                    block.ops.remove(partner);
-                    block.ops[index] = Op::Gate(gate);
+                    ops[partner] = None;
+                    ops[index] = Some(Op::Gate(gate));
                 }
                 Rewrite::Drop => {
-                    block.ops.remove(partner);
-                    block.ops.remove(index);
+                    ops[partner] = None;
+                    ops[index] = None;
                 }
             }
             hits += 1;
-            index = index.saturating_sub(SCAN);
+            let mut back = 0;
+            while index > 0 && back < SCAN {
+                index -= 1;
+                if ops[index].is_some() {
+                    back += 1;
+                }
+            }
         }
+
+        block.ops = ops.into_iter().flatten().collect();
     }
 
     hits
 }
 
 fn pair_at(
-    ops: &[Op],
+    ops: &[Option<Op>],
     index: usize,
     decide: &mut impl FnMut(&Gate, &Gate) -> Option<Rewrite>,
 ) -> Option<(usize, bool, Rewrite)> {
-    let gate = ops[index].as_gate()?;
+    let gate = ops[index].as_ref()?.as_gate()?;
     let wires: Vec<QubitId> = gate.wires().collect();
     let mut crossed = false;
     let mut seen = 0;
 
     for (offset, op) in ops[index + 1..].iter().enumerate() {
+        let Some(op) = op else {
+            continue;
+        };
         if !op.qubits().iter().any(|q| wires.contains(q)) {
             continue;
         }

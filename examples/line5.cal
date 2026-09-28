@@ -13,3 +13,27 @@ readout 1 0.012
 readout 2 0.009
 readout 3 0.015
 readout 4 0.022
+time cx 0 1 420
+time cx 1 2 310
+time cx 2 3 330
+time cx 3 4 300
+time single 0 35
+time single 1 35
+time single 2 35
+time single 3 35
+time single 4 35
+time readout 0 800
+time readout 1 800
+time readout 2 800
+time readout 3 800
+time readout 4 800
+t1 0 45
+t1 1 120
+t1 2 150
+t1 3 110
+t1 4 95
+t2 0 30
+t2 1 100
+t2 2 130
+t2 3 90
+t2 4 70

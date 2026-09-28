@@ -500,3 +500,25 @@ attributes #0 = { "entry_point" "qir_profiles"="adaptive_profile" "required_num_
     let qir = codegen::emit_qir(&program).unwrap();
     assert!(qir.lines().next().unwrap().ends_with(r"\0A\07'"), "{qir}");
 }
+
+#[test]
+fn diagrams() {
+    let bell = compile(include_str!("corpus/base_profile_bell.ll"), 1);
+    assert_eq!(
+        qirc::draw::quantikz(&bell),
+        r"\begin{quantikz}
+\lstick{$q_{0}$} & \gate{H} & \ctrl{1} & \meter{} & \qw \\
+\lstick{$q_{1}$} & \qw & \targ{} & \meter{} & \qw
+\end{quantikz}
+"
+    );
+    let teleport = compile(include_str!("corpus/adaptive_teleport.ll"), 2);
+    let latex = qirc::draw::quantikz(&teleport);
+    assert!(latex.contains(r"\gate{R_y(\frac{\pi}{4})}"), "{latex}");
+    assert!(latex.contains(r"\slice{then\_x}"), "{latex}");
+    let svg = qirc::draw::svg(&bell);
+    assert!(svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"));
+    assert_eq!(svg.matches("class=\"wire\"").count(), 2);
+    assert_eq!(svg.matches("class=\"plus\"").count(), 1);
+    assert_eq!(svg.matches("M r").count(), 2);
+}

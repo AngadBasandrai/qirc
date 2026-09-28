@@ -1,6 +1,6 @@
 mod common;
 
-use std::f64::consts::FRAC_PI_8;
+use std::f64::consts::{FRAC_PI_4, FRAC_PI_8};
 
 use common::{compile, errors, final_state, run};
 use qirc::calibration::Calibration;
@@ -9,6 +9,7 @@ use qirc::cost;
 use qirc::diag::Severity;
 use qirc::driver::{self, Emit};
 use qirc::ir::*;
+use qirc::observable::{self, Observable};
 use qirc::route::{self, Coupling};
 use qirc::simulator::exec::{self, ExecConfig};
 use qirc::simulator::state::{self, State};
@@ -1123,6 +1124,7 @@ attributes #0 = { \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_n
             depth: 5,
             live: 2,
             success: None,
+            time: None,
         }
     );
 }
@@ -1353,4 +1355,94 @@ attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_
         "{correct} vs {estimate}"
     );
     assert_eq!(exec::execute(&program, config).counts.len(), 2);
+}
+
+#[test]
+fn expectations() {
+    let value = |source: &str, text: &str| {
+        observable::expectation(&compile(source, 1), &Observable::parse(text).unwrap()).unwrap()
+    };
+    for (text, expected) in [
+        ("Z0 Z1", 1.0),
+        ("X0 X1", 1.0),
+        ("Y0 Y1", -1.0),
+        ("Z0", 0.0),
+        ("0.5 X0 X1 - 2 Z0 Z1 + 3", 1.5),
+    ] {
+        assert!((value(BELL, text) - expected).abs() < 1e-9, "{text}");
+    }
+    let turn = FRAC_PI_4;
+    assert!((value(TELEPORT, "Z2") - turn.cos()).abs() < 1e-9);
+    assert!((value(TELEPORT, "X2") - turn.sin()).abs() < 1e-9);
+    assert!(value(TELEPORT, "Z0").abs() < 1e-9);
+    let program = compile(BELL, 1);
+    assert!(observable::expectation(&program, &Observable::parse("Z5").unwrap()).is_err());
+}
+
+#[test]
+fn idle_decoherence() {
+    let qubit = |i: usize| format!("%Qubit* inttoptr (i64 {i} to %Qubit*)");
+    let wait: String = (0..10)
+        .map(|_| format!("  call void @__quantum__qis__x__body({})\n", qubit(1)))
+        .collect();
+    let program = |tail: &str| {
+        format!(
+            "%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {{
+entry:
+  call void @__quantum__qis__h__body({})
+{wait}{tail}  ret void
+}}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__x__body(%Qubit*)
+declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+
+attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"required_num_qubits\"=\"2\" \"required_num_results\"=\"1\" }}
+",
+            qubit(0)
+        )
+    };
+    let times = "cx 0 1 0.01\ntime cx 0 1 400\ntime single 0 50\ntime single 1 50\n";
+    let steady = Calibration::parse(times).unwrap();
+    let decaying = Calibration::parse(&format!("{times}t1 0 10\nt2 0 10\n")).unwrap();
+    let linked = compile(
+        &program(&format!(
+            "  call void @__quantum__qis__cnot__body({}, {})\n",
+            qubit(0),
+            qubit(1)
+        )),
+        0,
+    );
+    let worst = |c: &Calibration| cost::analyse(&linked, Some(c)).worst;
+    assert_eq!(worst(&decaying).time, Some(900.0));
+    let error: f64 = decaying.idle(0, 450.0).iter().sum();
+    let ratio = worst(&decaying).success.unwrap() / worst(&steady).success.unwrap();
+    assert!(
+        (ratio - (1.0 - error)).abs() < 1e-12,
+        "{ratio} vs {}",
+        1.0 - error
+    );
+
+    let dephasing = Calibration::parse(&format!("{times}t1 0 100\nt2 0 1\n")).unwrap();
+    let echo = compile(
+        &program(&format!(
+            "  call void @__quantum__qis__cnot__body({1}, {0})\n  call void @__quantum__qis__h__body({0})\n  call void @__quantum__qis__mz__body({0}, %Result* null)\n",
+            qubit(0),
+            qubit(1)
+        )),
+        0,
+    );
+    let config = ExecConfig {
+        shots: 20_000,
+        seed: 9,
+        keep_state: false,
+    };
+    let counts = exec::execute_noisy(&echo, config, &dephasing).counts;
+    let flipped = counts.get("1").copied().unwrap_or(0) as f64 / 20_000.0;
+    let [_, y, z] = dephasing.idle(0, 450.0);
+    assert!((flipped - (y + z)).abs() < 0.02, "{flipped} vs {}", y + z);
 }

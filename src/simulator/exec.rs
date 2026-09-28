@@ -224,10 +224,15 @@ pub fn execute(program: &Program, config: ExecConfig) -> ExecOutcome {
         }
         outcome
     } else {
-        let (mut outcome, state) = execute_sampled(program, config, State::new(qubits));
-        outcome.final_state = config.keep_state.then_some(state);
-        outcome
+        execute_vector(program, config)
     }
+}
+
+pub fn execute_vector(program: &Program, config: ExecConfig) -> ExecOutcome {
+    let (mut outcome, state) =
+        execute_sampled(program, config, State::new(program.num_qubits as usize));
+    outcome.final_state = config.keep_state.then_some(state);
+    outcome
 }
 
 fn control_mask(gate: &Gate) -> u64 {
@@ -388,6 +393,8 @@ fn shots<S: Backend>(
 
     for shot in 0..shots {
         let mut state = fresh();
+        let mut clock: Vec<Option<f64>> = vec![None; program.num_qubits as usize];
+        let mut started = 0.0;
         let run = run_with(
             program,
             &mut state,
@@ -396,9 +403,30 @@ fn shots<S: Backend>(
                 let flipped = noise.is_some_and(|c| rng.next_unit() < c.readout(qubit));
                 Some(outcome ^ flipped)
             },
-            &mut |state, gate| {
-                if let Some(calibration) = noise {
+            &mut |state, op, done| {
+                let Some(calibration) = noise else {
+                    return;
+                };
+                let qubits: Vec<usize> = op.qubits().iter().map(|q| q.index()).collect();
+                if !done {
+                    started = qubits.iter().filter_map(|&q| clock[q]).fold(0.0, f64::max);
+                    for &q in &qubits {
+                        if let Some(last) = clock[q] {
+                            let [x, y, z] = calibration.idle(q, started - last);
+                            let draw = errors.next_unit();
+                            if draw < x + y + z {
+                                state.pauli(q, draw < x + y, draw >= x);
+                            }
+                        }
+                    }
+                    return;
+                }
+                if let Op::Gate(gate) = op {
                     depolarize(state, gate, calibration, &mut errors);
+                }
+                let end = started + calibration.duration(op);
+                for q in qubits {
+                    clock[q] = Some(end);
                 }
             },
         );
@@ -446,7 +474,7 @@ pub(crate) fn run_with<S: Backend>(
     program: &Program,
     state: &mut S,
     measure: &mut dyn FnMut(&mut S, usize) -> Option<bool>,
-    after: &mut dyn FnMut(&mut S, &Gate),
+    hook: &mut dyn FnMut(&mut S, &Op, bool),
 ) -> ShotRun {
     let mut results = vec![false; program.num_results as usize];
     let mut values = HashMap::new();
@@ -491,28 +519,35 @@ pub(crate) fn run_with<S: Backend>(
         for op in &block.ops {
             match op {
                 Op::Gate(gate) => {
+                    hook(state, op, false);
                     apply_gate(state, gate, &values);
-                    after(state, gate);
+                    hook(state, op, true);
                 }
 
                 Op::Measure { qubit, result, .. } => {
+                    hook(state, op, false);
                     let Some(outcome) = measure(state, qubit.index()) else {
                         aborted = true;
                         break 'run;
                     };
+                    hook(state, op, true);
                     if result.index() < results.len() {
                         results[result.index()] = outcome;
                     }
                 }
 
-                Op::Reset { qubit, .. } => match measure(state, qubit.index()) {
-                    Some(true) => state.flip(qubit.index()),
-                    Some(false) => {}
-                    None => {
-                        aborted = true;
-                        break 'run;
+                Op::Reset { qubit, .. } => {
+                    hook(state, op, false);
+                    match measure(state, qubit.index()) {
+                        Some(true) => state.flip(qubit.index()),
+                        Some(false) => {}
+                        None => {
+                            aborted = true;
+                            break 'run;
+                        }
                     }
-                },
+                    hook(state, op, true);
+                }
 
                 Op::Assign {
                     expr: Expr::Phi(_), ..

@@ -370,8 +370,8 @@ footer a { color: var(--accent); }
       <label class="field" for="example">Example
         <select id="example"></select>
       </label>
-      <button type="button" class="ghost" id="open">Open .ll</button>
-      <input type="file" id="file" accept=".ll,.txt,text/plain" hidden>
+      <button type="button" class="ghost" id="open">Open file</button>
+      <input type="file" id="file" accept=".ll,.qasm,.txt,text/plain" hidden>
       <button type="button" class="ghost" id="share" hidden>Copy link</button>
     </div>
   </header>
@@ -385,6 +385,7 @@ footer a { color: var(--accent); }
         <button type="button" role="radio" data-emit="qir">qir</button>
         <button type="button" role="radio" data-emit="ir">ir</button>
         <button type="button" role="radio" data-emit="json">json</button>
+        <button type="button" role="radio" data-emit="quantikz">latex</button>
         <button type="button" role="radio" data-emit="cost">cost</button>
         <button type="button" role="radio" data-emit="diff">diff</button>
       </div>
@@ -498,7 +499,7 @@ footer a { color: var(--accent); }
     </section>
   </div>
 
-  <footer>Reads Base Profile, Adaptive Profile, Q# and PyQIR output. <code>diff</code> checks the compiled program against the original at <code>-O0</code>, branch by branch. Simulation is limited to 20 qubits here. Drop a <code>.ll</code> file on the editor to open it. <a href="https://github.com/AngadBasandrai/qirc">Source on GitHub</a>.</footer>
+  <footer>Reads Base Profile, Adaptive Profile, Q# and PyQIR output and OpenQASM 2 and 3. <code>diff</code> checks the compiled program against the original at <code>-O0</code>, branch by branch. Simulation is limited to 20 qubits here. Drop a <code>.ll</code> or <code>.qasm</code> file on the editor to open it. <a href="https://github.com/AngadBasandrai/qirc">Source on GitHub</a>.</footer>
 </div>
 
 <script type="text/plain" id="bell" data-example="Bell pair, Base Profile" data-file="bell.ll">
@@ -608,6 +609,24 @@ attributes #1 = { "irreversible" }
 !1 = !{i32 7, !"qir_minor_version", i32 0}
 !2 = !{i32 1, !"dynamic_qubit_management", i1 false}
 !3 = !{i32 1, !"dynamic_result_management", i1 false}
+</script>
+<script type="text/plain" id="qasm" data-example="Teleportation in OpenQASM 3" data-file="teleport.qasm">
+OPENQASM 3.0;
+include "stdgates.inc";
+
+qubit[3] q;
+bit[3] c;
+
+ry(pi / 4) q[0];
+h q[1];
+cx q[1], q[2];
+cx q[0], q[1];
+h q[0];
+c[0] = measure q[0];
+c[1] = measure q[1];
+if (c[1]) x q[2];
+if (c[0]) z q[2];
+c[2] = measure q[2];
 </script>
 <script type="text/plain" id="rus" data-example="Repeat until success, a loop" data-file="repeat.ll">
 ; ModuleID = 'repeat_until_success'
@@ -888,9 +907,9 @@ onmessage = async (event) => {
 };
 `;
 
-const EMITS = ["run", "circuit", "qasm3", "qir", "ir", "json", "cost", "diff"];
+const EMITS = ["run", "circuit", "qasm3", "qir", "ir", "json", "quantikz", "cost", "diff"];
 const CONTROLS = ["opt", "gates", "resynth", "cost", "coupling", "relabel", "shots", "seed"];
-const EXTENSIONS = { qasm3: "qasm", qir: "ll", json: "json", ir: "txt", circuit: "txt", cost: "txt", run: "txt", diff: "txt" };
+const EXTENSIONS = { qasm3: "qasm", qir: "ll", json: "json", ir: "txt", circuit: "txt", quantikz: "tex", cost: "txt", run: "txt", diff: "txt" };
 const MAX_HIGHLIGHT = 400000;
 const MAX_DRAWN = 4000;
 
@@ -942,7 +961,7 @@ const TOKENS = new RegExp(
     '("(?:[^"\\\\\\n]|\\\\.)*")',
     "(@__quantum__[A-Za-z0-9_.]+)",
     '([@%](?:[-A-Za-z0-9_.$]+|"(?:[^"\\\\]|\\\\.)*"))',
-    "\\b(define|declare|call|tail|ret|br|label|switch|type|opaque|attributes|inttoptr|ptrtoint|to|void|i1|i8|i16|i32|i64|double|float|ptr|null|true|false|icmp|fcmp|add|sub|mul|sdiv|udiv|srem|urem|and|or|xor|shl|lshr|ashr|fadd|fsub|fmul|fdiv|phi|select|load|store|alloca|getelementptr|inbounds|zext|sext|trunc|bitcast|sitofp|uitofp|fptosi|unreachable|eq|ne|slt|sle|sgt|sge|ult|ule|ugt|uge|oeq|one|olt|ole|ogt|oge|global|constant|internal|private|nounwind|source_filename|target)\\b",
+    "\\b(define|declare|call|tail|ret|br|label|switch|type|opaque|attributes|inttoptr|ptrtoint|to|void|i1|i8|i16|i32|i64|double|float|ptr|null|true|false|icmp|fcmp|add|sub|mul|sdiv|udiv|srem|urem|and|or|xor|shl|lshr|ashr|fadd|fsub|fmul|fdiv|phi|select|load|store|alloca|getelementptr|inbounds|zext|sext|trunc|bitcast|sitofp|uitofp|fptosi|unreachable|eq|ne|slt|sle|sgt|sge|ult|ule|ugt|uge|oeq|one|olt|ole|ogt|oge|global|constant|internal|private|nounwind|source_filename|target|OPENQASM|include|qubit|bit|qreg|creg|gate|measure|reset|barrier|if|else|pi)\\b",
     "(#\\d+)",
     "(-?\\b(?:0x[0-9A-Fa-f]+|\\d+(?:\\.\\d+)?(?:e[-+]?\\d+)?)\\b)",
   ].join("|"),
@@ -1182,7 +1201,7 @@ async function run() {
   queued = false;
   const tokens = words(command.value);
   const main = tokens.includes("--color") ? tokens.join(" ") : [...tokens, "--color", "always"].join(" ");
-  const file = tokens.find((t) => t.endsWith(".ll"));
+  const file = tokens.find((t) => /\.(ll|qasm)$/.test(t));
   const jobs = [main];
   if (file) jobs.push(jsonJob(tokens), [file, "-O0", "--emit", "json", "--color", "never"].join(" "));
   const reveal = setTimeout(() => ($("stop").hidden = false), 400);
@@ -1530,7 +1549,7 @@ async function start() {
   if (saved && EMITS.includes(saved.emit)) emit = saved.emit;
   if (saved && ["text", "circuit", "results"].includes(saved.view)) view = saved.view;
   if (shared && typeof shared.source === "string" && typeof shared.command === "string") {
-    const file = words(shared.command).find((t) => t.endsWith(".ll")) || "shared.ll";
+    const file = words(shared.command).find((t) => /\.(ll|qasm)$/.test(t)) || "shared.ll";
     load(addFile(file, shared.source));
     showEmit();
     command.value = shared.command;
@@ -1623,7 +1642,7 @@ if (!framed) {
   $("share").hidden = !("CompressionStream" in window);
   $("download").addEventListener("click", () => {
     if (!last) return;
-    const base = current.file.replace(/\.ll$/, "");
+    const base = current.file.replace(/\.(ll|qasm)$/, "");
     const tokens = words(command.value);
     const kind = tokens[tokens.indexOf("--emit") + 1];
     const extension = tokens.includes("--emit") ? EXTENSIONS[kind] || "txt" : "txt";

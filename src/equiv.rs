@@ -70,6 +70,19 @@ pub struct Branch {
     state: Final,
 }
 
+impl Branch {
+    pub fn probability(&self) -> f64 {
+        self.probability
+    }
+
+    pub fn vector(&self) -> Option<&State> {
+        match &self.state {
+            Final::Vector(state) if self.paths == 1 => Some(state),
+            _ => None,
+        }
+    }
+}
+
 pub struct Outcomes {
     pub branches: BTreeMap<String, Branch>,
     pub unexplored: f64,
@@ -112,7 +125,7 @@ fn explore_with<S: Explore>(program: &Program) -> Outcomes {
                 state.settle(qubit, outcome);
                 Some(outcome)
             },
-            &mut |_, _| {},
+            &mut |_, _, _| {},
         );
 
         if let Some(one) = fork {
