@@ -26,9 +26,9 @@ enum Token {
     Symbol(&'static str),
 }
 
-const SYMBOLS: [&str; 30] = [
-    "->", "==", "!=", "&&", "||", ">=", "<=", ">", "<", "%", "|", "&", "^", "~", ";", ",", "(",
-    ")", "[", "]", "{", "}", "=", "+", "-", "*", "/", "!", "@", ":",
+const SYMBOLS: [&str; 31] = [
+    "**", "->", "==", "!=", "&&", "||", ">=", "<=", ">", "<", "%", "|", "&", "^", "~", ";", ",",
+    "(", ")", "[", "]", "{", "}", "=", "+", "-", "*", "/", "!", "@", ":",
 ];
 
 fn lex(source: &str) -> Result<Vec<(Token, Span)>, Diagnostic> {
@@ -132,6 +132,8 @@ impl Angle {
                     '+' => a + b,
                     '-' => a - b,
                     '*' => a * b,
+                    '%' => a % b,
+                    '^' => a.powf(b),
                     _ => a / b,
                 }
             }
@@ -160,7 +162,7 @@ impl Angle {
 #[derive(Clone)]
 struct Wire {
     name: String,
-    index: Option<usize>,
+    index: Option<Angle>,
     span: Span,
 }
 
@@ -251,12 +253,29 @@ impl Parser<'_> {
         }
     }
 
-    fn integer(&mut self) -> Result<usize, Diagnostic> {
-        match self.next() {
-            Some((Token::Number(n), _)) if n >= 0.0 && n.fract() == 0.0 => Ok(n as usize),
-            _ => {
-                self.at -= 1;
-                Err(Diagnostic::error("expected a whole number").primary(self.span(), "here"))
+    fn skip_body(&mut self) -> Result<(), Diagnostic> {
+        let mut depth = 0usize;
+        loop {
+            let closes = match self.peek() {
+                None => {
+                    return Err(
+                        Diagnostic::error("the loop body never ends").primary(self.span(), "here")
+                    );
+                }
+                Some(Token::Symbol("{")) => {
+                    depth += 1;
+                    false
+                }
+                Some(Token::Symbol("}")) => {
+                    depth = depth.saturating_sub(1);
+                    depth == 0
+                }
+                Some(Token::Symbol(";")) => depth == 0,
+                _ => false,
+            };
+            self.at += 1;
+            if closes && !self.word("else") {
+                return Ok(());
             }
         }
     }
@@ -273,8 +292,14 @@ impl Parser<'_> {
 
     fn term(&mut self) -> Result<Angle, Diagnostic> {
         let mut left = self.unary()?;
-        while self.symbol("*") || self.symbol("/") {
-            let op = if self.symbol("*") { '*' } else { '/' };
+        while self.symbol("*") || self.symbol("/") || self.symbol("%") {
+            let op = if self.symbol("*") {
+                '*'
+            } else if self.symbol("/") {
+                '/'
+            } else {
+                '%'
+            };
             self.at += 1;
             left = Angle::Binary(op, Box::new(left), Box::new(self.unary()?));
         }
@@ -288,7 +313,13 @@ impl Parser<'_> {
             );
         }
         self.nesting += 1;
-        let angle = self.operand_angle();
+        let mut angle = self.operand_angle();
+        if angle.is_ok() && self.symbol("**") {
+            self.at += 1;
+            angle = self.unary().and_then(|power| {
+                angle.map(|base| Angle::Binary('^', Box::new(base), Box::new(power)))
+            });
+        }
         self.nesting -= 1;
         angle
     }
@@ -330,7 +361,7 @@ impl Parser<'_> {
         let (name, span) = self.name()?;
         let index = if self.symbol("[") {
             self.at += 1;
-            let index = self.integer()?;
+            let index = self.expr()?;
             self.expect("]")?;
             Some(index)
         } else {
@@ -378,6 +409,7 @@ struct Builder {
     measured: Vec<bool>,
     branches: usize,
     emitted: usize,
+    env: HashMap<String, f64>,
 }
 
 fn op(kind: GateKind, controls: &[usize], targets: &[usize], params: &[f64], span: Span) -> Op {
@@ -454,6 +486,18 @@ impl Builder {
         Ok(())
     }
 
+    fn whole(&self, angle: &Angle, span: Span) -> Result<usize, Diagnostic> {
+        let value = angle.eval(&self.env)?;
+        if value >= 0.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX) {
+            Ok(value as usize)
+        } else {
+            Err(
+                Diagnostic::error(format!("{value} is not a whole number of at least 0"))
+                    .primary(span, "here"),
+            )
+        }
+    }
+
     fn resolve(&self, operand: &Wire, kind: Kind) -> Result<Vec<usize>, Diagnostic> {
         let noun = if kind == Kind::Qubit { "qubit" } else { "bit" };
         let register = self
@@ -467,7 +511,12 @@ impl Builder {
                 ))
                 .primary(operand.span, "unknown here")
             })?;
-        match operand.index {
+        let index = operand
+            .index
+            .as_ref()
+            .map(|index| self.whole(index, operand.span))
+            .transpose()?;
+        match index {
             Some(i) if i < register.size => Ok(vec![register.offset + i]),
             Some(i) => Err(Diagnostic::error(format!(
                 "index {i} is out of range for `{}`, which has {} {noun}s",
@@ -706,7 +755,8 @@ impl Builder {
                 .primary(parser.span(), "here"));
             }
             parser.at += 1;
-            let value = parser.integer()?;
+            let at = parser.span();
+            let value = self.whole(&parser.expr()?, at)?;
             if bits.len() < usize::BITS as usize && value >> bits.len() != 0 {
                 return Err(Diagnostic::error(format!(
                     "{value} does not fit in {} bit(s)",
@@ -737,7 +787,7 @@ impl Builder {
         let checks = self.condition(parser)?;
         let then = self.block(format!("then_{tag}"));
         let join = self.block(format!("join_{tag}"));
-        let mut from = self.current;
+        let from = self.current;
         let else_block = {
             self.current = then;
             self.body(parser, depth)?;
@@ -753,9 +803,22 @@ impl Builder {
                 join
             }
         };
+        self.chain(from, &checks, then, else_block, tag);
+        self.current = join;
+        Ok(())
+    }
+
+    fn chain(
+        &mut self,
+        mut from: usize,
+        checks: &[(usize, bool)],
+        pass: usize,
+        fail: usize,
+        tag: usize,
+    ) {
         for (index, &(bit, expected)) in checks.iter().enumerate() {
             let next = if index + 1 == checks.len() {
-                then
+                pass
             } else {
                 self.block(format!("check_{tag}_{}", index + 1))
             };
@@ -767,11 +830,7 @@ impl Builder {
                 expr: Expr::ReadResult(ResultId(bit as u32)),
                 span: Span::DUMMY,
             });
-            let (yes, no) = if expected {
-                (next, else_block)
-            } else {
-                (else_block, next)
-            };
+            let (yes, no) = if expected { (next, fail) } else { (fail, next) };
             self.program.blocks[from].term = Term::CondBr {
                 cond: Operand::Value(value),
                 if_true: BlockId(yes as u32),
@@ -779,7 +838,138 @@ impl Builder {
             };
             from = next;
         }
-        self.current = join;
+    }
+
+    fn repeat_while(&mut self, parser: &mut Parser, depth: usize) -> Result<(), Diagnostic> {
+        self.adaptive = true;
+        self.branches += 1;
+        let tag = self.branches;
+        let head = self.block(format!("while_{tag}"));
+        let body = self.block(format!("loop_{tag}"));
+        let done = self.block(format!("done_{tag}"));
+        self.program.blocks[self.current].term = Term::Br(BlockId(head as u32));
+        let checks = self.condition(parser)?;
+        self.chain(head, &checks, body, done, tag);
+        self.current = body;
+        self.body(parser, depth)?;
+        self.program.blocks[self.current].term = Term::Br(BlockId(head as u32));
+        self.current = done;
+        Ok(())
+    }
+
+    fn range(&self, parser: &mut Parser) -> Result<Vec<f64>, Diagnostic> {
+        let span = parser.span();
+        if parser.symbol("{") {
+            parser.at += 1;
+            let mut values = vec![parser.expr()?.eval(&self.env)?];
+            while parser.symbol(",") {
+                parser.at += 1;
+                values.push(parser.expr()?.eval(&self.env)?);
+            }
+            parser.expect("}")?;
+            return Ok(values);
+        }
+        parser.expect("[")?;
+        let mut bounds = vec![parser.expr()?.eval(&self.env)?];
+        while parser.symbol(":") {
+            parser.at += 1;
+            bounds.push(parser.expr()?.eval(&self.env)?);
+        }
+        parser.expect("]")?;
+        let (start, step, end) = match bounds[..] {
+            [start, end] => (start, 1.0, end),
+            [start, step, end] if step != 0.0 => (start, step, end),
+            _ => {
+                return Err(Diagnostic::error(
+                    "a range is written [start:end] or [start:step:end] with a step other than 0",
+                )
+                .primary(span, "here"));
+            }
+        };
+        let count = ((end - start) / step).floor() + 1.0;
+        if count > MAX_OPS as f64 {
+            return Err(
+                Diagnostic::error(format!("the loop runs more than {MAX_OPS} times"))
+                    .primary(span, "here"),
+            );
+        }
+        Ok((0..count.max(0.0) as usize)
+            .map(|k| start + k as f64 * step)
+            .collect())
+    }
+
+    fn repeat_for(&mut self, parser: &mut Parser, depth: usize) -> Result<(), Diagnostic> {
+        let (first, _) = parser.name()?;
+        if parser.symbol("[") {
+            parser.at += 1;
+            parser.expr()?;
+            parser.expect("]")?;
+        }
+        let name = if parser.word("in") {
+            first
+        } else {
+            parser.name()?.0
+        };
+        if !parser.word("in") {
+            return Err(Diagnostic::error("expected `in`").primary(parser.span(), "here"));
+        }
+        parser.at += 1;
+        let values = self.range(parser)?;
+        let start = parser.at;
+        let saved = self.env.get(&name).copied();
+        let mut end = None;
+        for value in values {
+            self.budget(0, parser.span())?;
+            parser.at = start;
+            self.env.insert(name.clone(), value);
+            self.body(parser, depth)?;
+            end = Some(parser.at);
+        }
+        match saved {
+            Some(value) => self.env.insert(name, value),
+            None => self.env.remove(&name),
+        };
+        match end {
+            Some(at) => {
+                parser.at = at;
+                Ok(())
+            }
+            None => parser.skip_body(),
+        }
+    }
+
+    fn constant(&mut self, parser: &mut Parser, word: &str) -> Result<(), Diagnostic> {
+        let ty = if word == "const" {
+            parser.name()?.0
+        } else {
+            word.to_string()
+        };
+        if !matches!(ty.as_str(), "int" | "uint" | "float" | "angle") {
+            return Err(Diagnostic::error(format!(
+                "`{ty}` values are not supported, only int, uint, float and angle"
+            ))
+            .primary(parser.span(), "here"));
+        }
+        if parser.symbol("[") {
+            parser.at += 1;
+            parser.expr()?;
+            parser.expect("]")?;
+        }
+        let (name, span) = parser.name()?;
+        if !parser.symbol("=") {
+            return Err(Diagnostic::error(format!(
+                "`{name}` needs a value, since qirc reads classical values that are set once"
+            ))
+            .primary(span, "declared here"));
+        }
+        parser.at += 1;
+        let value = parser.expr()?.eval(&self.env)?;
+        parser.expect(";")?;
+        if self.env.contains_key(&name) || self.registers.contains_key(&name) {
+            return Err(Diagnostic::error(format!("`{name}` is already declared"))
+                .primary(span, "declared again here"));
+        }
+        self.env.insert(name, value);
         Ok(())
     }
 
@@ -826,14 +1016,15 @@ impl Builder {
                 if word == "qreg" || word == "creg" {
                     let (name, span) = parser.name()?;
                     parser.expect("[")?;
-                    let size = parser.integer()?;
+                    let size = self.whole(&parser.expr()?, span)?;
                     parser.expect("]")?;
                     parser.expect(";")?;
                     self.declare(name, kind, size, true, span)?;
                 } else {
                     let size = if parser.symbol("[") {
                         parser.at += 1;
-                        let size = parser.integer()?;
+                        let at = parser.span();
+                        let size = self.whole(&parser.expr()?, at)?;
                         parser.expect("]")?;
                         Some(size)
                     } else {
@@ -887,11 +1078,13 @@ impl Builder {
                     },
                 );
             }
-            "bool" | "int" | "uint" | "float" | "angle" | "complex" | "output" | "input"
-            | "const" | "while" | "for" | "def" | "let" | "duration" | "stretch" | "delay"
-            | "box" => {
+            "const" | "int" | "uint" | "float" | "angle" => self.constant(parser, &word)?,
+            "for" => self.repeat_for(parser, depth)?,
+            "while" => self.repeat_while(parser, depth)?,
+            "bool" | "complex" | "output" | "input" | "def" | "let" | "duration" | "stretch"
+            | "delay" | "box" | "break" | "continue" | "return" => {
                 return Err(Diagnostic::error(format!(
-                    "`{word}` is not supported yet: qirc reads OpenQASM gates, registers, measurements, resets and `if` on bits"
+                    "`{word}` is not supported yet: qirc reads OpenQASM gates, registers, measurements, resets, constants, `if`, `for` and `while`"
                 ))
                 .primary(span, "unsupported here"));
             }
@@ -930,6 +1123,12 @@ impl Builder {
                 parser.expect(";")?;
             }
             "if" => self.branch(parser, depth)?,
+            _ if self.env.contains_key(&word) => {
+                return Err(Diagnostic::error(format!(
+                    "`{word}` cannot change, since qirc reads classical values that are set once"
+                ))
+                .primary(span, "assigned here"));
+            }
             _ if parser.symbol("=")
                 || parser.symbol("[")
                     && self
@@ -955,7 +1154,8 @@ impl Builder {
             }
             _ => {
                 let call = parser.call(word, span)?;
-                self.apply(&call, &HashMap::new(), &HashMap::new(), 0)?;
+                let env = self.env.clone();
+                self.apply(&call, &env, &HashMap::new(), 0)?;
             }
         }
         Ok(())
@@ -990,6 +1190,7 @@ pub fn lower(source: &str) -> (Program, Vec<Diagnostic>) {
         measured: Vec::new(),
         branches: 0,
         emitted: 0,
+        env: HashMap::new(),
     };
     builder.block("entry".into());
     let prelude = lex(PRELUDE).unwrap();

@@ -1,6 +1,8 @@
 mod common;
 
-use common::{compile, errors, run};
+use std::f64::consts::PI;
+
+use common::{compile, errors, final_state, run};
 use qirc::calibration::Calibration;
 use qirc::driver;
 use qirc::equiv;
@@ -126,8 +128,8 @@ fn errors_point_at_source() {
         ),
         ("OPENQASM 3.0;\nqubit[2] q;\nh q[2];\n", "out of range"),
         (
-            "OPENQASM 3.0;\nqubit q;\nint x = 1;\n",
-            "`int` is not supported yet",
+            "OPENQASM 3.0;\nqubit q;\nbool x = true;\n",
+            "`bool` is not supported yet",
         ),
         (
             "OPENQASM 3.0;\nqubit[2] q;\ncx q[0];\n",
@@ -251,4 +253,76 @@ measure q[2] -> c2[0];
     assert!(qirc::stim::emit(&teleport, Some(&calibration)).is_err());
     let rotation = compile("OPENQASM 2.0;\nqreg q[1];\nrx(0.3) q[0];\n", 0);
     assert!(qirc::stim::emit(&rotation, None).is_err());
+}
+
+#[test]
+fn loops() {
+    let looped = compile(
+        "OPENQASM 3.0;
+include \"stdgates.inc\";
+const int n = 5;
+qubit[n] q;
+x q[0];
+ry(0.3) q[2];
+for int i in [0:n - 1] {
+  h q[i];
+  for int j in [i + 1:n - 1] {
+    cp(pi / 2 ** (j - i)) q[j], q[i];
+  }
+}
+for uint k in {0, 1} swap q[k], q[n - 1 - k];
+for int dead in [3:2] { x q[0]; }
+",
+        0,
+    );
+    let mut flat = String::from(
+        "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[5];\nx q[0];\nry(0.3) q[2];\n",
+    );
+    for i in 0..5 {
+        flat += &format!("h q[{i}];\n");
+        for j in i + 1..5 {
+            flat += &format!("cu1({:?}) q[{j}], q[{i}];\n", PI / 2f64.powi(j - i));
+        }
+    }
+    flat += "swap q[0], q[4];\nswap q[1], q[3];\n";
+    let (a, b) = (final_state(&looped), final_state(&compile(&flat, 0)));
+    for basis in 0..a.len() {
+        assert!((a.amplitude(basis) - b.amplitude(basis)).norm() < 1e-9);
+    }
+
+    let repeat = compile(
+        "OPENQASM 3.0;
+include \"stdgates.inc\";
+qubit q;
+qubit a;
+bit r;
+bit out;
+h a;
+cx a, q;
+r = measure a;
+while (r) {
+  reset a;
+  h a;
+  cx a, q;
+  r = measure a;
+}
+out = measure q;
+",
+        1,
+    );
+    let counts = run(&repeat, 30_000, 2).counts;
+    let flipped = counts.get("01").copied().unwrap_or(0) as f64 / 30_000.0;
+    assert!((flipped - 1.0 / 3.0).abs() < 0.01, "{counts:?}");
+
+    for (source, message) in [
+        ("OPENQASM 3.0;\nint k;\n", "needs a value"),
+        ("OPENQASM 3.0;\nconst int n = 2;\nn = 3;\n", "cannot change"),
+        (
+            "OPENQASM 3.0;\nqubit q;\nfor int i in [0:0:3] x q;\n",
+            "step other than 0",
+        ),
+    ] {
+        let found = errors(&driver::compile(source, 1)).join("\n");
+        assert!(found.contains(message), "{found}");
+    }
 }
