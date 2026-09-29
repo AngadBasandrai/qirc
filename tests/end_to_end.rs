@@ -1652,3 +1652,81 @@ creg s[{}];
     assert_eq!(value(&format!("Z{} Z{out}", y(5))), Ok(sign(5) * sign(64)));
     assert_eq!(value(&format!("X{}", y(5))), Ok(0.0));
 }
+
+#[test]
+fn recursion() {
+    let module = |helper: &str, main: &str| {
+        format!(
+            "%Qubit = type opaque
+%Result = type opaque
+
+{helper}
+
+define void @main() #0 {{
+entry:
+{main}  ret void
+}}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__x__body(%Qubit*)
+declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+declare void @__quantum__qis__reset__body(%Qubit*)
+declare i1 @__quantum__qis__read_result__body(%Result*)
+
+attributes #0 = {{ \"entry_point\" \"qir_profiles\"=\"adaptive_profile\" \"required_num_qubits\"=\"2\" \"required_num_results\"=\"2\" }}
+"
+        )
+    };
+    let attempt = |after: &str| {
+        format!(
+            "define void @attempt(%Qubit* %q, %Qubit* %a, %Result* %r) {{
+entry:
+  call void @__quantum__qis__h__body(%Qubit* %a)
+  call void @__quantum__qis__cnot__body(%Qubit* %a, %Qubit* %q)
+  call void @__quantum__qis__mz__body(%Qubit* %a, %Result* %r)
+  %one = call i1 @__quantum__qis__read_result__body(%Result* %r)
+  br i1 %one, label %again, label %done
+again:
+  call void @__quantum__qis__reset__body(%Qubit* %a)
+  call void @attempt(%Qubit* %q, %Qubit* %a, %Result* %r)
+{after}  ret void
+done:
+  ret void
+}}"
+        )
+    };
+    let call =
+        "  call void @attempt(%Qubit* null, %Qubit* inttoptr (i64 1 to %Qubit*), %Result* null)
+  call void @__quantum__qis__mz__body(%Qubit* null, %Result* inttoptr (i64 1 to %Result*))
+";
+    let looped = compile(&module(&attempt(""), call), 1);
+    let counts = run(&looped, 30_000, 3).counts;
+    let flipped = counts.get("01").copied().unwrap_or(0) as f64 / 30_000.0;
+    assert!((flipped - 1.0 / 3.0).abs() < 0.01, "{counts:?}");
+
+    let stuck = module(
+        &attempt("  call void @__quantum__qis__x__body(%Qubit* %q)\n"),
+        call,
+    );
+    let found = errors(&driver::compile(&stuck, 1)).join("\n");
+    assert!(found.contains("depends on a measurement"), "{found}");
+
+    let climb = "define void @climb(i64 %n) {
+entry:
+  %done = icmp eq i64 %n, 0
+  br i1 %done, label %stop, label %more
+more:
+  call void @__quantum__qis__x__body(%Qubit* null)
+  %next = sub i64 %n, 1
+  call void @climb(i64 %next)
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+  ret void
+stop:
+  ret void
+}";
+    let deep = compile(&module(climb, "  call void @climb(i64 5000)\n"), 0);
+    assert_eq!(deep.gate_count(), 10_000);
+    let too_deep = driver::compile(&module(climb, "  call void @climb(i64 20000)\n"), 0);
+    assert!(errors(&too_deep).join("\n").contains("calls deep"));
+}

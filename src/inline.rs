@@ -14,6 +14,11 @@ pub struct Inlined {
 pub fn inline_module(module: &Module) -> Inlined {
     let mut working = module.clone();
     let mut diagnostics = Vec::new();
+    for function in &mut working.functions {
+        if let Some(looped) = loop_tail_calls(function) {
+            *function = looped;
+        }
+    }
 
     let Some(index) = module.entry_point().and_then(|entry| {
         module
@@ -60,6 +65,158 @@ struct CallSite {
     callee_index: usize,
 }
 
+fn calls(function: &Function) -> impl Iterator<Item = &Call> {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|inst| match &inst.kind {
+            InstKind::Call(call) => Some(call),
+            _ => None,
+        })
+}
+
+fn recursive(module: &Module, name: &str) -> bool {
+    let mut seen = vec![name.to_string()];
+    let mut stack = vec![name.to_string()];
+    while let Some(current) = stack.pop() {
+        let Some(function) = module.functions.iter().find(|f| f.sig.name == current) else {
+            continue;
+        };
+        for callee in calls(function).filter_map(Call::callee_name) {
+            if callee == name {
+                return true;
+            }
+            if !seen.iter().any(|s| s == callee) {
+                seen.push(callee.to_string());
+                stack.push(callee.to_string());
+            }
+        }
+    }
+    false
+}
+
+fn tail_call<'a>(block: &'a BasicBlock, name: &str) -> Option<&'a Call> {
+    let last = block.instructions.last()?;
+    let InstKind::Call(call) = &last.kind else {
+        return None;
+    };
+    let returned = match &block.terminator {
+        Terminator::Ret(None) => true,
+        Terminator::Ret(Some(value)) => {
+            matches!((&last.result, &value.value), (Some(result), Value::Local(v)) if result == v)
+        }
+        _ => false,
+    };
+    (returned && call.callee_name() == Some(name)).then_some(call)
+}
+
+fn loop_tail_calls(function: &Function) -> Option<Function> {
+    let name = &function.sig.name;
+    let tails: Vec<&Call> = function
+        .blocks
+        .iter()
+        .filter_map(|block| tail_call(block, name))
+        .collect();
+    let recursions = calls(function)
+        .filter(|call| call.callee_name() == Some(name))
+        .count();
+    if tails.is_empty() || tails.len() != recursions {
+        return None;
+    }
+    let params: Vec<(String, &Param)> = function
+        .sig
+        .params
+        .iter()
+        .map(|p| Some((p.name.clone()?, p)))
+        .collect::<Option<_>>()?;
+    let varying: Vec<usize> = (0..params.len())
+        .filter(|&i| {
+            tails
+                .iter()
+                .any(|call| call.args[i].value != Value::Local(params[i].0.clone()))
+        })
+        .collect();
+    let start = format!("{name}.tailrec.start");
+    let head = format!("{name}.tailrec.head");
+    let looped = |param: &str| format!("{param}.tailrec");
+    let renamer = Renamer {
+        prefix: String::new(),
+        substitution: varying
+            .iter()
+            .map(|&i| (params[i].0.clone(), Value::Local(looped(&params[i].0))))
+            .collect(),
+    };
+    let mut incoming: Vec<Vec<(Value, String)>> = varying
+        .iter()
+        .map(|&i| vec![(Value::Local(params[i].0.clone()), start.clone())])
+        .collect();
+    let mut body = Vec::new();
+    for block in &function.blocks {
+        let tail = tail_call(block, name).is_some();
+        let mut block = BasicBlock {
+            label: block.label.clone(),
+            instructions: block
+                .instructions
+                .iter()
+                .map(|inst| renamer.instruction(inst))
+                .collect(),
+            terminator: renamer.terminator(&block.terminator),
+            span: block.span,
+        };
+        if tail
+            && let Some(Instruction {
+                kind: InstKind::Call(call),
+                ..
+            }) = block.instructions.pop()
+        {
+            for (slot, &i) in incoming.iter_mut().zip(&varying) {
+                slot.push((call.args[i].value.clone(), block.label.clone()));
+            }
+            block.terminator = Terminator::Br {
+                target: head.clone(),
+            };
+        }
+        body.push(block);
+    }
+    let phis = varying
+        .iter()
+        .zip(incoming)
+        .map(|(&i, incoming)| Instruction {
+            result: Some(looped(&params[i].0)),
+            kind: InstKind::Phi {
+                ty: params[i].1.ty.clone(),
+                incoming,
+            },
+            span: params[i].1.span,
+        })
+        .collect();
+    let mut blocks = vec![
+        BasicBlock {
+            label: start,
+            instructions: Vec::new(),
+            terminator: Terminator::Br {
+                target: head.clone(),
+            },
+            span: function.span,
+        },
+        BasicBlock {
+            label: head,
+            instructions: phis,
+            terminator: Terminator::Br {
+                target: function.blocks[0].label.clone(),
+            },
+            span: function.span,
+        },
+    ];
+    blocks.extend(body);
+    Some(Function {
+        sig: function.sig.clone(),
+        blocks,
+        span: function.span,
+    })
+}
+
 fn find_call_site(module: &Module, caller: &Function) -> Option<CallSite> {
     for (block_index, block) in caller.blocks.iter().enumerate() {
         for (inst_index, inst) in block.instructions.iter().enumerate() {
@@ -69,7 +226,7 @@ fn find_call_site(module: &Module, caller: &Function) -> Option<CallSite> {
             let Some(name) = call.callee_name() else {
                 continue;
             };
-            if qis::resolve(name).is_some() || name == caller.sig.name {
+            if qis::resolve(name).is_some() || name == caller.sig.name || recursive(module, name) {
                 continue;
             }
             let Some(callee_index) = module.functions.iter().position(|f| f.sig.name == name)

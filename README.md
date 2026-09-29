@@ -151,6 +151,8 @@ The frontend parses the subset of textual LLVM IR that QIR producers emit: typed
 
 Lowering first tries to evaluate the program's classical control flow at compile time. Loops over constant ranges are unrolled, `getelementptr` over a global array of qubit ids resolves to a qubit, helper functions are interpreted, and arithmetic folds to constants. Values that depend on a measurement are kept as instructions. The program only keeps its control flow graph when a branch actually depends on a measurement, as in teleportation or repeat until success loops.
 
+Recursive functions are expanded too. A function whose calls to itself are all tail calls becomes a loop before anything else runs, with a `phi` for each parameter that changes between calls, so recursion that stops on a measurement result, such as a repeat until success written as a function that calls itself again after a failure, compiles to the same loop a hand written version would. Any other recursion is interpreted at compile time when its depth is known, up to 10,000 calls deep; the compiler runs on its own thread with a large stack so that depth is safe in debug builds too. Recursion that is neither a tail call nor bounded at compile time is refused with an error at the call.
+
 This is what lets Q# style output compile. A loop like
 
 ```llvm
@@ -426,7 +428,7 @@ The tests include:
 ## Limitations
 
 - A qubit index that depends on a measurement cannot be resolved, because qubits are assigned at compile time.
-- Recursive functions are rejected.
+- Recursion that is not a tail call is only expanded when its depth is known at compile time, up to 10,000 calls deep, or 32 in the browser.
 - OpenQASM 3 output writes branches as `if` and `else`, loops as a `while` over blocks, classical values as typed variables and recorded values as `output` variables. A floating point remainder, a pointer cast or a value recorded inside a loop is refused rather than approximated, and `--emit qir` keeps them.
 - QIR output decomposes a controlled gate that has no QIR function of its own, and refuses one with three or more controls.
 
