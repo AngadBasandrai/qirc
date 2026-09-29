@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal};
+use std::panic;
 use std::path::PathBuf;
 use std::slice;
+use std::thread;
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -32,6 +34,7 @@ use crate::transpile::{self, GateSet, TranspileStats};
 use crate::verify;
 
 const DIFF_QUBITS: usize = 20;
+const COMPILER_STACK: usize = 256 << 20;
 const MAX_DRAWN: usize = 200_000;
 
 #[derive(PartialEq, Debug)]
@@ -477,6 +480,25 @@ pub fn compile(source: &str, opt_level: u8) -> Compilation {
 }
 
 pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Target) -> Compilation {
+    if cfg!(target_arch = "wasm32") {
+        return compile_now(source, opt_level, verify_each, target);
+    }
+    thread::scope(|scope| {
+        thread::Builder::new()
+            .stack_size(COMPILER_STACK)
+            .spawn_scoped(scope, || {
+                compile_now(source, opt_level, verify_each, target)
+            })
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| panic::resume_unwind(panic))
+            })
+            .unwrap_or_else(|_| compile_now(source, opt_level, verify_each, target))
+    })
+}
+
+fn compile_now(source: &str, opt_level: u8, verify_each: bool, target: &Target) -> Compilation {
     let mut diagnostics = Vec::new();
 
     let (mut program, parse_time, lower_time) = if qasm::is_qasm(source) {

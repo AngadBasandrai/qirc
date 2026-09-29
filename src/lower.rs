@@ -42,7 +42,11 @@ pub fn lower(module: &ast::Module) -> Lowered {
 
 const MAX_WIRES: u32 = 1 << 16;
 
-const MAX_INLINE_DEPTH: usize = 32;
+const MAX_INLINE_DEPTH: usize = if cfg!(target_arch = "wasm32") {
+    32
+} else {
+    10_000
+};
 const MAX_FLATTEN_STEPS: usize = 200_000;
 const MAX_FLATTEN_OPS: usize = 2_000_000;
 
@@ -978,9 +982,12 @@ impl<'a> Lowerer<'a> {
     ) {
         if self.inline_depth >= MAX_INLINE_DEPTH {
             self.error(
-                format!("inlining `{}` exceeded the depth limit", function.sig.name),
+                format!(
+                    "`{}` recurses more than {MAX_INLINE_DEPTH} calls deep",
+                    function.sig.name
+                ),
                 span,
-                "possible recursion",
+                "while expanding this call",
             );
             return;
         }
@@ -1005,9 +1012,12 @@ impl<'a> Lowerer<'a> {
 
         if function.blocks.len() != 1 {
             self.error(
-                format!("cannot inline recursive call to `{}`", function.sig.name),
+                format!(
+                    "`{}` calls itself in a way that depends on a measurement",
+                    function.sig.name
+                ),
                 span,
-                "recursion is not supported",
+                "only calls in tail position can become a loop",
             );
             return;
         }
