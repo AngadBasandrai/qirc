@@ -1,0 +1,11 @@
+[book]
+title = "qirc"
+description = "A compiler and simulator for QIR and OpenQASM"
+authors = ["Angad Basandrai"]
+language = "en"
+src = "src"
+
+[output.html]
+site-url = "/qirc/book/"
+git-repository-url = "https://github.com/AngadBasandrai/qirc"
+edit-url-template = "https://github.com/AngadBasandrai/qirc/edit/main/docs/{path}"

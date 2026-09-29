@@ -65,7 +65,7 @@ fn xor(a: &[u32], b: &[u32]) -> Vec<u32> {
     out
 }
 
-fn wrap(angle: f64) -> f64 {
+pub(crate) fn wrap(angle: f64) -> f64 {
     let turn = 2.0 * PI;
     let wrapped = angle.rem_euclid(turn);
     if wrapped > PI {
@@ -75,7 +75,7 @@ fn wrap(angle: f64) -> f64 {
     }
 }
 
-fn rewrite(gate: &mut Gate, angle: f64) {
+pub(crate) fn rewrite(gate: &mut Gate, angle: f64) {
     let named = [
         (PI, GateKind::Z),
         (-PI, GateKind::Z),

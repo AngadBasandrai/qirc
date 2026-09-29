@@ -20,6 +20,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://angadbasandrai.github.io/qirc/"
+Documentation = "https://angadbasandrai.github.io/qirc/book/"
 Repository = "https://github.com/AngadBasandrai/qirc"
 
 [project.optional-dependencies]

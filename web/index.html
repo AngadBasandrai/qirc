@@ -325,8 +325,26 @@ a.loc { color: inherit; text-decoration: underline dotted; cursor: pointer; }
 .chip.idle { color: var(--muted); }
 .timing { font: 12px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .empty { padding: 18px 14px; color: var(--muted); font-size: 13px; max-width: 60ch; }
-.circuit { padding: 8px 6px 12px; }
+.circuit { padding: 0 0 12px; }
 .circuit svg { display: block; }
+.zoom {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: max-content;
+  padding: 6px 8px;
+  background: var(--panel);
+  font: 12px var(--mono);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.zoom .ghost { font-family: var(--mono); min-width: 30px; }
+.canvas { display: flex; width: max-content; padding-right: 8px; }
+.canvas .labels { position: sticky; left: 0; z-index: 1; flex: none; background: var(--panel); }
 .circuit .wire { stroke: var(--wire); stroke-width: 1; }
 .circuit .link { stroke: var(--accent); stroke-width: 1.5; }
 .circuit .box { fill: var(--panel); stroke: var(--accent); stroke-width: 1.2; }
@@ -353,6 +371,7 @@ footer a { color: var(--accent); }
   .editor { min-height: 340px; }
   .view { min-height: 320px; }
   .run kbd { display: none; }
+  .pane-head { flex-wrap: wrap; }
 }
 @media (prefers-reduced-motion: no-preference) {
   .emit button, .ghost, .run, .tabs button { transition: background-color 120ms, color 120ms; }
@@ -522,7 +541,7 @@ footer a { color: var(--accent); }
     </section>
   </div>
 
-  <footer>Reads Base Profile, Adaptive Profile, Q# and PyQIR output and OpenQASM 2 and 3. <code>diff</code> checks the compiled program against the original at <code>-O0</code>, branch by branch. The state vector is limited to 20 qubits here. Wider programs still run: Clifford programs on a stabilizer tableau up to 5,000 qubits, permutation and phase gates such as adders on a bit vector at any width, Clifford circuits with a few T gates as a sum of stabilizer states, and anything else as a matrix product state that reports any truncation. <code>line5.cal</code> is a five qubit device with gate, readout and T1 and T2 errors. Drop a <code>.ll</code> or <code>.qasm</code> file on the editor to open it. <a href="https://github.com/AngadBasandrai/qirc">Source on GitHub</a>.</footer>
+  <footer>Reads Base Profile, Adaptive Profile, Q# and PyQIR output and OpenQASM 2 and 3. <code>diff</code> checks the compiled program against the original at <code>-O0</code>, branch by branch. The state vector is limited to 20 qubits here. Wider programs still run: Clifford programs on a stabilizer tableau up to 5,000 qubits, permutation and phase gates such as adders on a bit vector at any width, Clifford circuits with a few T gates as a sum of stabilizer states, and anything else as a matrix product state that reports any truncation. <code>line5.cal</code> is a five qubit device with gate, readout and T1 and T2 errors. Drop a <code>.ll</code> or <code>.qasm</code> file on the editor to open it. <a href="book/">Guide</a> and <a href="https://github.com/AngadBasandrai/qirc">source on GitHub</a>.</footer>
 </div>
 
 <script type="text/plain" id="bell" data-example="Bell pair, Base Profile" data-file="bell.ll">
@@ -1435,6 +1454,7 @@ let debounce = 0;
 let paint = 0;
 let marks = new Map();
 let last = null;
+let zoom = 1;
 
 function escape(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -1546,10 +1566,25 @@ function locations(text, failed) {
   return found;
 }
 
+function snapshot() {
+  return { emit, view, controls: Object.fromEntries(CONTROLS.map((id) => [id, $(id).value])) };
+}
+
+function apply(state) {
+  for (const id of CONTROLS) {
+    const value = state.controls && state.controls[id];
+    const control = $(id);
+    if (typeof value !== "string") continue;
+    if (control.tagName === "SELECT" && ![...control.options].some((o) => o.value === value)) continue;
+    control.value = value;
+  }
+  if (EMITS.includes(state.emit)) emit = state.emit;
+  if (["text", "circuit", "results"].includes(state.view)) view = state.view;
+}
+
 function remember() {
   try {
-    const controls = Object.fromEntries(CONTROLS.map((id) => [id, $(id).value]));
-    localStorage.setItem("qirc-play", JSON.stringify({ example: current.id, text: editor.value, emit, view, controls }));
+    localStorage.setItem("qirc-play", JSON.stringify({ example: current.id, text: editor.value, ...snapshot() }));
   } catch (error) {
     return;
   }
@@ -1764,6 +1799,7 @@ function show(reply, tokens) {
   const source = parse(sourceJob);
   showStats(source, compiled);
   $("view-circuit").innerHTML = compiled ? drawCircuit(compiled) : `<p class="empty">The circuit appears here once the program compiles.</p>`;
+  showZoom();
   $("view-results").innerHTML = drawResults(tokens[0] === "diff" ? "" : result.stdout);
 }
 
@@ -1883,14 +1919,53 @@ function drawCircuit(program) {
   }
   const width = Math.max(x + 8, 200);
   const height = TOP + n * ROW + (program.blocks.length > 1 ? 22 : 6);
+  const side = LEFT - 6;
   const wires = [];
+  const labels = [];
   for (let q = 0; q < n; q++) {
-    wires.push(`<line class="wire" x1="${LEFT - 6}" x2="${width - 6}" y1="${y(q)}" y2="${y(q)}"/>`);
-    wires.push(`<text class="qlabel" x="${LEFT - 12}" y="${y(q) + 4}" text-anchor="end">q${q}</text>`);
+    wires.push(`<line class="wire" x1="${side}" x2="${width - 6}" y1="${y(q)}" y2="${y(q)}"/>`);
+    labels.push(`<text class="qlabel" x="${LEFT - 12}" y="${y(q) + 4}" text-anchor="end">q${q}</text>`);
   }
   const lines = separators.map((sx) => `<line class="sep" x1="${sx}" x2="${sx}" y1="20" y2="${TOP + n * ROW}"/>`);
   const note = truncated ? `<p class="empty">Showing the first ${MAX_DRAWN} operations.</p>` : "";
-  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="Circuit diagram">${wires.join("")}${lines.join("")}${parts.join("")}</svg>${note}`;
+  const tools =
+    `<div class="zoom" role="toolbar" aria-label="Zoom">` +
+    `<button type="button" class="ghost" data-zoom="out" aria-label="Zoom out">−</button>` +
+    `<span id="zoom-level"></span>` +
+    `<button type="button" class="ghost" data-zoom="in" aria-label="Zoom in">+</button>` +
+    `<button type="button" class="ghost" data-zoom="fit">Fit</button>` +
+    `<button type="button" class="ghost" data-zoom="reset">1:1</button></div>`;
+  return (
+    tools +
+    `<div class="canvas"><svg class="labels" data-width="${side}" data-height="${height}" viewBox="0 0 ${side} ${height}" aria-hidden="true">${labels.join("")}</svg>` +
+    `<svg class="drawing" data-width="${width - side}" data-height="${height}" viewBox="${side} 0 ${width - side} ${height}" role="img" aria-label="Circuit diagram">${wires.join("")}${lines.join("")}${parts.join("")}</svg></div>${note}`
+  );
+}
+
+function showZoom() {
+  for (const svg of $("view-circuit").querySelectorAll("svg[data-width]")) {
+    svg.setAttribute("width", svg.dataset.width * zoom);
+    svg.setAttribute("height", svg.dataset.height * zoom);
+  }
+  const level = $("zoom-level");
+  if (level) level.textContent = Math.round(zoom * 100) + "%";
+}
+
+function fit() {
+  const box = $("view-circuit");
+  const svgs = [...box.querySelectorAll("svg[data-width]")];
+  if (!svgs.length) return 1;
+  const width = svgs.reduce((sum, svg) => sum + Number(svg.dataset.width), 0);
+  const height = Number(svgs[0].dataset.height);
+  const bar = box.querySelector(".zoom").offsetHeight;
+  return Math.min(1, (box.clientWidth - 16) / width, (box.clientHeight - bar - 16) / height);
+}
+
+function describe(op) {
+  if (op.op === "measure") return `measure q${op.qubit} → r${op.result}`;
+  if (op.op === "reset") return `reset q${op.qubit}`;
+  const wires = [...op.controls, ...op.targets].map((q) => "q" + q).join(", ");
+  return "c".repeat(op.controls.length) + gateLabel(op) + " " + wires;
 }
 
 function isTarget(op) {
@@ -1898,7 +1973,7 @@ function isTarget(op) {
 }
 
 function drawOp(op, cx, width, y) {
-  const out = [];
+  const out = [`<g><title>${escape(describe(op))}</title>`];
   const box = (q, label, cls = "box") => {
     const w = Math.max(26, Math.min(width, 12 + label.length * 6.9));
     out.push(`<rect class="${cls}" x="${cx - w / 2}" y="${y(q) - 12}" width="${w}" height="24" rx="4"/>`);
@@ -1906,11 +1981,11 @@ function drawOp(op, cx, width, y) {
   };
   if (op.op === "measure") {
     box(op.qubit, `M→r${op.result}`, "meter");
-    return out.join("");
+    return out.join("") + "</g>";
   }
   if (op.op === "reset") {
     box(op.qubit, "|0⟩", "meter");
-    return out.join("");
+    return out.join("") + "</g>";
   }
   const wires = [...op.controls, ...op.targets];
   if (wires.length > 1) {
@@ -1931,7 +2006,7 @@ function drawOp(op, cx, width, y) {
   } else {
     for (const q of op.targets) box(q, gateLabel(op));
   }
-  return out.join("");
+  return out.join("") + "</g>";
 }
 
 function table(text, heading) {
@@ -2033,18 +2108,9 @@ async function start() {
       shared = null;
     }
   }
-  if (saved && saved.controls) {
-    for (const id of CONTROLS) {
-      const value = saved.controls[id];
-      const control = $(id);
-      if (value === undefined) continue;
-      if (control.tagName === "SELECT" && ![...control.options].some((o) => o.value === value)) continue;
-      control.value = value;
-    }
-  }
-  if (saved && EMITS.includes(saved.emit)) emit = saved.emit;
-  if (saved && ["text", "circuit", "results"].includes(saved.view)) view = saved.view;
+  if (saved) apply(saved);
   if (shared && typeof shared.source === "string" && typeof shared.command === "string") {
+    apply(shared);
     const file = words(shared.command).find((t) => /\.(ll|qasm)$/.test(t)) || "shared.ll";
     load(addFile(file, shared.source));
     showEmit();
@@ -2070,6 +2136,14 @@ exampleSelect.addEventListener("change", () => {
     }
   }
   sync();
+});
+$("view-circuit").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-zoom]");
+  if (!button) return;
+  const kind = button.dataset.zoom;
+  const next = kind === "fit" ? fit() : kind === "reset" ? 1 : zoom * (kind === "in" ? 1.25 : 0.8);
+  zoom = Math.min(4, Math.max(0.05, next));
+  showZoom();
 });
 $("emit").addEventListener("click", (event) => {
   const button = event.target.closest("button");
@@ -2159,7 +2233,7 @@ if (!framed) {
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   });
   $("share").addEventListener("click", async () => {
-    const hash = await pack({ source: editor.value, command: command.value });
+    const hash = await pack({ source: editor.value, command: command.value, ...snapshot() });
     const url = location.href.split("#")[0] + "#p=" + hash;
     history.replaceState(null, "", url);
     navigator.clipboard.writeText(url).then(

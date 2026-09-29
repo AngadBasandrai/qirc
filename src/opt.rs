@@ -7,6 +7,7 @@ use crate::phase;
 use crate::simulator::matrix::{Matrix2, matrix_for};
 use crate::synth;
 use crate::verify;
+use crate::zx;
 
 const ANGLE_EPSILON: f64 = 1e-12;
 const MATRIX_EPSILON: f64 = 1e-12;
@@ -123,6 +124,7 @@ fn schedule(level: u8) -> Vec<(&'static str, Pass)> {
     if level >= 2 {
         schedule.push(("peephole", peephole));
         schedule.push(("fold-phases", phase::fold));
+        schedule.push(("teleport-phases", zx::teleport));
         schedule.push(("simplify-cfg", simplify_cfg));
     }
 

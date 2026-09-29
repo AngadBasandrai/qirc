@@ -1,13 +1,13 @@
 use std::fmt;
 
 use crate::calibration::Calibration;
+use crate::cut;
 use crate::equiv;
 use crate::ir::{Expr, Op, Program, QubitId, ResultId, Term, keep_marked};
 use crate::pauli;
 use crate::route::remap;
 use crate::simulator::bits::{self, Bits};
 use crate::simulator::exec::{self, ExecConfig, Snapshot};
-use crate::simulator::matrix::C64;
 use crate::simulator::matrix::Matrix2;
 use crate::simulator::mps::Mps;
 use crate::simulator::state::{self, State};
@@ -33,46 +33,28 @@ pub struct Observable {
 }
 
 impl Product {
+    fn masks(&self, wire: &[usize]) -> Vec<(usize, bool, bool)> {
+        self.paulis
+            .iter()
+            .map(|&(q, pauli)| (wire[q], pauli != Pauli::Z, pauli != Pauli::X))
+            .collect()
+    }
+
     fn value(&self, state: &State, wire: &[usize]) -> f64 {
-        let (mut x, mut z, mut ys) = (0usize, 0usize, 0);
-        for &(q, pauli) in &self.paulis {
-            let bit = 1 << wire[q];
-            match pauli {
-                Pauli::X => x |= bit,
-                Pauli::Z => z |= bit,
-                Pauli::Y => {
-                    x |= bit;
-                    z |= bit;
-                    ys += 1;
-                }
+        let (mut x, mut z) = (0usize, 0usize);
+        for (w, flips, phases) in self.masks(wire) {
+            if flips {
+                x |= 1 << w;
+            }
+            if phases {
+                z |= 1 << w;
             }
         }
-        let sum: C64 = (0..state.len())
-            .map(|j| {
-                let sign = if (j & z).count_ones() % 2 == 1 {
-                    -1.0
-                } else {
-                    1.0
-                };
-                state.amplitude(j ^ x).conj() * state.amplitude(j) * sign
-            })
-            .sum();
-        let phase = [
-            C64::new(1.0, 0.0),
-            C64::new(0.0, 1.0),
-            C64::new(-1.0, 0.0),
-            C64::new(0.0, -1.0),
-        ][ys % 4];
-        self.weight * (phase * sum).re
+        self.weight * state.pauli_element(state, x, z).re
     }
 
     fn propagated(&self, program: &Program, wire: &[usize]) -> Result<f64, String> {
-        let paulis: Vec<(usize, bool, bool)> = self
-            .paulis
-            .iter()
-            .map(|&(q, pauli)| (wire[q], pauli != Pauli::Z, pauli != Pauli::X))
-            .collect();
-        Ok(self.weight * pauli::propagate(program, &paulis)?)
+        Ok(self.weight * pauli::propagate(program, &self.masks(wire))?)
     }
 
     fn classical_value(&self, bits: &Bits, wire: &[usize]) -> f64 {
@@ -251,6 +233,8 @@ impl fmt::Display for Observable {
     }
 }
 
+type Wide = ((Vec<bool>, Vec<usize>), Program, String, Vec<cut::Weighted>);
+
 fn terminal(program: &Program) -> Program {
     let mut stripped = program.clone();
     for block in &mut stripped.blocks {
@@ -300,7 +284,7 @@ fn fits(program: &Program) -> Result<(), String> {
     Ok(())
 }
 
-fn cone(program: &Program, qubits: &[usize]) -> (Program, Vec<usize>) {
+fn cone(program: &Program, qubits: &[usize]) -> (Program, Vec<usize>, Vec<bool>) {
     let ops = &program.blocks[0].ops;
     let mut inside = vec![false; program.num_qubits as usize];
     for &q in qubits {
@@ -334,7 +318,7 @@ fn cone(program: &Program, qubits: &[usize]) -> (Program, Vec<usize>) {
         .map(|(op, _)| remap(op.clone(), |q| wire[q.index()]))
         .collect();
     sub.num_qubits = count as u32;
-    (sub, wire)
+    (sub, wire, keep)
 }
 
 fn final_state(program: &Program) -> Result<State, String> {
@@ -389,13 +373,14 @@ pub fn expectation(program: &Program, observable: &Observable) -> Result<f64, St
         && !stripped.ops().any(|op| matches!(op, Op::Measure { .. }));
     if straight {
         let mut total = 0.0;
+        let mut wide: Vec<Wide> = Vec::new();
         for term in &observable.terms {
             let qubits: Vec<usize> = term.paulis.iter().map(|&(q, _)| q).collect();
             if qubits.is_empty() {
                 total += term.weight;
                 continue;
             }
-            let (sub, wire) = cone(&stripped, &qubits);
+            let (sub, wire, kept) = cone(&stripped, &qubits);
             total += if sub.gates().all(bits::supports) {
                 term.classical_value(
                     &exec::finish(&sub, Bits::new(sub.num_qubits as usize)),
@@ -404,10 +389,26 @@ pub fn expectation(program: &Program, observable: &Observable) -> Result<f64, St
             } else if exec::stabilizer(&sub) {
                 term.stabilizer_value(&sub, &wire)
             } else if sub.num_qubits as usize > state::MAX_QUBITS {
-                term.propagated(&sub, &wire)?
+                match term.propagated(&sub, &wire) {
+                    Ok(value) => value,
+                    Err(reason) => {
+                        let masks = (term.weight, term.masks(&wire));
+                        match wide
+                            .iter_mut()
+                            .find(|(key, ..)| key.0 == kept && key.1 == wire)
+                        {
+                            Some((.., terms)) => terms.push(masks),
+                            None => wide.push(((kept, wire), sub, reason, vec![masks])),
+                        }
+                        0.0
+                    }
+                }
             } else {
                 term.value(&final_state(&sub)?, &wire)
             };
+        }
+        for (_, sub, reason, terms) in &wide {
+            total += cut::expectation(sub, terms).map_err(|cut| format!("{reason}, and {cut}"))?;
         }
         return Ok(total);
     }
@@ -553,5 +554,48 @@ qreg q[5];
             let propagated = term.propagated(program, &identity).unwrap();
             assert!((exact - propagated).abs() < 1e-9, "{source}");
         });
+    }
+    #[test]
+    fn cutting() {
+        let mut rng = Rng::new(9);
+        let mut forward = Vec::new();
+        for layer in 0..3 {
+            for q in 0..34 {
+                forward.push(format!("ry({:.3}) q[{q}];", 3.0 * rng.next_unit()));
+                forward.push(format!("rz({:.3}) q[{q}];", 3.0 * rng.next_unit()));
+            }
+            for q in (0..33).filter(|&q| q != 16) {
+                forward.push(format!("cx q[{q}], q[{}];", q + 1));
+            }
+            if layer % 3 == 1 {
+                forward.push("cx q[16], q[17];".into());
+            }
+        }
+        let backward: Vec<String> = forward
+            .iter()
+            .rev()
+            .map(|line| line.replace("ry(", "ry(-").replace("rz(", "rz(-"))
+            .collect();
+        let source = format!(
+            "OPENQASM 2.0;
+include \"qelib1.inc\";
+qreg q[34];
+{}
+{}
+",
+            forward.join(
+                "
+"
+            ),
+            backward.join(
+                "
+"
+            )
+        );
+        let (program, errors) = qasm::lower(&source);
+        assert!(errors.is_empty(), "{errors:?}");
+        let observable = Observable::parse("Z0 Z33 + X10 + Z16 Z17 + 0.5 Y3").unwrap();
+        let value = expectation(&program, &observable).unwrap();
+        assert!((value - 2.0).abs() < 1e-9, "{value}");
     }
 }

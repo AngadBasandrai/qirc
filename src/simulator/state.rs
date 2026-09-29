@@ -44,6 +44,7 @@ impl Sampler {
     }
 }
 
+#[derive(Clone)]
 pub struct State {
     n: usize,
     re: Vec<f64>,
@@ -78,6 +79,26 @@ impl State {
 
     pub fn amplitude(&self, index: usize) -> C64 {
         Complex::new(self.re[index], self.im[index])
+    }
+
+    pub fn pauli_element(&self, ket: &State, x: usize, z: usize) -> C64 {
+        let sum: C64 = (0..ket.len())
+            .map(|j| {
+                let sign = if (j & z).count_ones() % 2 == 1 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                self.amplitude(j ^ x).conj() * ket.amplitude(j) * sign
+            })
+            .sum();
+        let phase = [
+            C64::new(1.0, 0.0),
+            C64::new(0.0, 1.0),
+            C64::new(-1.0, 0.0),
+            C64::new(0.0, -1.0),
+        ][(x & z).count_ones() as usize % 4];
+        phase * sum
     }
 
     pub fn apply(&mut self, matrix: &Matrix2, target: usize, controls: u64) {
