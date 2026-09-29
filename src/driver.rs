@@ -21,13 +21,15 @@ use crate::lower;
 use crate::observable::{self, Observable};
 use crate::opt::{self, OptStats};
 use crate::parse::parse_module;
+use crate::provider;
+use crate::pulse;
 use crate::qasm;
 use crate::qasm2;
 use crate::reuse::{self, Reused};
 use crate::route::{self, Coupling, Relabelled, RouteStats};
 use crate::sema;
 use crate::simulator::exec::{self, ExecConfig};
-use crate::simulator::state;
+use crate::simulator::{mps, state};
 use crate::stim;
 use crate::synth::{self, Cost};
 use crate::transpile::{self, GateSet, TranspileStats};
@@ -35,6 +37,7 @@ use crate::verify;
 
 const DIFF_QUBITS: usize = 20;
 const COMPILER_STACK: usize = 256 << 20;
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_DRAWN: usize = 200_000;
 
 #[derive(PartialEq, Debug)]
@@ -44,6 +47,9 @@ pub enum Emit {
     Qasm3,
     Qasm2,
     Stim,
+    Pulse,
+    Schedule,
+    Ionq,
     Qir,
     Json,
     Circuit,
@@ -61,6 +67,9 @@ impl Emit {
             "qasm" | "qasm3" => Emit::Qasm3,
             "qasm2" => Emit::Qasm2,
             "stim" => Emit::Stim,
+            "pulse" | "openpulse" => Emit::Pulse,
+            "schedule" => Emit::Schedule,
+            "ionq" => Emit::Ionq,
             "qir" | "llvm" => Emit::Qir,
             "json" => Emit::Json,
             "circuit" => Emit::Circuit,
@@ -190,11 +199,14 @@ pub struct Options {
     pub noisy: bool,
     pub mitigate: bool,
     pub zne: bool,
+    pub bond: Option<usize>,
     pub observable: Option<Observable>,
     pub coupling: Option<Coupling>,
     pub calibration: Option<Calibration>,
     pub color: Color,
     pub diff: bool,
+    pub submit: bool,
+    pub device: String,
     pub other: Option<PathBuf>,
 }
 
@@ -232,11 +244,14 @@ impl Default for Options {
             noisy: false,
             mitigate: false,
             zne: false,
+            bond: None,
             observable: None,
             coupling: None,
             calibration: None,
             color: Color::Auto,
             diff: false,
+            submit: false,
+            device: "simulator".into(),
             other: None,
         }
     }
@@ -250,10 +265,13 @@ usage:
   qirc diff <a.ll> [b.ll] [options]
                     check that b.ll, or a.ll compiled with the options,
                     behaves exactly like a.ll at -O0
+  qirc submit <input.ll> [options]
+                    run on IonQ with the key in IONQ_API_KEY, on --target
+                    (default simulator) with --shots
 
 options:
-  --emit <kind>     run | ir | qasm3 | qasm2 | stim | qir | json | circuit | quantikz | svg
-                    | cost | check
+  --emit <kind>     run | ir | qasm3 | qasm2 | stim | pulse | schedule | ionq | qir | json
+                    | circuit | quantikz | svg | cost | check
                     (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
   --shots <n>       sample n measurement outcomes
@@ -270,6 +288,9 @@ options:
   --relabel         remove swaps at the end of the program by permuting qubits
   --reuse           reset measured qubits and reuse them to need fewer qubits
   --noisy           simulate with the error rates from --calibration
+  --target <name>   IonQ target for submit and --emit ionq, such as qpu.aria-1
+  --bond <n>        simulate as a matrix product state with bonds up to n (default 32
+                    above 30 qubits)
   --mitigate        undo the readout errors from --calibration in the counts
   --zne             extrapolate the --observable to zero noise from 1x, 2x and 3x noise
   --observable <p>  print the exact expectation of a Pauli sum such as 'Z0 Z1 + 0.5 X2'
@@ -295,9 +316,16 @@ pub fn parse_args_with(
     let mut input: Option<PathBuf> = None;
     let mut excluded: Option<&str> = None;
     let mut args = args.iter();
-    if args.as_slice().first().is_some_and(|a| a == "diff") {
-        args.next();
-        options.diff = true;
+    match args.as_slice().first().map(String::as_str) {
+        Some("diff") => {
+            args.next();
+            options.diff = true;
+        }
+        Some("submit") => {
+            args.next();
+            options.submit = true;
+        }
+        _ => {}
     }
 
     while let Some(arg) = args.next() {
@@ -358,6 +386,25 @@ pub fn parse_args_with(
             "--reuse" => options.reuse = true,
 
             "--noisy" => options.noisy = true,
+
+            "--target" => {
+                options.device = value(
+                    &mut args,
+                    "--target needs a provider target such as simulator",
+                )?
+                .to_string();
+            }
+
+            "--bond" => {
+                let value = value(&mut args, "--bond needs a bond dimension")?;
+                options.bond = Some(
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|&b: &usize| b > 0)
+                        .ok_or_else(|| format!("invalid bond dimension `{value}`"))?,
+                );
+            }
 
             "--mitigate" => options.mitigate = true,
 
@@ -790,6 +837,28 @@ pub fn run_source(
 
     let program = &compilation.program;
 
+    if options.submit {
+        let shots = options.shots.max(1);
+        let mut progress = |line: &str| output.eprintln(line);
+        return match provider::submit(
+            program,
+            &options.device,
+            shots,
+            SUBMIT_TIMEOUT,
+            &mut progress,
+        ) {
+            Ok(counts) => {
+                let note = format!(" on IonQ {}", options.device);
+                print_tally(output, "measurement", &note, &counts);
+                0
+            }
+            Err(reason) => {
+                output.eprintln(format_args!("error: {reason}"));
+                1
+            }
+        };
+    }
+
     if options.verbose {
         output.eprintln(format_args!(
             "parse {:?}, lower {:?}, optimise {:?}",
@@ -837,6 +906,33 @@ pub fn run_source(
                 Ok(text) => text,
                 Err(reason) => {
                     output.eprintln(format_args!("error: cannot emit Stim: {reason}"));
+                    return 1;
+                }
+            }
+        }
+        Emit::Ionq => match provider::ionq(program, &options.device, options.shots.max(1)) {
+            Ok(text) => text + "\n",
+            Err(reason) => {
+                output.eprintln(format_args!("error: cannot write an IonQ job: {reason}"));
+                return 1;
+            }
+        },
+        Emit::Pulse | Emit::Schedule => {
+            let Some(calibration) = &options.calibration else {
+                output.eprintln(format_args!(
+                    "error: a pulse schedule needs --calibration for gate times and frequencies"
+                ));
+                return 1;
+            };
+            let emitted = if options.emit == Emit::Pulse {
+                pulse::emit(program, calibration)
+            } else {
+                pulse::schedule(program, calibration)
+            };
+            match emitted {
+                Ok(text) => text,
+                Err(reason) => {
+                    output.eprintln(format_args!("error: cannot schedule pulses: {reason}"));
                     return 1;
                 }
             }
@@ -907,7 +1003,11 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
     let seed = options.seed.unwrap_or_else(clock_seed);
 
     output.println(format_args!("source:  {}", options.input.display()));
-    output.println(format_args!("kernel:  {}", exec::kernel(program)));
+    let kernel = match options.bond {
+        Some(_) => "matrix product state",
+        None => exec::kernel(program),
+    };
+    output.println(format_args!("kernel:  {kernel}"));
     output.println(format_args!("program: {}", summary(program)));
 
     if compilation.stats.changed() {
@@ -935,12 +1035,23 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
         seed,
         keep_state: options.show_state,
     };
-    let (outcome, elapsed) = timed(|| match (&options.calibration, options.noisy) {
-        (Some(calibration), true) => exec::execute_noisy(program, config, calibration),
-        _ => exec::execute(program, config),
-    });
+    let (outcome, elapsed) = timed(
+        || match (&options.calibration, options.noisy, options.bond) {
+            (Some(calibration), true, _) => exec::execute_noisy(program, config, calibration),
+            (_, _, Some(bond)) => exec::execute_bonded(program, config, bond)
+                .unwrap_or_else(|| exec::execute(program, config)),
+            _ => exec::execute(program, config),
+        },
+    );
     if options.noisy {
         output.println("noise:   calibration error rates applied to every gate and measurement");
+    }
+    if outcome.discarded > 0.0 {
+        output.println(format_args!(
+            "truncation: bonds were capped at {}, discarding {:.2e} of the weight, so the counts are approximate",
+            options.bond.unwrap_or(mps::DEFAULT_BOND),
+            outcome.discarded
+        ));
     }
 
     if outcome.aborted {

@@ -389,6 +389,8 @@ footer a { color: var(--accent); }
         <button type="button" role="radio" data-emit="stim">stim</button>
         <button type="button" role="radio" data-emit="quantikz">latex</button>
         <button type="button" role="radio" data-emit="svg">svg</button>
+        <button type="button" role="radio" data-emit="pulse">pulse</button>
+        <button type="button" role="radio" data-emit="schedule">schedule</button>
         <button type="button" role="radio" data-emit="cost">cost</button>
         <button type="button" role="radio" data-emit="diff">diff</button>
       </div>
@@ -1209,6 +1211,26 @@ cx q[2], q[3];
 cx q[3], q[4];
 </script>
 
+<script type="text/plain" id="qftloop" data-example="QFT with OpenQASM 3 loops" data-file="qft.qasm" data-settings='{"emit": "run", "gates": "", "coupling": "", "device": ""}'>
+// A quantum Fourier transform written with OpenQASM 3 loops, which qirc
+// unrolls at compile time. Try emit pulse or schedule with the line5.cal
+// device to see the gates as timed pulses on a five qubit line.
+OPENQASM 3.0;
+include "stdgates.inc";
+const int n = 5;
+qubit[n] q;
+bit[n] c;
+x q[0];
+for int i in [0:n - 1] {
+  h q[i];
+  for int j in [i + 1:n - 1] {
+    cp(pi / 2 ** (j - i)) q[j], q[i];
+  }
+}
+for uint k in {0, 1} swap q[k], q[n - 1 - k];
+c = measure q;
+</script>
+
 <script type="text/plain" id="pyqir" data-example="Circuit from PyQIR" data-file="pyqir.ll">
 ; ModuleID = 'bell'
 source_filename = "bell"
@@ -1293,9 +1315,9 @@ onmessage = async (event) => {
 };
 `;
 
-const EMITS = ["run", "circuit", "qasm3", "qir", "ir", "json", "qasm2", "stim", "quantikz", "svg", "cost", "diff"];
+const EMITS = ["run", "circuit", "qasm3", "qir", "ir", "json", "qasm2", "stim", "quantikz", "svg", "pulse", "schedule", "cost", "diff"];
 const CONTROLS = ["opt", "gates", "resynth", "cost", "coupling", "relabel", "reuse", "device", "observable", "shots", "seed"];
-const EXTENSIONS = { qasm3: "qasm", qasm2: "qasm", stim: "stim", qir: "ll", json: "json", ir: "txt", circuit: "txt", quantikz: "tex", svg: "svg", cost: "txt", run: "txt", diff: "txt" };
+const EXTENSIONS = { qasm3: "qasm", qasm2: "qasm", stim: "stim", qir: "ll", json: "json", ir: "txt", circuit: "txt", quantikz: "tex", svg: "svg", pulse: "qasm", schedule: "txt", cost: "txt", run: "txt", diff: "txt" };
 const MAX_HIGHLIGHT = 400000;
 const MAX_DRAWN = 4000;
 
