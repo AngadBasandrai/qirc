@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
 use crate::ir::{Gate, GateKind, Op, Program};
+use crate::phase;
 use crate::route::Coupling;
 
 const MAX_MITIGATED: usize = 20;
@@ -17,6 +18,9 @@ pub struct Calibration {
     readout_time: HashMap<usize, f64>,
     t1: HashMap<usize, f64>,
     t2: HashMap<usize, f64>,
+    frequency: HashMap<usize, f64>,
+    drive: HashMap<usize, (f64, f64)>,
+    cross: HashMap<(usize, usize), f64>,
 }
 
 fn lookup<K: Eq + Hash>(map: &HashMap<K, f64>, key: K) -> f64 {
@@ -68,7 +72,7 @@ impl Calibration {
             }
             let shape = || {
                 format!(
-                    "line {number}: expected `cx a b error`, `single q error`, `readout q error`, `time cx a b ns`, `time single q ns`, `time readout q ns`, `t1 q us` or `t2 q us`"
+                    "line {number}: expected `cx a b error`, `single q error`, `readout q error`, `time cx a b ns`, `time single q ns`, `time readout q ns`, `t1 q us`, `t2 q us`, `frequency q GHz`, `drive q amplitude beta` or `cross a b amplitude`"
                 )
             };
             let length = |word: &str| match word.parse::<f64>() {
@@ -78,6 +82,12 @@ impl Calibration {
                 )),
             };
             let qubit = |word: &str| word.parse::<usize>().map_err(|_| shape());
+            let number_in = |word: &str, low: f64, high: f64| match word.parse::<f64>() {
+                Ok(v) if v.is_finite() && v > low && v <= high => Ok(v),
+                _ => Err(format!(
+                    "line {number}: `{word}` must be above {low} and at most {high}"
+                )),
+            };
             let rate = |word: &str| match word.parse::<f64>() {
                 Ok(e) if (0.0..1.0).contains(&e) => Ok(e),
                 _ => Err(format!(
@@ -130,6 +140,28 @@ impl Calibration {
                     calibration.t2.insert(q, length(t)? * 1000.0);
                     q
                 }
+                ["frequency", q, ghz] => {
+                    let q = qubit(q)?;
+                    calibration
+                        .frequency
+                        .insert(q, number_in(ghz, 0.0, 1000.0)?);
+                    q
+                }
+                ["drive", q, amplitude, beta] => {
+                    let q = qubit(q)?;
+                    let beta = number_in(beta, -100.0, 100.0)?;
+                    calibration
+                        .drive
+                        .insert(q, (number_in(amplitude, 0.0, 1.0)?, beta));
+                    q
+                }
+                ["cross", a, b, amplitude] => {
+                    let (a, b) = (qubit(a)?, qubit(b)?);
+                    calibration
+                        .cross
+                        .insert((a, b), number_in(amplitude, 0.0, 1.0)?);
+                    a.max(b)
+                }
                 _ => return Err(shape()),
             };
             calibration.qubits = calibration.qubits.max(highest + 1);
@@ -172,11 +204,40 @@ impl Calibration {
         lookup(&self.cx_time, (a.min(b), a.max(b)))
     }
 
-    fn duration(&self, op: &Op) -> f64 {
+    pub fn frequency(&self, q: usize) -> Option<f64> {
+        self.frequency.get(&q).copied()
+    }
+
+    pub fn drive(&self, q: usize) -> (f64, f64) {
+        self.drive.get(&q).copied().unwrap_or((0.2, 0.0))
+    }
+
+    pub fn cross(&self, control: usize, target: usize) -> f64 {
+        self.cross.get(&(control, target)).copied().unwrap_or(0.1)
+    }
+
+    pub fn coupled(&self, a: usize, b: usize) -> bool {
+        self.cx.contains_key(&(a.min(b), a.max(b)))
+    }
+
+    pub fn timeline<'a>(&self, ops: impl IntoIterator<Item = &'a Op>) -> Vec<(f64, f64)> {
+        let mut clock = Clock::default();
+        ops.into_iter()
+            .map(|op| {
+                clock.begin(self, op);
+                let start = clock.start;
+                clock.end(self, op);
+                (start, start + self.duration(op))
+            })
+            .collect()
+    }
+
+    pub fn duration(&self, op: &Op) -> f64 {
         match op {
             Op::Gate(gate) => {
                 let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
                 match wires[..] {
+                    [_] if phase::diagonal(gate.kind) => 0.0,
                     [q] => lookup(&self.single_time, q),
                     [a, b] if gate.kind == GateKind::Swap => 3.0 * self.cx_time(a, b),
                     [a, b] => self.cx_time(a, b),

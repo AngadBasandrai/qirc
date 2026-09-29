@@ -65,9 +65,10 @@ The only direct dependency is `num-complex`.
 ```
 qirc <input.ll | input.qasm> [options]
 qirc diff <a> [b] [options]
+qirc submit <input> [options]
 
-  --emit <kind>     run | ir | qasm3 | qasm2 | stim | qir | json | circuit | quantikz | svg
-                    | cost | check
+  --emit <kind>     run | ir | qasm3 | qasm2 | stim | pulse | schedule | ionq | qir | json
+                    | circuit | quantikz | svg | cost | check
                     (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
   --gates <set>     target gate set: rz-sx-cx, rz-ry-cz or a list such as rz,sx,cx
@@ -79,6 +80,8 @@ qirc diff <a> [b] [options]
   --relabel         remove swaps at the end of the program by permuting qubits
   --reuse           reset measured qubits and reuse them to need fewer qubits
   --noisy           simulate with the error rates from --calibration
+  --bond <n>        cap matrix product state bonds at n (default 32 above 30 qubits)
+  --target <name>   IonQ target for submit and --emit ionq (default simulator)
   --mitigate        undo the readout errors from --calibration in the counts
   --zne             extrapolate the --observable to zero noise from 1x, 2x and 3x noise
   --observable <p>  print the exact expectation of a Pauli sum such as 'Z0 Z1 + 0.5 X2'
@@ -137,7 +140,7 @@ A file whose first statement is `OPENQASM 2.0;` or `OPENQASM 3.0;` is read as Op
 $ qirc bell.qasm --emit qir -O2 --gates rz-sx-cx
 ```
 
-It reads `qubit`, `bit`, `qreg` and `creg` declarations, the standard gates of `stdgates.inc` and `qelib1.inc` including `u`, `u2`, `u3`, `cp`, `crz`, `cu`, `rzz`, `rxx`, `ryy`, `ccx` and `cswap`, gate definitions with parameters, gates applied to whole registers, all three ways of writing a measurement, `reset`, `barrier`, and `if` on a bit, its negation or a register compared with a number, with an `else`. Angles can use `pi`, arithmetic and functions such as `sin` and `sqrt`. Classical types, `output`, loops and subroutines are reported as unsupported. The classical bits are recorded as one array at the end, and the program uses the Adaptive Profile only if it branches, resets or reuses a measured qubit. Errors point at the source like any other diagnostic, and nesting, expression depth and the size of expanded gate definitions are bounded, so hostile input fails with a message.
+It reads `qubit`, `bit`, `qreg` and `creg` declarations, the standard gates of `stdgates.inc` and `qelib1.inc` including `u`, `u2`, `u3`, `cp`, `crz`, `cu`, `rzz`, `rxx`, `ryy`, `ccx` and `cswap`, gate definitions with parameters, gates applied to whole registers, all three ways of writing a measurement, `reset`, `barrier`, and `if` on a bit, its negation or a register compared with a number, with an `else`. Angles can use `pi`, arithmetic and functions such as `sin` and `sqrt`. `const int n = 5;` and other `int`, `uint`, `float` and `angle` values set once can size registers and appear in indices and angles. A `for` loop over a range such as `[0:n - 1]` or `[0:2:8]`, or over a set such as `{0, 3}`, is unrolled at compile time with its variable usable in indices like `q[i + 1]` and angles like `pi / 2 ** i`, and a `while` loop on a measured bit becomes a loop in the program, so a repeat until success reads as written. A QFT written with nested loops is proven equivalent by `qirc diff` to the same circuit written out gate by gate, and the `for` and `while` loops Qiskit's OpenQASM 3 exporter writes compile and run. Classical values that change, `bool`, `output`, `break` and subroutines are reported as unsupported. The classical bits are recorded as one array at the end, and the program uses the Adaptive Profile only if it branches, resets or reuses a measured qubit. Errors point at the source like any other diagnostic, and nesting, expression depth and the size of expanded gate definitions are bounded, so hostile input fails with a message.
 
 Every circuit Qiskit exports for the benchmarks, in both versions, `qirc diff` finds identical to the same circuit built as QIR.
 
@@ -400,7 +403,19 @@ A program with more than 20 qubits whose gates only permute basis states (X, Y, 
 
 `--observable` prints the exact expectation value of a sum of Pauli strings, written like `Z0 Z1 + 0.5 X2 - 2*Y3`. Measurements at the end of the program are left out, so the value is taken on the state just before them, and a program that branches on mid circuit measurements is averaged exactly over every branch, weighted by its probability. On the teleportation example the teleported qubit gives 0.707107 for both `Z2` and `X2`, as `ry(pi/4)` should. A program without mid circuit measurements is not limited to 30 qubits: each Pauli string only depends on the gates in its backward light cone, so each is simulated on a small circuit over just the qubits of its cone. A 200 qubit layer of `ry` rotations and CNOT pairs gives `Z199 + X0 X1` exactly in 50 ms. A cone of permutation and phase gates is a basis state, where a string with an X or Y gives 0 and a string of Z gives the sign of the parity of its bits. A cone of Clifford gates is simulated on the stabilizer tableau instead, however wide it is: after basis changes and CNOTs fold the Pauli string onto one qubit, its value is 0 if measuring that qubit would be random and the sign of the deterministic outcome otherwise, so `Y0 Y1 X2 ... X999` on a 1000 qubit GHZ state gives -1. A cone that is neither Clifford nor small enough for a state vector is lowered to `rz`, `sx` and `cx` and the Pauli string is pushed backwards through it in the Heisenberg picture: a CNOT maps each string to one string, a rotation splits a string that anticommutes with it into a cosine and a sine part, and at the start only strings of I and Z count. This stays exact while few rotations touch the cone, so `rz(0.3)`, `t` and `rx(0.2)` on a 100 qubit GHZ state give `X0 ... X99 + Z0 Z99` = 1.446627 in 80 ms, and it gives up once a term expands past 65536 strings.
 
-Other programs are limited to 30 qubits by the state vector. Larger programs can still be compiled and emitted.
+A straight line program with more than 30 qubits whose gates are Clifford apart from up to 10 rotations by other angles, such as T gates, runs on a sum of stabilizer states. Each state is kept in CH form, which unlike a tableau tracks its global phase, so the terms of the sum can interfere. Lowered to `rz`, `sx` and `cx`, a CNOT or a quarter turn is a row operation on each term, a Hadamard folds the two basis strings it produces back into one state with a few CNOTs, CZs and an S, and a rotation by any other angle splits every term into two with cos(θ/2) I - i sin(θ/2) Z. Shots are drawn exactly by gate by gate sampling, which needs only amplitudes: every shot moves through the circuit with the state, a CNOT or X flips its bits, a phase changes nothing, and only an `sx` redraws one bit from the amplitudes of its two neighbours. Shots that agree so far share those amplitudes. A 40 qubit circuit with three T gates spread along a CNOT chain takes 3 seconds for 40,000 shots, and every qubit's frequency of 1 matches the exact value from the light cone expectation to within 0.0004.
+
+Any other program with more than 30 qubits runs as a matrix product state: one small tensor per qubit, joined by bonds whose size grows with entanglement. A two qubit gate on neighbouring tensors is applied to their product and split back with a singular value decomposition, gates between distant qubits move one tensor next to the other with swaps, and the bonds are capped at 32 by default or at `--bond n`, dropping the smallest singular values. The run reports the weight it dropped, so an approximate answer says so. Without the cap the result is exact, which the tests check against the state vector amplitude by amplitude. A 60 qubit circuit of four layers of arbitrary rotations and CNOTs runs in 1.3 seconds and its marginals match exact light cone values to within sampling noise, and a 40 qubit circuit of twelve layers drops 0.09% of the weight at bond 32. `--bond` also forces this kernel on a small program.
+
+The stabilizer tableau, the bit vector, the stabilizer sum and the matrix product state are chosen in that order, the first that fits, and the run prints which.
+
+## Pulse schedules
+
+`--emit schedule` with a calibration lays the compiled program out in time: every gate starts as soon as its qubits are free, one qubit gates take the calibration's single qubit time, CNOTs its per edge time and measurements its readout time, and phase gates like `rz` take no time because hardware applies them as a frame change. `--emit pulse` writes the same schedule as OpenQASM 3 with OpenPulse calibrations: a port and a drive frame per qubit at the frequency from a `frequency q GHz` line, `rz` as `shift_phase` on that frame, `sx` and `x` as DRAG pulses with the amplitude and DRAG coefficient from an optional `drive q amplitude beta` line, and each CNOT as a cross resonance `gaussian_square` pulse from the control's port at the target's frequency, with its amplitude from an optional `cross a b amplitude` line. Idle time becomes explicit `delay` statements. A single pulse per CNOT, without echo or rotary tones, is a starting point to calibrate against a device rather than a finished gate. `examples/line5.cal` has frequencies, so `qirc bell.ll --calibration examples/line5.cal --emit pulse` works as is, and the output is accepted by the reference OpenPulse parser from the OpenQASM project.
+
+## Running on IonQ
+
+`qirc submit program.ll` compiles the program and sends it to IonQ as a job in IonQ's native circuit format, with the API key from the `IONQ_API_KEY` environment variable, `--target` choosing the backend (`simulator` by default, or a QPU such as `qpu.aria-1`) and `--shots` the shot count. It waits for the job, then prints the counts per result like a local run. `--emit ionq` prints the job instead of sending it. IonQ measures every qubit once at the end, so the program must be straight line with its measurements last. qirc keeps its single dependency by calling the `curl` that ships with Windows, macOS and Linux, and passes the key to it on standard input, so it never appears in the process list. The submission, polling and result mapping are tested end to end against a local server that imitates IonQ's API; a real job needs your own key, which IonQ gives out free with access to its cloud simulator.
 
 With `--calibration` and `--noisy`, every gate is followed by a random Pauli error with the probability the calibration gives for it, uniform over the nonidentity Paulis on its qubits, and every measurement result flips with the readout error of its qubit. Pauli errors are Clifford, so noisy Clifford programs still run on the tableau. For a 5 qubit GHZ state on `examples/line5.cal` the fraction of correct shots is 0.885 against a `--emit cost` estimate of 0.861, which counts every error as fatal.
 
@@ -429,6 +444,9 @@ The tests include:
 
 - A qubit index that depends on a measurement cannot be resolved, because qubits are assigned at compile time.
 - Recursion that is not a tail call is only expanded when its depth is known at compile time, up to 10,000 calls deep, or 32 in the browser.
+- Above 30 qubits a circuit without structure to exploit runs as a matrix product state, which is exact only while its entanglement fits the bond cap and otherwise reports the weight it dropped.
+- OpenQASM 3 input reads classical values that are set once. Values that change, `bool`, `break` and subroutines are refused.
+- `qirc submit` talks to IonQ only, and has been tested against a local imitation of its API rather than a live account.
 - OpenQASM 3 output writes branches as `if` and `else`, loops as a `while` over blocks, classical values as typed variables and recorded values as `output` variables. A floating point remainder, a pointer cast or a value recorded inside a loop is refused rather than approximated, and `--emit qir` keeps them.
 - QIR output decomposes a controlled gate that has no QIR function of its own, and refuses one with three or more controls.
 

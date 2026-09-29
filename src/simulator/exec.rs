@@ -1,12 +1,16 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::bits::{self, Bits};
 use super::matrix::{Matrix2, matrix_for};
+use super::mps::{self, Mps};
+use super::rank::{self, Rank};
 use super::simd;
-use super::state::{Rng, Sampler, State};
+use super::state::{self, Rng, Sampler, State};
 use super::tableau::{self, Tableau};
 use crate::calibration::{Calibration, Clock};
 use crate::ir::*;
+use crate::transpile::{self, GateSet};
 
 const STABILIZER_ABOVE: usize = 20;
 
@@ -63,6 +67,31 @@ impl Backend for Bits {
         if x {
             Bits::flip(self, qubit);
         }
+    }
+}
+
+impl Backend for Mps {
+    fn gate(&mut self, gate: &Gate, params: &[f64]) {
+        self.apply(gate, params);
+    }
+
+    fn pauli(&mut self, qubit: usize, x: bool, z: bool) {
+        if x {
+            self.one(qubit, &Matrix2::x());
+        }
+        if z {
+            self.one(qubit, &Matrix2::z());
+        }
+    }
+}
+
+impl Backend for Rank {
+    fn gate(&mut self, gate: &Gate, params: &[f64]) {
+        self.apply(gate, params);
+    }
+
+    fn pauli(&mut self, qubit: usize, x: bool, z: bool) {
+        Rank::pauli(self, qubit, x, z);
     }
 }
 
@@ -131,13 +160,83 @@ impl Sample for Bits {
     }
 }
 
+impl Sample for Mps {
+    type Sampler = Mps;
+
+    fn sampler(&self) -> Mps {
+        self.prepared()
+    }
+
+    fn sample(
+        &self,
+        sampler: &Mps,
+        plan: &[(QubitId, ResultId)],
+        rng: &mut Rng,
+        results: &mut [bool],
+    ) {
+        let mut measured = vec![None; self.qubits()];
+        for (qubit, result) in plan {
+            if result.index() < results.len() {
+                measured[qubit.index()] = Some(result.index());
+            }
+        }
+        sampler.draw(&measured, rng, results);
+    }
+}
+
+impl Sample for Rank {
+    type Sampler = Cell<usize>;
+
+    fn sampler(&self) -> Cell<usize> {
+        Cell::new(0)
+    }
+
+    fn sample(
+        &self,
+        next: &Cell<usize>,
+        plan: &[(QubitId, ResultId)],
+        _: &mut Rng,
+        results: &mut [bool],
+    ) {
+        let shot = next.get();
+        next.set(shot + 1);
+        for (qubit, result) in plan {
+            if let Some(slot) = results.get_mut(result.index()) {
+                *slot = self.shot(shot, qubit.index());
+            }
+        }
+    }
+}
+
+fn ranked(program: &Program) -> Option<Program> {
+    if !wide(program) || needs_per_shot(program) {
+        return None;
+    }
+    let mut lowered = program.clone();
+    transpile::transpile(&mut lowered, &GateSet::parse("rz-sx-cx").ok()?);
+    let rotations = lowered.gates().filter(|g| rank::rotation(g)).count();
+    let supported = lowered.gates().all(rank::supports);
+    (supported && rotations <= rank::MAX_ROTATIONS).then_some(lowered)
+}
+
 fn classical(program: &Program) -> bool {
     let qubits = program.num_qubits as usize;
     qubits > STABILIZER_ABOVE && qubits <= bits::MAX_QUBITS && program.gates().all(bits::supports)
 }
 
+fn wide(program: &Program) -> bool {
+    program.num_qubits as usize > state::MAX_QUBITS && !classical(program) && !stabilizer(program)
+}
+
+fn local(program: &Program) -> Option<Program> {
+    let mut lowered = program.clone();
+    transpile::transpile(&mut lowered, &GateSet::native().local());
+    let supported = lowered.gates().all(mps::supports);
+    supported.then_some(lowered)
+}
+
 pub fn scalable(program: &Program) -> bool {
-    classical(program) || stabilizer(program)
+    classical(program) || stabilizer(program) || wide(program) && local(program).is_some()
 }
 
 pub fn stabilizer(program: &Program) -> bool {
@@ -154,6 +253,10 @@ pub fn kernel(program: &Program) -> &'static str {
         "classical bits"
     } else if stabilizer(program) {
         "stabilizer tableau"
+    } else if ranked(program).is_some() {
+        "stabilizer rank"
+    } else if wide(program) {
+        "matrix product state"
     } else {
         simd::backend()
     }
@@ -186,6 +289,7 @@ pub struct ExecOutcome {
     pub messages: Vec<String>,
     pub outputs: Vec<String>,
     pub sampled: bool,
+    pub discarded: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -237,8 +341,30 @@ pub fn needs_per_shot(program: &Program) -> bool {
     false
 }
 
+pub fn execute_bonded(program: &Program, config: ExecConfig, bond: usize) -> Option<ExecOutcome> {
+    let lowered = local(program)?;
+    let fresh = || Mps::new(lowered.num_qubits as usize, bond);
+    let (mut outcome, state) = if needs_per_shot(&lowered) {
+        shots(&lowered, config, None, fresh, Mps::measure, &mut |_| {})
+    } else {
+        let (outcome, state) = execute_sampled(&lowered, config, fresh());
+        (outcome, Some(state))
+    };
+    outcome.discarded = state.map_or(0.0, |s| s.discarded);
+    Some(outcome)
+}
+
 pub fn execute(program: &Program, config: ExecConfig) -> ExecOutcome {
     let qubits = program.num_qubits as usize;
+    if let Some(lowered) = ranked(program) {
+        let rank = Rank::new(qubits, config.shots as usize, config.seed);
+        return execute_sampled(&lowered, config, rank).0;
+    }
+    if wide(program)
+        && let Some(outcome) = execute_bonded(program, config, mps::DEFAULT_BOND)
+    {
+        return outcome;
+    }
     if classical(program) && needs_per_shot(program) {
         let once = ExecConfig { shots: 1, ..config };
         let mut outcome = shots(
@@ -396,6 +522,7 @@ fn execute_sampled<S: Sample>(
         messages,
         outputs,
         sampled: true,
+        discarded: 0.0,
     };
     (outcome, state)
 }
@@ -427,6 +554,20 @@ pub fn execute_noisy(
             &mut |_| {},
         )
         .0;
+    }
+    if wide(program)
+        && let Some(lowered) = local(program)
+    {
+        let (mut outcome, state) = shots(
+            &lowered,
+            config,
+            Some(calibration),
+            || Mps::new(qubits, mps::DEFAULT_BOND),
+            Mps::measure,
+            &mut |_| {},
+        );
+        outcome.discarded = state.map_or(0.0, |s| s.discarded);
+        return outcome;
     }
     let (mut outcome, state) = shots(
         program,
@@ -554,6 +695,7 @@ fn shots<S: Backend>(
         messages,
         outputs,
         sampled: false,
+        discarded: 0.0,
     };
     (outcome, last_state)
 }
@@ -876,8 +1018,138 @@ fn render_output(
 
 #[cfg(test)]
 mod tests {
+    use std::f64::consts::FRAC_PI_2;
+
     use super::*;
+    use crate::diag::Span;
     use crate::qasm;
+
+    fn random_circuit(qubits: usize, gates: usize, seed: u64) -> Program {
+        let mut rng = Rng::new(seed);
+        let mut pick = |n: usize| rng.next_u64() as usize % n;
+        let mut source = format!("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{qubits}];\n");
+        let one = [
+            "h",
+            "t",
+            "sx",
+            "rx(0.7)",
+            "ry(1.3)",
+            "rz(-0.4)",
+            "u3(0.3, 1.1, -0.6)",
+        ];
+        for _ in 0..gates {
+            let a = pick(qubits);
+            let b = (a + 1 + pick(qubits - 1)) % qubits;
+            match pick(4) {
+                0 => source += &format!("cx q[{a}], q[{b}];\n"),
+                1 => source += &format!("crz(0.9) q[{a}], q[{b}];\n"),
+                _ => source += &format!("{} q[{a}];\n", one[pick(one.len())]),
+            }
+        }
+        let (program, diagnostics) = qasm::lower(&source);
+        assert!(diagnostics.is_empty());
+        program
+    }
+
+    #[test]
+    fn matrix_product() {
+        for seed in 0..6 {
+            let program = random_circuit(10, 80, seed);
+            let exact = execute_vector(&program, ExecConfig::default())
+                .final_state
+                .unwrap();
+            let lowered = local(&program).unwrap();
+            let chain = finish(&lowered, Mps::new(10, 1 << 10));
+            assert_eq!(chain.discarded, 0.0);
+            for basis in 0..exact.len() {
+                let difference = (exact.amplitude(basis) - chain.amplitude(basis)).norm();
+                assert!(difference < 1e-9, "seed {seed} basis {basis}");
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_product_samples() {
+        let mut program = random_circuit(6, 40, 11);
+        let measures: Vec<Op> = (0..6)
+            .map(|q| Op::Measure {
+                qubit: QubitId(q),
+                result: ResultId(q),
+                span: Span::DUMMY,
+            })
+            .collect();
+        program.blocks[0].ops.extend(measures);
+        program.num_results = 6;
+        let config = ExecConfig {
+            shots: 40_000,
+            seed: 5,
+            keep_state: false,
+        };
+        let vector = execute_vector(&program, config).counts;
+        let chain = execute_bonded(&program, config, 64).unwrap().counts;
+        let keys: HashSet<&String> = vector.keys().chain(chain.keys()).collect();
+        let distance: u64 = keys
+            .into_iter()
+            .map(|key| {
+                vector
+                    .get(key)
+                    .unwrap_or(&0)
+                    .abs_diff(*chain.get(key).unwrap_or(&0))
+            })
+            .sum();
+        assert!(distance < 2400, "{distance}");
+        let truncated = execute_bonded(&random_circuit(8, 120, 3), config, 1).unwrap();
+        assert!(truncated.discarded > 0.01);
+    }
+
+    #[test]
+    fn stabilizer_rank_samples() {
+        for seed in 0..4 {
+            let source = random_circuit(7, 60, 20 + seed);
+            let mut lowered = source.clone();
+            transpile::transpile(&mut lowered, &GateSet::parse("rz-sx-cx").unwrap());
+            let mut rotations = 0;
+            for op in &mut lowered.blocks[0].ops {
+                if let Op::Gate(gate) = op
+                    && rank::rotation(gate)
+                {
+                    rotations += 1;
+                    if rotations > 6 {
+                        gate.params = vec![Operand::Const(Const::Float(FRAC_PI_2))];
+                    }
+                }
+            }
+            let measures: Vec<Op> = (0..7)
+                .map(|q| Op::Measure {
+                    qubit: QubitId(q),
+                    result: ResultId(q),
+                    span: Span::DUMMY,
+                })
+                .collect();
+            lowered.blocks[0].ops.extend(measures);
+            lowered.num_results = 7;
+            let config = ExecConfig {
+                shots: 20_000,
+                seed,
+                keep_state: false,
+            };
+            let vector = execute_vector(&lowered, config).counts;
+            let sampled = execute_sampled(&lowered, config, Rank::new(7, 20_000, seed))
+                .0
+                .counts;
+            let keys: HashSet<&String> = vector.keys().chain(sampled.keys()).collect();
+            let distance: u64 = keys
+                .into_iter()
+                .map(|key| {
+                    vector
+                        .get(key)
+                        .unwrap_or(&0)
+                        .abs_diff(*sampled.get(key).unwrap_or(&0))
+                })
+                .sum();
+            assert!(distance < 2400, "seed {seed}: {distance}");
+        }
+    }
 
     #[test]
     fn noisy_bits() {

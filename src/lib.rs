@@ -16,6 +16,8 @@ pub mod opt;
 pub mod parse;
 mod pauli;
 mod phase;
+pub mod provider;
+pub mod pulse;
 pub mod qasm;
 pub mod qasm2;
 pub mod qis;
