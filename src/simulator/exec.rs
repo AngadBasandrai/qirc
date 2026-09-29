@@ -208,11 +208,70 @@ impl Sample for Rank {
     }
 }
 
+fn deferred(program: &Program) -> Option<Program> {
+    let [block] = &program.blocks[..] else {
+        return None;
+    };
+    let mut next = program.num_qubits;
+    let mut ops = Vec::with_capacity(block.ops.len());
+    let mut last = Vec::new();
+    for op in &block.ops {
+        match op {
+            Op::Assign {
+                expr: Expr::ReadResult(_),
+                ..
+            } => return None,
+            Op::Measure {
+                qubit,
+                result,
+                span,
+            } => {
+                let copy = QubitId(next);
+                next += 1;
+                ops.push(Op::Gate(Gate {
+                    kind: GateKind::X,
+                    controls: vec![*qubit],
+                    targets: vec![copy],
+                    params: Vec::new(),
+                    span: *span,
+                }));
+                last.push(Op::Measure {
+                    qubit: copy,
+                    result: *result,
+                    span: *span,
+                });
+            }
+            Op::Reset { qubit, span } => {
+                let fresh = QubitId(next);
+                next += 1;
+                ops.push(Op::Gate(Gate {
+                    kind: GateKind::Swap,
+                    controls: Vec::new(),
+                    targets: vec![*qubit, fresh],
+                    params: Vec::new(),
+                    span: *span,
+                }));
+            }
+            Op::RecordOutput { .. } => last.push(op.clone()),
+            _ => ops.push(op.clone()),
+        }
+    }
+    ops.extend(last);
+    let mut out = program.clone();
+    out.blocks[0].ops = ops;
+    out.num_qubits = next;
+    Some(out)
+}
+
 fn ranked(program: &Program) -> Option<Program> {
-    if !wide(program) || needs_per_shot(program) {
+    if !wide(program) {
         return None;
     }
-    let mut lowered = program.clone();
+    let mut lowered = if needs_per_shot(program) {
+        deferred(program)?
+    } else {
+        program.clone()
+    };
     transpile::transpile(&mut lowered, &GateSet::parse("rz-sx-cx").ok()?);
     let rotations = lowered.gates().filter(|g| rank::rotation(g)).count();
     let supported = lowered.gates().all(rank::supports);
@@ -357,7 +416,8 @@ pub fn execute_bonded(program: &Program, config: ExecConfig, bond: usize) -> Opt
 pub fn execute(program: &Program, config: ExecConfig) -> ExecOutcome {
     let qubits = program.num_qubits as usize;
     if let Some(lowered) = ranked(program) {
-        let rank = Rank::new(qubits, config.shots as usize, config.seed);
+        let width = lowered.num_qubits as usize;
+        let rank = Rank::new(width, config.shots as usize, config.seed);
         return execute_sampled(&lowered, config, rank).0;
     }
     if wide(program)
@@ -583,23 +643,60 @@ pub fn execute_noisy(
     outcome
 }
 
+#[derive(Clone, Copy)]
+pub enum Snapshot<'a> {
+    Vector(&'a State),
+    Tableau(&'a Tableau),
+    Bits(&'a Bits),
+    Chain(&'a Mps),
+}
+
 pub fn average_noisy(
     program: &Program,
     config: ExecConfig,
     calibration: &Calibration,
-    value: impl Fn(&State) -> f64,
-) -> f64 {
+    value: impl Fn(Snapshot) -> f64,
+) -> Option<f64> {
     let qubits = program.num_qubits as usize;
+    let noise = Some(calibration);
     let mut total = 0.0;
-    shots(
-        program,
-        config,
-        Some(calibration),
-        || State::new(qubits),
-        State::measure,
-        &mut |state| total += value(state),
-    );
-    total / config.shots.max(1) as f64
+    if classical(program) {
+        let mut add = |s: &Bits| total += value(Snapshot::Bits(s));
+        shots(
+            program,
+            config,
+            noise,
+            || Bits::new(qubits),
+            Bits::measure,
+            &mut add,
+        );
+    } else if stabilizer(program) {
+        let mut add = |s: &Tableau| total += value(Snapshot::Tableau(s));
+        shots(
+            program,
+            config,
+            noise,
+            || Tableau::new(qubits),
+            Tableau::measure,
+            &mut add,
+        );
+    } else if wide(program) {
+        let lowered = local(program)?;
+        let fresh = || Mps::new(qubits, mps::DEFAULT_BOND);
+        let mut add = |s: &Mps| total += value(Snapshot::Chain(s));
+        shots(&lowered, config, noise, fresh, Mps::measure, &mut add);
+    } else {
+        let mut add = |s: &State| total += value(Snapshot::Vector(s));
+        shots(
+            program,
+            config,
+            noise,
+            || State::new(qubits),
+            State::measure,
+            &mut add,
+        );
+    }
+    Some(total / config.shots.max(1) as f64)
 }
 
 fn depolarize<S: Backend>(state: &mut S, gate: &Gate, calibration: &Calibration, rng: &mut Rng) {
@@ -1142,6 +1239,92 @@ mod tests {
                 .into_iter()
                 .map(|key| {
                     vector
+                        .get(key)
+                        .unwrap_or(&0)
+                        .abs_diff(*sampled.get(key).unwrap_or(&0))
+                })
+                .sum();
+            assert!(distance < 2400, "seed {seed}: {distance}");
+        }
+    }
+
+    #[test]
+    fn deferred_measurements() {
+        for seed in 0..4 {
+            let mut rng = Rng::new(40 + seed);
+            let mut source = String::from(
+                "OPENQASM 2.0;
+include \"qelib1.inc\";
+qreg q[5];
+",
+            );
+            for index in 0..40 {
+                let a = rng.next_u64() as usize % 5;
+                let b = (a + 1 + rng.next_u64() as usize % 4) % 5;
+                source += &match rng.next_u64() % 5 {
+                    0 | 1 => format!(
+                        "cx q[{a}], q[{b}];
+"
+                    ),
+                    2 => format!(
+                        "h q[{a}];
+"
+                    ),
+                    3 if index % 10 == 0 => format!(
+                        "t q[{a}];
+"
+                    ),
+                    _ => format!(
+                        "s q[{a}];
+"
+                    ),
+                };
+            }
+            let (mut program, diagnostics) = qasm::lower(&source);
+            assert!(diagnostics.is_empty());
+            let mut ops = Vec::new();
+            for (index, op) in program.blocks[0].ops.drain(..).enumerate() {
+                ops.push(op);
+                let qubit = QubitId((index % 5) as u32);
+                match index % 9 {
+                    3 => ops.push(Op::Measure {
+                        qubit,
+                        result: ResultId((index / 9 % 4) as u32),
+                        span: Span::DUMMY,
+                    }),
+                    7 => ops.push(Op::Reset {
+                        qubit,
+                        span: Span::DUMMY,
+                    }),
+                    _ => {}
+                }
+            }
+            ops.push(Op::Measure {
+                qubit: QubitId(0),
+                result: ResultId(4),
+                span: Span::DUMMY,
+            });
+            program.blocks[0].ops = ops;
+            program.num_results = 5;
+            let config = ExecConfig {
+                shots: 20_000,
+                seed,
+                keep_state: false,
+            };
+            let reference = execute(&program, config).counts;
+            let mut lowered = deferred(&program).unwrap();
+            transpile::transpile(&mut lowered, &GateSet::parse("rz-sx-cx").unwrap());
+            let rotations = lowered.gates().filter(|g| rank::rotation(g)).count();
+            assert!(rotations <= rank::MAX_ROTATIONS);
+            let width = lowered.num_qubits as usize;
+            let sampled = execute_sampled(&lowered, config, Rank::new(width, 20_000, seed))
+                .0
+                .counts;
+            let keys: HashSet<&String> = reference.keys().chain(sampled.keys()).collect();
+            let distance: u64 = keys
+                .into_iter()
+                .map(|key| {
+                    reference
                         .get(key)
                         .unwrap_or(&0)
                         .abs_diff(*sampled.get(key).unwrap_or(&0))

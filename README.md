@@ -4,9 +4,9 @@ A compiler and state vector simulator for [QIR](https://github.com/qir-alliance/
 
 qirc reads QIR `.ll` files and OpenQASM 2 and 3 programs, checks them against the QIR profile they declare, optimises the circuit, and then either simulates it or emits OpenQASM 3, QIR or JSON. It can also lower a circuit to a hardware gate set and route it onto a limited qubit connectivity map.
 
-Try it in the browser at https://angadbasandrai.github.io/qirc/.
+Try it in the browser at <https://angadbasandrai.github.io/qirc/>.
 
-```
+```text
 $ qirc tests/corpus/base_profile_bell.ll --shots 1000
 source:  tests/corpus/base_profile_bell.ll
 kernel:  AVX2 + FMA (4 x f64 lanes)
@@ -42,7 +42,7 @@ simulated in 851.600µs
 
 Each release on GitHub carries a prebuilt `qirc` for Linux (x86_64 and arm64), macOS (Intel and Apple silicon) and Windows, and Python wheels for the same platforms.
 
-```
+```text
 cargo install qirc-compiler
 pip install qirc
 ```
@@ -53,7 +53,7 @@ The crate is published as `qirc-compiler` because `qirc` was taken on crates.io.
 
 Requires Rust 1.88 or newer.
 
-```
+```text
 cargo build --release
 ./target/release/qirc --help
 ```
@@ -62,7 +62,7 @@ The only direct dependency is `num-complex`.
 
 ## Usage
 
-```
+```text
 qirc <input.ll | input.qasm> [options]
 qirc diff <a> [b] [options]
 qirc submit <input> [options]
@@ -122,7 +122,7 @@ qirc submit <input> [options]
 
 Errors point at the source:
 
-```
+```text
 error[QIR0300]: the Base Profile forbids branching
   --> teleport.ll:11:1
    |
@@ -136,7 +136,7 @@ error[QIR0300]: the Base Profile forbids branching
 
 A file whose first statement is `OPENQASM 2.0;` or `OPENQASM 3.0;` is read as OpenQASM instead of LLVM IR, so every command works on it: simulate it, optimise and route it, `qirc diff` it against a QIR program, or turn it into QIR with `--emit qir`.
 
-```
+```text
 $ qirc bell.qasm --emit qir -O2 --gates rz-sx-cx
 ```
 
@@ -154,7 +154,7 @@ The frontend parses the subset of textual LLVM IR that QIR producers emit: typed
 
 Lowering first tries to evaluate the program's classical control flow at compile time. Loops over constant ranges are unrolled, `getelementptr` over a global array of qubit ids resolves to a qubit, helper functions are interpreted, and arithmetic folds to constants. Values that depend on a measurement are kept as instructions. The program only keeps its control flow graph when a branch actually depends on a measurement, as in teleportation or repeat until success loops.
 
-Recursive functions are expanded too. A function whose calls to itself are all tail calls becomes a loop before anything else runs, with a `phi` for each parameter that changes between calls, so recursion that stops on a measurement result, such as a repeat until success written as a function that calls itself again after a failure, compiles to the same loop a hand written version would. Any other recursion is interpreted at compile time when its depth is known, up to 10,000 calls deep; the compiler runs on its own thread with a large stack so that depth is safe in debug builds too. Recursion that is neither a tail call nor bounded at compile time is refused with an error at the call.
+Recursive functions are expanded too. Functions that call each other in a cycle are first merged, each absorbing the others' bodies, and a function whose calls to itself are then all tail calls becomes a loop before anything else runs, with a `phi` for each parameter that changes between calls, so recursion that stops on a measurement result, such as a repeat until success written as a function that calls itself again after a failure, compiles to the same loop a hand written version would. Any other recursion is interpreted at compile time when its depth is known, up to 10,000 calls deep; the compiler runs on its own thread with a large stack so that depth is safe in debug builds too. Recursion that is neither a tail call nor bounded at compile time is refused with an error at the call.
 
 This is what lets Q# style output compile. A loop like
 
@@ -170,7 +170,7 @@ body:
 
 becomes
 
-```
+```text
 h q0
 cx q0, q1
 cx q1, q2
@@ -212,7 +212,7 @@ On `tests/corpus/pyqir_simple.ll`, `-O3` takes the circuit from 12 gates at dept
 
 `--gates` rebuilds every gate from a target set: a preset such as `rz-sx-cx` for IBM style devices or `rz-ry-cz`, or any list of gates such as `rx,ry,cy`. `--exclude` removes gates from the full QIR set instead, and `--basis` is kept as a name for `--gates`. Multi qubit gates reduce to CNOTs and single qubit matrices first. The CNOT is then mapped onto whichever entangler the set has, and each single qubit matrix is rebuilt from Euler angles over two rotation axes, from one axis plus a fixed gate, or by an exact search over fixed gates such as `h,s,t`. A gate the set cannot express exactly is reported and left as written. A Toffoli that a later identical Toffoli undoes, with only gates in between that use its three qubits as controls or only add phases to them, is lowered together with its partner as a pair of relative phase Toffolis, each 3 CNOTs and 4 T gates instead of 6 and 7, because the phases the two halves add cancel. A six control X gate built from a ladder of Toffolis on ancillas drops from 63 T gates and 54 CNOTs to 39 and 30 on `h,s,t,cx`. On 600 random programs full of such pairs, with phases, rotations and conflicting gates in between, `qirc diff` finds every result equivalent.
 
-```
+```text
 $ qirc tests/corpus/base_profile_bell.ll --exclude h,cx --emit ir
   x q0
   ry(-1.5707963267948966) q0
@@ -237,7 +237,7 @@ A calibration can also give durations in nanoseconds as `time cx a b ns`, `time 
 
 `--zne` with `--observable` and `--calibration` runs zero noise extrapolation. The program is simulated with the calibration's errors at one, two and three times their rates, with T1 and T2 shortened to match, the expectation value is averaged over the final state of every shot, and a quadratic through the three points is extended to zero noise, which is 3 E1 - 3 E2 + E3. For `Z0 Z4` on a 5 qubit GHZ state on `examples/line5.cal`, the exact value is 1, one times noise gives 0.938 and the extrapolation gives 0.993. In a program with branches or loops every block starts from the same layout, and a block that jumps elsewhere swaps its qubits back before the jump, so each successor sees the layout it expects.
 
-```
+```text
 $ qirc tests/corpus/qsharp_loop.ll --emit qasm3 --basis rz-sx-cx --coupling line:4
 OPENQASM 3.0;
 include "stdgates.inc";
@@ -275,13 +275,47 @@ worst = qirc.cost(source, gates="rz-sx-cx")["worst"]
 
 `compile` returns the text of any emit kind, `run` returns measurement counts, `diff` returns `"equivalent"`, `"different"` or `"inconclusive"`, and `cost` returns the per path counts from `--emit cost` as dictionaries. Options are keywords with the command line values: `opt`, `gates`, `exclude`, `resynth`, `cost`, `coupling` and `calibration`, plus `relabel=True`. With a calibration, `cost` also reports the estimated `success` probability. Compile errors raise `qirc.CompileError` with the rendered diagnostics, and warnings go through the `warnings` module.
 
+With `pip install "qirc[qiskit]"`, qirc is also a Qiskit optimization stage: `transpile(circuit, basis_gates=["rz", "sx", "x", "cx"], optimization_level=3, optimization_method="qirc")` runs Qiskit's optimization and then qirc's, keeping whichever circuit has fewer two qubit gates.
+
+### From Q# and PyQIR
+
+Q# and PyQIR both produce QIR text, which every qirc function accepts as it is.
+
+```python
+from qdk import qsharp
+import qirc
+
+qsharp.init(target_profile=qsharp.TargetProfile.Adaptive_RI)
+qsharp.eval(open("Teleport.qs").read())
+counts = qirc.run(str(qsharp.compile("Teleport()")), shots=1000)
+```
+
+```python
+from pyqir import BasicQisBuilder, SimpleModule
+import qirc
+
+module = SimpleModule("bell", num_qubits=2, num_results=2)
+qis = BasicQisBuilder(module.builder)
+qis.h(module.qubits[0])
+qis.cx(module.qubits[0], module.qubits[1])
+qis.mz(module.qubits[0], module.results[0])
+qis.mz(module.qubits[1], module.results[1])
+counts = qirc.run(module.ir(), shots=1000)
+```
+
+`str(qsharp.compile(...))` is the module Q# would submit to hardware, so `qirc.compile(..., emit="qasm3")`, `qirc.diff` and `qirc.cost` work on it the same way. The older `import qsharp` package works too.
+
+## Editors
+
+`qirc lsp` is a language server: it reads QIR and OpenQASM files from an editor over stdin and stdout and answers with the same diagnostics the command line prints, codes and notes included, on every change. Any editor with a language client can start it as `qirc lsp` to show qirc's errors as you type.
+
 ## Playground
 
-Try it at https://angadbasandrai.github.io/qirc/.
+Try it at <https://angadbasandrai.github.io/qirc/>.
 
 `web/` builds qirc for the browser. The page has the full command line and every emit kind, an editor with QIR highlighting, line numbers and example programs, and it runs the compiler in a Web Worker so a long simulation can be stopped. Diagnostics keep their colours and link to the line they point at. Beside the text output it draws the compiled circuit block by block, charts measurement counts or final state probabilities, and shows how qubits, gates, two qubit gates, T gates and depth changed from the source. A `.ll` file can be opened or dropped on the editor, and when the page is served on its own it can save the output and copy a link that carries the program and command. Nothing is sent to a server.
 
-```
+```text
 cargo build --release --target wasm32-unknown-unknown --manifest-path web/Cargo.toml
 cp web/target/wasm32-unknown-unknown/release/qirc_web.wasm web/qirc.wasm
 python -m http.server --directory web
@@ -295,7 +329,7 @@ The module exports `allocate`, `release` and `run`, which takes the source and t
 
 `--emit circuit` prints an ASCII diagram, `--emit quantikz` writes a LaTeX `quantikz` environment and `--emit svg` a standalone SVG image. The two drawings pack each operation into the earliest column its qubits allow, write angles as fractions of pi where they are, and mark where each block of a branching program starts, as a `\slice` in LaTeX and a dashed line in SVG. The LaTeX needs `\usetikzlibrary{quantikz2}` and compiles with pdflatex.
 
-```
+```text
 $ qirc tests/corpus/base_profile_bell.ll --emit quantikz
 \begin{quantikz}
 \lstick{$q_{0}$} & \gate{H} & \ctrl{1} & \meter{} & \qw \\
@@ -307,7 +341,7 @@ $ qirc tests/corpus/base_profile_bell.ll --emit quantikz
 
 `--emit cost` counts what a compiled program costs without simulating it. Every path from the entry block to a return is listed with its T gates, two qubit gates, total gates, depth and the peak number of qubits in use at once, followed by the worst case over all paths. Depth schedules each gate, measurement and reset as early as its qubits allow. A qubit is in use from its first operation until its last, and a reset frees it. A path that jumps back to a block it already passed ends there, so a loop is counted once per pass. At most 256 paths are listed.
 
-```
+```text
 $ qirc tests/corpus/adaptive_teleport.ll --emit cost -O2 --gates rz-sx-cx
 path                                            t      cx   gates   depth    live
 entry > then_x > join_x > then_z > join_z       0       2      18      13       3
@@ -373,7 +407,7 @@ All three tools remove SWAP gates by relabelling qubits, which qirc does with `-
 
 Compile time over the whole set is about 0.3 s for Qiskit, 26 s for tket and 0.9 s for qirc, or 2.9 s routed with `--cost cx`, counting a process start per circuit. To run it, install `qiskit` and `pytket` and build qirc in release mode:
 
-```
+```text
 python bench/compare.py --qirc target/release/qirc
 python bench/compare.py --qirc target/release/qirc --line
 ```
@@ -382,7 +416,7 @@ python bench/compare.py --qirc target/release/qirc --line
 
 `qirc diff a.ll` compiles `a.ll` twice, once at `-O0` and once with the given options, and compares them branch by branch. Every measurement splits the run into both outcomes, and each outcome must have the same probability, the same recorded values and the same final state up to global phase. `qirc diff a.ll b.ll` compares two different programs the same way.
 
-```
+```text
 $ qirc diff tests/corpus/qsharp_teleport.ll -O3 --gates rz-sx-cx --resynth 4
 equivalent: 8 outcomes agree in probability and final state
 ```
@@ -403,7 +437,7 @@ A program with more than 20 qubits whose gates only permute basis states (X, Y, 
 
 `--observable` prints the exact expectation value of a sum of Pauli strings, written like `Z0 Z1 + 0.5 X2 - 2*Y3`. Measurements at the end of the program are left out, so the value is taken on the state just before them, and a program that branches on mid circuit measurements is averaged exactly over every branch, weighted by its probability. On the teleportation example the teleported qubit gives 0.707107 for both `Z2` and `X2`, as `ry(pi/4)` should. A program without mid circuit measurements is not limited to 30 qubits: each Pauli string only depends on the gates in its backward light cone, so each is simulated on a small circuit over just the qubits of its cone. A 200 qubit layer of `ry` rotations and CNOT pairs gives `Z199 + X0 X1` exactly in 50 ms. A cone of permutation and phase gates is a basis state, where a string with an X or Y gives 0 and a string of Z gives the sign of the parity of its bits. A cone of Clifford gates is simulated on the stabilizer tableau instead, however wide it is: after basis changes and CNOTs fold the Pauli string onto one qubit, its value is 0 if measuring that qubit would be random and the sign of the deterministic outcome otherwise, so `Y0 Y1 X2 ... X999` on a 1000 qubit GHZ state gives -1. A cone that is neither Clifford nor small enough for a state vector is lowered to `rz`, `sx` and `cx` and the Pauli string is pushed backwards through it in the Heisenberg picture: a CNOT maps each string to one string, a rotation splits a string that anticommutes with it into a cosine and a sine part, and at the start only strings of I and Z count. This stays exact while few rotations touch the cone, so `rz(0.3)`, `t` and `rx(0.2)` on a 100 qubit GHZ state give `X0 ... X99 + Z0 Z99` = 1.446627 in 80 ms, and it gives up once a term expands past 65536 strings.
 
-A straight line program with more than 30 qubits whose gates are Clifford apart from up to 10 rotations by other angles, such as T gates, runs on a sum of stabilizer states. Each state is kept in CH form, which unlike a tableau tracks its global phase, so the terms of the sum can interfere. Lowered to `rz`, `sx` and `cx`, a CNOT or a quarter turn is a row operation on each term, a Hadamard folds the two basis strings it produces back into one state with a few CNOTs, CZs and an S, and a rotation by any other angle splits every term into two with cos(θ/2) I - i sin(θ/2) Z. Shots are drawn exactly by gate by gate sampling, which needs only amplitudes: every shot moves through the circuit with the state, a CNOT or X flips its bits, a phase changes nothing, and only an `sx` redraws one bit from the amplitudes of its two neighbours. Shots that agree so far share those amplitudes. A 40 qubit circuit with three T gates spread along a CNOT chain takes 3 seconds for 40,000 shots, and every qubit's frequency of 1 matches the exact value from the light cone expectation to within 0.0004.
+A straight line program with more than 30 qubits whose gates are Clifford apart from up to 10 rotations by other angles, such as T gates, runs on a sum of stabilizer states. Each state is kept in CH form, which unlike a tableau tracks its global phase, so the terms of the sum can interfere. Lowered to `rz`, `sx` and `cx`, a CNOT or a quarter turn is a row operation on each term, a Hadamard folds the two basis strings it produces back into one state with a few CNOTs, CZs and an S, and a rotation by any other angle splits every term into two with cos(θ/2) I - i sin(θ/2) Z. Shots are drawn exactly by gate by gate sampling, which needs only amplitudes: every shot moves through the circuit with the state, a CNOT or X flips its bits, a phase changes nothing, and only an `sx` redraws one bit from the amplitudes of its two neighbours. Shots that agree so far share those amplitudes. Measurements and resets in the middle of a straight line program are deferred: a measurement becomes a CNOT onto a fresh qubit read at the end, and a reset swaps the qubit with a fresh one, which gives the same statistics exactly. A program that branches on a result goes to the matrix product state instead. A 40 qubit circuit with three T gates spread along a CNOT chain takes 3 seconds for 40,000 shots, and every qubit's frequency of 1 matches the exact value from the light cone expectation to within 0.0004.
 
 Any other program with more than 30 qubits runs as a matrix product state: one small tensor per qubit, joined by bonds whose size grows with entanglement. A two qubit gate on neighbouring tensors is applied to their product and split back with a singular value decomposition, gates between distant qubits move one tensor next to the other with swaps, and the bonds are capped at 32 by default or at `--bond n`, dropping the smallest singular values. The run reports the weight it dropped, so an approximate answer says so. Without the cap the result is exact, which the tests check against the state vector amplitude by amplitude. A 60 qubit circuit of four layers of arbitrary rotations and CNOTs runs in 1.3 seconds and its marginals match exact light cone values to within sampling noise, and a 40 qubit circuit of twelve layers drops 0.09% of the weight at bond 32. `--bond` also forces this kernel on a small program.
 
@@ -411,7 +445,7 @@ The stabilizer tableau, the bit vector, the stabilizer sum and the matrix produc
 
 ## Pulse schedules
 
-`--emit schedule` with a calibration lays the compiled program out in time: every gate starts as soon as its qubits are free, one qubit gates take the calibration's single qubit time, CNOTs its per edge time and measurements its readout time, and phase gates like `rz` take no time because hardware applies them as a frame change. `--emit pulse` writes the same schedule as OpenQASM 3 with OpenPulse calibrations: a port and a drive frame per qubit at the frequency from a `frequency q GHz` line, `rz` as `shift_phase` on that frame, `sx` and `x` as DRAG pulses with the amplitude and DRAG coefficient from an optional `drive q amplitude beta` line, and each CNOT as a cross resonance `gaussian_square` pulse from the control's port at the target's frequency, with its amplitude from an optional `cross a b amplitude` line. Idle time becomes explicit `delay` statements. A single pulse per CNOT, without echo or rotary tones, is a starting point to calibrate against a device rather than a finished gate. `examples/line5.cal` has frequencies, so `qirc bell.ll --calibration examples/line5.cal --emit pulse` works as is, and the output is accepted by the reference OpenPulse parser from the OpenQASM project.
+`--emit schedule` with a calibration lays the compiled program out in time: every gate starts as soon as its qubits are free, one qubit gates take the calibration's single qubit time, CNOTs its per edge time and measurements its readout time, and phase gates like `rz` take no time because hardware applies them as a frame change. `--emit pulse` writes the same schedule as OpenQASM 3 with OpenPulse calibrations: a port and a drive frame per qubit at the frequency from a `frequency q GHz` line, `rz` as `shift_phase` on that frame, `sx` and `x` as DRAG pulses with the amplitude and DRAG coefficient from an optional `drive q amplitude beta` line, and each CNOT as a cross resonance `gaussian_square` pulse from the control's port at the target's frequency, with its amplitude from an optional `cross a b amplitude` line. A qubit with a `resonator q GHz` line, and an optional amplitude after it, gets a readout tone on a measure frame and a `capture_v2` on an acquire frame as its `defcal measure`, lasting the calibration's readout time; other qubits keep the device's own measurement. Idle time becomes explicit `delay` statements. A single pulse per CNOT, without echo or rotary tones, is a starting point to calibrate against a device rather than a finished gate. `examples/line5.cal` has frequencies, so `qirc bell.ll --calibration examples/line5.cal --emit pulse` works as is, and the output is accepted by the reference OpenPulse parser from the OpenQASM project.
 
 ## Running on IonQ
 
@@ -421,7 +455,7 @@ With `--calibration` and `--noisy`, every gate is followed by a random Pauli err
 
 ## Testing
 
-```
+```text
 cargo test
 ```
 
@@ -452,4 +486,4 @@ The tests include:
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](https://github.com/AngadBasandrai/qirc/blob/main/LICENSE).

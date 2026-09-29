@@ -533,6 +533,46 @@ impl Mps {
         }
     }
 
+    pub fn expectation(&self, paulis: &[(usize, Matrix2)]) -> C64 {
+        let mut env = vec![C64::new(1.0, 0.0)];
+        for (k, site) in self.sites.iter().enumerate() {
+            let m = paulis
+                .iter()
+                .find(|(q, _)| self.site_of[*q] == k)
+                .map_or(Matrix2::identity(), |(_, m)| *m);
+            let op = [[m.a, m.b], [m.c, m.d]];
+            let (left, right) = (site.left, site.right);
+            let mut next = vec![C64::new(0.0, 0.0); right * right];
+            for l in 0..left {
+                for (s, row) in op.iter().enumerate() {
+                    for r in 0..right {
+                        let bra = site.at(l, s, r).conj();
+                        if bra == C64::new(0.0, 0.0) {
+                            continue;
+                        }
+                        for m in 0..left {
+                            let e = env[l * left + m];
+                            if e == C64::new(0.0, 0.0) {
+                                continue;
+                            }
+                            for (t, &o) in row.iter().enumerate() {
+                                if o == C64::new(0.0, 0.0) {
+                                    continue;
+                                }
+                                let weight = bra * e * o;
+                                for q in 0..right {
+                                    next[r * right + q] += weight * site.at(m, t, q);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            env = next;
+        }
+        env[0]
+    }
+
     pub fn amplitude(&self, basis: usize) -> C64 {
         let mut vector = vec![C64::new(1.0, 0.0)];
         for (k, site) in self.sites.iter().enumerate() {

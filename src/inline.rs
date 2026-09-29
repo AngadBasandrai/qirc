@@ -14,9 +14,21 @@ pub struct Inlined {
 pub fn inline_module(module: &Module) -> Inlined {
     let mut working = module.clone();
     let mut diagnostics = Vec::new();
-    for function in &mut working.functions {
-        if let Some(looped) = loop_tail_calls(function) {
-            *function = looped;
+    for index in 0..working.functions.len() {
+        for round in 0..module.functions.len() {
+            let Some(site) = partner_call(&working, index) else {
+                break;
+            };
+            working.functions[index] = expand(
+                &working.functions[index],
+                &working.functions[site.callee_index],
+                &site,
+                MAX_ROUNDS + round + 1,
+            );
+        }
+        thread_returns(&mut working.functions[index]);
+        if let Some(looped) = loop_tail_calls(&working.functions[index]) {
+            working.functions[index] = looped;
         }
     }
 
@@ -76,15 +88,15 @@ fn calls(function: &Function) -> impl Iterator<Item = &Call> {
         })
 }
 
-fn recursive(module: &Module, name: &str) -> bool {
-    let mut seen = vec![name.to_string()];
-    let mut stack = vec![name.to_string()];
+fn reaches(module: &Module, from: &str, to: &str) -> bool {
+    let mut seen = vec![from.to_string()];
+    let mut stack = vec![from.to_string()];
     while let Some(current) = stack.pop() {
         let Some(function) = module.functions.iter().find(|f| f.sig.name == current) else {
             continue;
         };
         for callee in calls(function).filter_map(Call::callee_name) {
-            if callee == name {
+            if callee == to {
                 return true;
             }
             if !seen.iter().any(|s| s == callee) {
@@ -94,6 +106,100 @@ fn recursive(module: &Module, name: &str) -> bool {
         }
     }
     false
+}
+
+fn recursive(module: &Module, name: &str) -> bool {
+    reaches(module, name, name)
+}
+
+fn partner_call(module: &Module, index: usize) -> Option<CallSite> {
+    let function = &module.functions[index];
+    let name = &function.sig.name;
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        for (inst_index, inst) in block.instructions.iter().enumerate() {
+            let InstKind::Call(call) = &inst.kind else {
+                continue;
+            };
+            let Some(callee) = call.callee_name().filter(|c| c != name) else {
+                continue;
+            };
+            let Some(callee_index) = module.functions.iter().position(|f| f.sig.name == callee)
+            else {
+                continue;
+            };
+            if reaches(module, callee, name) && reaches(module, name, callee) {
+                return Some(CallSite {
+                    block: block_index,
+                    instruction: inst_index,
+                    callee_index,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn thread_returns(function: &mut Function) {
+    let exits: Vec<(String, Vec<Instruction>, Option<TypedValue>)> = function
+        .blocks
+        .iter()
+        .filter(|block| {
+            block
+                .instructions
+                .iter()
+                .all(|inst| matches!(inst.kind, InstKind::Phi { .. }))
+        })
+        .filter_map(|block| match &block.terminator {
+            Terminator::Ret(value) => Some((
+                block.label.clone(),
+                block.instructions.clone(),
+                value.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let mut threaded: Vec<(String, String)> = Vec::new();
+    for block in &mut function.blocks {
+        let Terminator::Br { target } = &block.terminator else {
+            continue;
+        };
+        let Some((exit, phis, value)) = exits.iter().find(|(label, ..)| label == target) else {
+            continue;
+        };
+        let returned = value.as_ref().map(|typed| {
+            let incoming = phis
+                .iter()
+                .find_map(|inst| match (&inst.result, &inst.kind) {
+                    (Some(result), InstKind::Phi { incoming, .. })
+                        if typed.value == Value::Local(result.clone()) =>
+                    {
+                        incoming
+                            .iter()
+                            .find(|(_, from)| *from == block.label)
+                            .map(|(v, _)| v.clone())
+                    }
+                    _ => None,
+                });
+            TypedValue {
+                ty: typed.ty.clone(),
+                value: incoming.unwrap_or_else(|| typed.value.clone()),
+                span: typed.span,
+            }
+        });
+        threaded.push((exit.clone(), block.label.clone()));
+        block.terminator = Terminator::Ret(returned);
+    }
+    for block in &mut function.blocks {
+        for inst in &mut block.instructions {
+            if let InstKind::Phi { incoming, .. } = &mut inst.kind {
+                incoming.retain(|(_, from)| {
+                    !threaded
+                        .iter()
+                        .any(|(exit, source)| *exit == block.label && source == from)
+                });
+            }
+        }
+    }
 }
 
 fn tail_call<'a>(block: &'a BasicBlock, name: &str) -> Option<&'a Call> {

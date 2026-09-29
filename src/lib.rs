@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, doc = include_str!("../README.md"))]
+
 pub mod ast;
 pub mod calibration;
 pub mod codegen;
@@ -8,9 +10,11 @@ pub mod driver;
 pub mod equiv;
 pub mod inline;
 pub mod ir;
+pub mod json;
 mod kak;
 pub mod lex;
 pub mod lower;
+pub mod lsp;
 pub mod observable;
 pub mod opt;
 pub mod parse;

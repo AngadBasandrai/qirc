@@ -6,8 +6,10 @@ use crate::ir::{Expr, Op, Program, QubitId, ResultId, Term, keep_marked};
 use crate::pauli;
 use crate::route::remap;
 use crate::simulator::bits::{self, Bits};
-use crate::simulator::exec::{self, ExecConfig};
+use crate::simulator::exec::{self, ExecConfig, Snapshot};
 use crate::simulator::matrix::C64;
+use crate::simulator::matrix::Matrix2;
+use crate::simulator::mps::Mps;
 use crate::simulator::state::{self, State};
 use crate::simulator::tableau::Tableau;
 
@@ -90,7 +92,31 @@ impl Product {
     }
 
     fn stabilizer_value(&self, program: &Program, wire: &[usize]) -> f64 {
-        let mut tableau = exec::finish(program, Tableau::new(program.num_qubits as usize));
+        let tableau = exec::finish(program, Tableau::new(program.num_qubits as usize));
+        self.tableau_value(&tableau, wire)
+    }
+
+    fn chain_value(&self, chain: &Mps) -> f64 {
+        let paulis: Vec<(usize, Matrix2)> = self
+            .paulis
+            .iter()
+            .map(|&(q, pauli)| {
+                let m = match pauli {
+                    Pauli::X => Matrix2::x(),
+                    Pauli::Y => Matrix2::y(),
+                    Pauli::Z => Matrix2::z(),
+                };
+                (q, m)
+            })
+            .collect();
+        self.weight * chain.expectation(&paulis).re
+    }
+
+    fn tableau_value(&self, tableau: &Tableau, wire: &[usize]) -> f64 {
+        if self.paulis.is_empty() {
+            return self.weight;
+        }
+        let mut tableau = tableau.clone();
         let wires: Vec<usize> = self
             .paulis
             .iter()
@@ -182,6 +208,19 @@ impl Observable {
         self.terms
             .iter()
             .map(|term| term.value(state, &identity))
+            .sum()
+    }
+
+    fn snapshot(&self, snapshot: Snapshot) -> f64 {
+        let identity: Vec<usize> = (0..self.qubits).collect();
+        self.terms
+            .iter()
+            .map(|term| match snapshot {
+                Snapshot::Vector(state) => term.value(state, &identity),
+                Snapshot::Tableau(tableau) => term.tableau_value(tableau, &identity),
+                Snapshot::Bits(bits) => term.classical_value(bits, &identity),
+                Snapshot::Chain(chain) => term.chain_value(chain),
+            })
             .sum()
     }
 }
@@ -317,18 +356,15 @@ pub fn noisy_expectation(
     seed: u64,
 ) -> Result<f64, String> {
     check(program, observable)?;
-    fits(program)?;
     let config = ExecConfig {
         shots,
         seed,
         keep_state: false,
     };
-    Ok(exec::average_noisy(
-        &terminal(program),
-        config,
-        calibration,
-        |state| observable.value(state),
-    ))
+    exec::average_noisy(&terminal(program), config, calibration, |snapshot| {
+        observable.snapshot(snapshot)
+    })
+    .ok_or_else(|| "the program has gates the wide simulators cannot run".into())
 }
 
 pub fn extrapolate(
@@ -470,6 +506,27 @@ qreg q[5];
             let exact = term.value(state, &identity);
             let tableau = term.stabilizer_value(program, &identity);
             assert!((exact - tableau).abs() < 1e-9, "{source}");
+        });
+    }
+
+    #[test]
+    fn chain_terms() {
+        let gates = [
+            ("h", 1),
+            ("t", 1),
+            ("sx", 1),
+            ("rx(0.3)", 1),
+            ("u3(0.4, 0.2, 1.3)", 1),
+            ("cx", 2),
+            ("cz", 2),
+            ("crz(0.5)", 2),
+            ("swap", 2),
+        ];
+        let identity: Vec<usize> = (0..5).collect();
+        random_terms(40, &gates, |source, term, program, state| {
+            let exact = term.value(state, &identity);
+            let chain = exec::finish(program, Mps::new(5, 64));
+            assert!((exact - term.chain_value(&chain)).abs() < 1e-9, "{source}");
         });
     }
 

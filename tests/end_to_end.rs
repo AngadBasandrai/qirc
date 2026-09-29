@@ -1729,4 +1729,72 @@ stop:
     assert_eq!(deep.gate_count(), 10_000);
     let too_deep = driver::compile(&module(climb, "  call void @climb(i64 20000)\n"), 0);
     assert!(errors(&too_deep).join("\n").contains("calls deep"));
+
+    let split = attempt("").replace(
+        "  call void @__quantum__qis__reset__body(%Qubit* %a)\n  call void @attempt(",
+        "  call void @retry(",
+    ) + "
+
+define void @retry(%Qubit* %q, %Qubit* %a, %Result* %r) {
+entry:
+  call void @__quantum__qis__reset__body(%Qubit* %a)
+  call void @attempt(%Qubit* %q, %Qubit* %a, %Result* %r)
+  ret void
+}";
+    let mutual = compile(&module(&split, call), 1);
+    assert_eq!(run(&mutual, 30_000, 3).counts, counts);
+}
+
+#[test]
+fn wide_noiseless_averages() {
+    let edges: String = (0..39)
+        .map(|q| {
+            format!(
+                "cx {q} {} 0
+",
+                q + 1
+            )
+        })
+        .collect();
+    let silent = Calibration::parse(&edges).unwrap();
+    let chain: String = (0..39)
+        .map(|q| {
+            format!(
+                "cx q[{q}], q[{}];
+",
+                q + 1
+            )
+        })
+        .collect();
+    let ghz = compile(
+        &format!(
+            "OPENQASM 2.0;
+include \"qelib1.inc\";
+qreg q[40];
+h q[0];
+{chain}"
+        ),
+        0,
+    );
+    let rotated = compile(
+        &format!(
+            "OPENQASM 2.0;
+include \"qelib1.inc\";
+qreg q[40];
+ry(0.7) q[0];
+{chain}rx(0.4) q[39];
+"
+        ),
+        0,
+    );
+    for (program, text) in [(ghz, "Z0 Z39 + 0.5 X0 X1"), (rotated, "Z0 Z39 + Y39")] {
+        let observable = Observable::parse(text).unwrap();
+        let exact = observable::expectation(&program, &observable).unwrap();
+        let averaged =
+            observable::noisy_expectation(&program, &observable, &silent, 20, 1).unwrap();
+        assert!(
+            (exact - averaged).abs() < 1e-9,
+            "{text}: {exact} vs {averaged}"
+        );
+    }
 }

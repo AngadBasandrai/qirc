@@ -268,6 +268,8 @@ usage:
   qirc submit <input.ll> [options]
                     run on IonQ with the key in IONQ_API_KEY, on --target
                     (default simulator) with --shots
+  qirc lsp          report diagnostics for .ll and .qasm files to an editor
+                    over the language server protocol on stdin and stdout
 
 options:
   --emit <kind>     run | ir | qasm3 | qasm2 | stim | pulse | schedule | ionq | qir | json

@@ -314,7 +314,21 @@ out = measure q;
     let flipped = counts.get("01").copied().unwrap_or(0) as f64 / 30_000.0;
     assert!((flipped - 1.0 / 3.0).abs() < 0.01, "{counts:?}");
 
+    let halves = compile(
+        "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nconst int n = 7 / 2;\nqubit[8] q;\nfor int i in [0:n] x q[i * 5 / 2];\nrx(1 / 2) q[0];\n",
+        0,
+    );
+    let targets: Vec<u32> = halves.gates().map(|g| g.targets[0].0).collect();
+    assert_eq!(targets, [0, 2, 5, 7, 0]);
+    let angle = halves.gates().last().and_then(|g| g.constant_angle());
+    assert_eq!(angle, Some(0.5));
+
     for (source, message) in [
+        (
+            "OPENQASM 3.0;\nint[4] big = 100;\n",
+            "does not fit in `int[4]`",
+        ),
+        ("OPENQASM 3.0;\nuint u = -1;\n", "does not fit in `uint`"),
         ("OPENQASM 3.0;\nint k;\n", "needs a value"),
         ("OPENQASM 3.0;\nconst int n = 2;\nn = 3;\n", "cannot change"),
         (

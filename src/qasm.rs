@@ -114,6 +114,14 @@ enum Angle {
 
 impl Angle {
     fn eval(&self, env: &HashMap<String, f64>) -> Result<f64, Diagnostic> {
+        self.value(env, false)
+    }
+
+    fn integer(&self, env: &HashMap<String, f64>) -> Result<f64, Diagnostic> {
+        self.value(env, true)
+    }
+
+    fn value(&self, env: &HashMap<String, f64>, integer: bool) -> Result<f64, Diagnostic> {
         Ok(match self {
             Angle::Number(n) => *n,
             Angle::Name(name, span) => match name.as_str() {
@@ -125,20 +133,21 @@ impl Angle {
                         .primary(*span, "not defined here")
                 })?,
             },
-            Angle::Neg(e) => -e.eval(env)?,
+            Angle::Neg(e) => -e.value(env, integer)?,
             Angle::Binary(op, a, b) => {
-                let (a, b) = (a.eval(env)?, b.eval(env)?);
+                let (a, b) = (a.value(env, integer)?, b.value(env, integer)?);
                 match op {
                     '+' => a + b,
                     '-' => a - b,
                     '*' => a * b,
                     '%' => a % b,
                     '^' => a.powf(b),
+                    _ if integer => (a / b).trunc(),
                     _ => a / b,
                 }
             }
             Angle::Call(name, arg, span) => {
-                let x = arg.eval(env)?;
+                let x = arg.value(env, integer)?;
                 match name.as_str() {
                     "sin" => x.sin(),
                     "cos" => x.cos(),
@@ -487,7 +496,7 @@ impl Builder {
     }
 
     fn whole(&self, angle: &Angle, span: Span) -> Result<usize, Diagnostic> {
-        let value = angle.eval(&self.env)?;
+        let value = angle.integer(&self.env)?;
         if value >= 0.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX) {
             Ok(value as usize)
         } else {
@@ -870,10 +879,10 @@ impl Builder {
             return Ok(values);
         }
         parser.expect("[")?;
-        let mut bounds = vec![parser.expr()?.eval(&self.env)?];
+        let mut bounds = vec![parser.expr()?.integer(&self.env)?];
         while parser.symbol(":") {
             parser.at += 1;
-            bounds.push(parser.expr()?.eval(&self.env)?);
+            bounds.push(parser.expr()?.integer(&self.env)?);
         }
         parser.expect("]")?;
         let (start, step, end) = match bounds[..] {
@@ -950,11 +959,15 @@ impl Builder {
             ))
             .primary(parser.span(), "here"));
         }
-        if parser.symbol("[") {
+        let width = if parser.symbol("[") {
             parser.at += 1;
-            parser.expr()?;
+            let at = parser.span();
+            let width = self.whole(&parser.expr()?, at)?;
             parser.expect("]")?;
-        }
+            Some(width)
+        } else {
+            None
+        };
         let (name, span) = parser.name()?;
         if !parser.symbol("=") {
             return Err(Diagnostic::error(format!(
@@ -963,8 +976,30 @@ impl Builder {
             .primary(span, "declared here"));
         }
         parser.at += 1;
-        let value = parser.expr()?.eval(&self.env)?;
+        let expression = parser.expr()?;
+        let integral = matches!(ty.as_str(), "int" | "uint");
+        let value = if integral {
+            expression.integer(&self.env)?.trunc()
+        } else {
+            expression.eval(&self.env)?
+        };
         parser.expect(";")?;
+        let fits = match (ty.as_str(), width) {
+            ("uint", Some(bits)) => value >= 0.0 && value < 2f64.powi(bits as i32),
+            ("uint", None) => value >= 0.0,
+            ("int", Some(bits)) => {
+                let half = 2f64.powi(bits as i32 - 1);
+                value >= -half && value < half
+            }
+            _ => true,
+        };
+        if !fits {
+            let declared = width.map_or(ty.clone(), |bits| format!("{ty}[{bits}]"));
+            return Err(
+                Diagnostic::error(format!("{value} does not fit in `{declared}`"))
+                    .primary(span, "declared here"),
+            );
+        }
         if self.env.contains_key(&name) || self.registers.contains_key(&name) {
             return Err(Diagnostic::error(format!("`{name}` is already declared"))
                 .primary(span, "declared again here"));

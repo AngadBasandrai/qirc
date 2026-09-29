@@ -24,7 +24,7 @@ impl Rng {
     }
 }
 
-pub const MAX_QUBITS: usize = 30;
+pub const MAX_QUBITS: usize = if cfg!(target_arch = "wasm32") { 20 } else { 30 };
 
 pub fn memory_required(n: usize) -> Option<u64> {
     1u64.checked_shl(n as u32)?.checked_mul(16)

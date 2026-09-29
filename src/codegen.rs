@@ -4,6 +4,7 @@ use std::fmt::{self, Write as _};
 use std::mem;
 
 use crate::ir::*;
+use crate::json;
 use crate::simulator::matrix::Matrix2;
 use crate::synth::Synth;
 use crate::transpile::{self, GateSet};
@@ -1404,7 +1405,7 @@ pub fn emit_json(program: &Program) -> String {
     let mut out = String::new();
 
     out.push_str("{\n");
-    writeln!(out, "  \"name\": {},", json_string(&program.name)).unwrap();
+    writeln!(out, "  \"name\": {},", json::quoted(&program.name)).unwrap();
     writeln!(out, "  \"profile\": {:?},", program.profile.name()).unwrap();
     writeln!(out, "  \"qubits\": {},", program.num_qubits).unwrap();
     writeln!(out, "  \"results\": {},", program.num_results).unwrap();
@@ -1414,7 +1415,7 @@ pub fn emit_json(program: &Program) -> String {
 
     for (index, block) in program.blocks.iter().enumerate() {
         out.push_str("    {\n");
-        writeln!(out, "      \"label\": {},", json_string(&block.label)).unwrap();
+        writeln!(out, "      \"label\": {},", json::quoted(&block.label)).unwrap();
         out.push_str("      \"ops\": [\n");
 
         let lines: Vec<String> = block.ops.iter().filter_map(json_op).collect();
@@ -1427,7 +1428,7 @@ pub fn emit_json(program: &Program) -> String {
         writeln!(
             out,
             "      \"terminator\": {}",
-            json_string(&json_term(program, &block.term))
+            json::quoted(&json_term(program, &block.term))
         )
         .unwrap();
         out.push_str("    }");
@@ -1438,20 +1439,6 @@ pub fn emit_json(program: &Program) -> String {
     }
 
     out.push_str("  ]\n}\n");
-    out
-}
-
-fn json_string(text: &str) -> String {
-    let mut out = String::from("\"");
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if u32::from(c) < 0x20 => write!(out, "\\u{:04x}", u32::from(c)).unwrap(),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
     out
 }
 

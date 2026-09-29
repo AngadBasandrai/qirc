@@ -1,10 +1,8 @@
 use std::{ptr, slice};
 
 use qirc::diag::SourceFile;
-use qirc::driver::{self, Emit, Output};
-use qirc::simulator::exec;
+use qirc::driver::{self, Output};
 
-const MAX_QUBITS: u32 = 20;
 const LINE5: &str = include_str!("../../examples/line5.cal");
 
 #[unsafe(no_mangle)]
@@ -64,17 +62,6 @@ fn execute(source: &str, args: &str, output: &mut Output) -> i32 {
             return 2;
         }
     };
-
-    if options.diff || matches!(options.emit, Emit::Run) {
-        let program = driver::compile(source, 0).program;
-        let qubits = program.num_qubits;
-        if qubits > MAX_QUBITS && !exec::scalable(&program) {
-            output.stderr.push_str(&format!(
-                "error: this program needs {qubits} qubits, the playground simulates at most {MAX_QUBITS}\n"
-            ));
-            return 1;
-        }
-    }
 
     let file = SourceFile::new(options.input.display().to_string(), source);
     driver::run_source(&options, &file, None, output)

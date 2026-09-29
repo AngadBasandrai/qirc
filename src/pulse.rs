@@ -55,6 +55,16 @@ fn used(program: &Program) -> BTreeSet<usize> {
         .collect()
 }
 
+fn measured(program: &Program) -> BTreeSet<usize> {
+    program
+        .ops()
+        .filter_map(|op| match op {
+            Op::Measure { qubit, .. } => Some(qubit.index()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn pairs(program: &Program) -> BTreeSet<(usize, usize)> {
     program
         .gates()
@@ -103,6 +113,21 @@ pub fn emit(program: &Program, calibration: &Calibration) -> Result<String, Stri
         let hertz = calibration.frequency(t).unwrap_or_default() * 1e9;
         writeln!(out, "  frame q{c}_q{t}_cross = newframe(d{c}, {hertz}, 0);").unwrap();
     }
+    let readouts: Vec<(usize, f64, f64)> = measured(&program)
+        .into_iter()
+        .filter_map(|q| {
+            calibration
+                .resonator(q)
+                .map(|(ghz, amplitude)| (q, ghz, amplitude))
+        })
+        .collect();
+    for &(q, ghz, _) in &readouts {
+        let hertz = ghz * 1e9;
+        writeln!(out, "  port m{q};").unwrap();
+        writeln!(out, "  port a{q};").unwrap();
+        writeln!(out, "  frame q{q}_measure = newframe(m{q}, {hertz}, 0);").unwrap();
+        writeln!(out, "  frame q{q}_acquire = newframe(a{q}, {hertz}, 0);").unwrap();
+    }
     out.push_str("}\n\n");
     for &q in &qubits {
         let length = single(calibration, q);
@@ -140,6 +165,18 @@ pub fn emit(program: &Program, calibration: &Calibration) -> Result<String, Stri
             "defcal cx ${c}, ${t} {{\n  play(q{c}_q{t}_cross, gaussian_square({}, {length}ns, {}ns, {rise}ns));\n}}",
             calibration.cross(c, t),
             length - 4.0 * rise
+        )
+        .unwrap();
+    }
+    for &(q, _, amplitude) in &readouts {
+        let length = calibration.duration(&Op::Measure {
+            qubit: QubitId(q as u32),
+            result: ResultId(0),
+            span: Span::DUMMY,
+        });
+        writeln!(
+            out,
+            "defcal measure ${q} -> bit {{\n  play(q{q}_measure, constant({amplitude}, {length}ns));\n  return capture_v2(q{q}_acquire, {length}ns);\n}}"
         )
         .unwrap();
     }
@@ -199,7 +236,7 @@ mod tests {
     #[test]
     fn schedules() {
         let calibration = Calibration::parse(
-            "cx 0 1 0.01\ntime single 0 40\ntime single 1 40\ntime cx 0 1 300\nfrequency 0 5.1\nfrequency 1 4.9\ndrive 1 0.25 0.3\n",
+            "cx 0 1 0.01\ntime single 0 40\ntime single 1 40\ntime cx 0 1 300\nfrequency 0 5.1\nfrequency 1 4.9\ndrive 1 0.25 0.3\ntime readout 0 800\nresonator 0 7.2 0.15\n",
         )
         .unwrap();
         let (program, _) = qasm::lower(
@@ -209,9 +246,13 @@ mod tests {
         assert!(pulses.contains("frame q0_q1_cross = newframe(d0, 4900000000, 0);"));
         assert!(pulses.contains("play(q1_drive, drag(0.25, 40ns, 10ns, 0.3));"));
         assert!(pulses.contains("delay[40ns] $1;\ncx $0, $1;"));
+        assert!(pulses.contains(
+            "defcal measure $0 -> bit {\n  play(q0_measure, constant(0.15, 800ns));\n  return capture_v2(q0_acquire, 800ns);\n}"
+        ));
+        assert!(!pulses.contains("defcal measure $1"));
         let timeline = schedule(&program, &calibration).unwrap();
         assert!(
-            timeline.contains("total 340.0 ns on 2 qubits"),
+            timeline.contains("total 1140.0 ns on 2 qubits"),
             "{timeline}"
         );
         let silent = Calibration::parse("cx 0 1 0.01\n").unwrap();

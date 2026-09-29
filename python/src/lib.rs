@@ -263,6 +263,7 @@ fn cost_report<'py>(
 }
 
 #[pymodule]
+#[pyo3(name = "_qirc")]
 fn qirc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CompileError", m.py().get_type::<CompileError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

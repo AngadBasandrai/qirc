@@ -83,3 +83,20 @@ def test_errors():
         qirc.compile(BELL, gates="nonsense")
     with pytest.raises(TypeError, match="colour"):
         qirc.compile(BELL, colour="red")
+
+
+def test_qiskit_plugin():
+    qiskit = pytest.importorskip("qiskit")
+    from qiskit.circuit.random import random_circuit
+    from qiskit.quantum_info import Operator
+
+    basis = ["rz", "sx", "x", "cx"]
+    for seed in range(4):
+        circuit = random_circuit(4, 8, max_operands=3, seed=seed)
+        default = qiskit.transpile(circuit, basis_gates=basis, optimization_level=3, seed_transpiler=1)
+        ours = qiskit.transpile(
+            circuit, basis_gates=basis, optimization_level=3, seed_transpiler=1, optimization_method="qirc"
+        )
+        assert Operator.from_circuit(ours).equiv(Operator(circuit)), seed
+        assert set(ours.count_ops()) <= set(basis), ours.count_ops()
+        assert ours.count_ops().get("cx", 0) <= default.count_ops().get("cx", 0), (seed, ours.count_ops())

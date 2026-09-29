@@ -22,5 +22,12 @@ classifiers = [
 Homepage = "https://angadbasandrai.github.io/qirc/"
 Repository = "https://github.com/AngadBasandrai/qirc"
 
+[project.optional-dependencies]
+qiskit = ["qiskit>=1.0"]
+
+[project.entry-points."qiskit.transpiler.optimization"]
+qirc = "qirc.qiskit:QircPlugin"
+
 [tool.maturin]
-module-name = "qirc"
+module-name = "qirc._qirc"
+python-source = "pysrc"

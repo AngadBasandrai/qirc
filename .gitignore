@@ -3,3 +3,6 @@
 /web/qirc.wasm
 /python/target
 __pycache__/
+/python/pysrc/qirc/*.pyd
+/python/pysrc/qirc/*.so
+/python/pysrc/qirc/*.pdb

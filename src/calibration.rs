@@ -21,6 +21,7 @@ pub struct Calibration {
     frequency: HashMap<usize, f64>,
     drive: HashMap<usize, (f64, f64)>,
     cross: HashMap<(usize, usize), f64>,
+    resonator: HashMap<usize, (f64, f64)>,
 }
 
 fn lookup<K: Eq + Hash>(map: &HashMap<K, f64>, key: K) -> f64 {
@@ -72,7 +73,7 @@ impl Calibration {
             }
             let shape = || {
                 format!(
-                    "line {number}: expected `cx a b error`, `single q error`, `readout q error`, `time cx a b ns`, `time single q ns`, `time readout q ns`, `t1 q us`, `t2 q us`, `frequency q GHz`, `drive q amplitude beta` or `cross a b amplitude`"
+                    "line {number}: expected `cx a b error`, `single q error`, `readout q error`, `time cx a b ns`, `time single q ns`, `time readout q ns`, `t1 q us`, `t2 q us`, `frequency q GHz`, `drive q amplitude beta`, `cross a b amplitude` or `resonator q GHz [amplitude]`"
                 )
             };
             let length = |word: &str| match word.parse::<f64>() {
@@ -155,6 +156,17 @@ impl Calibration {
                         .insert(q, (number_in(amplitude, 0.0, 1.0)?, beta));
                     q
                 }
+                ["resonator", q, ghz] | ["resonator", q, ghz, _] => {
+                    let q = qubit(q)?;
+                    let amplitude = match words.get(3) {
+                        Some(word) => number_in(word, 0.0, 1.0)?,
+                        None => 0.1,
+                    };
+                    calibration
+                        .resonator
+                        .insert(q, (number_in(ghz, 0.0, 1000.0)?, amplitude));
+                    q
+                }
                 ["cross", a, b, amplitude] => {
                     let (a, b) = (qubit(a)?, qubit(b)?);
                     calibration
@@ -210,6 +222,10 @@ impl Calibration {
 
     pub fn drive(&self, q: usize) -> (f64, f64) {
         self.drive.get(&q).copied().unwrap_or((0.2, 0.0))
+    }
+
+    pub fn resonator(&self, q: usize) -> Option<(f64, f64)> {
+        self.resonator.get(&q).copied()
     }
 
     pub fn cross(&self, control: usize, target: usize) -> f64 {
