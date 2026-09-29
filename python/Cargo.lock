@@ -118,14 +118,14 @@ dependencies = [
 
 [[package]]
 name = "qirc-compiler"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "num-complex",
 ]
 
 [[package]]
 name = "qirc-python"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "pyo3",
  "qirc-compiler",
