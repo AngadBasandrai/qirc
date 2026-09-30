@@ -1,5 +1,7 @@
 use num_complex::Complex;
 use std::fmt;
+use std::num::NonZero;
+use std::thread;
 
 use super::matrix::{C64, Matrix2};
 use super::simd;
@@ -24,6 +26,73 @@ impl Rng {
     }
 }
 
+const PARALLEL_ABOVE: usize = 21;
+const MAX_WORKERS: usize = 16;
+
+type Halves<'a> = (
+    usize,
+    &'a mut [f64],
+    &'a mut [f64],
+    &'a mut [f64],
+    &'a mut [f64],
+);
+
+fn pair((offset, re0, re1, im0, im1): Halves<'_>, m: &Matrix2, controls: u64) {
+    for i in 0..re0.len() {
+        if ((offset + i) as u64 & controls) != controls {
+            continue;
+        }
+        let (a, b) = (C64::new(re0[i], im0[i]), C64::new(re1[i], im1[i]));
+        let (x, y) = (m.a * a + m.b * b, m.c * a + m.d * b);
+        (re0[i], im0[i], re1[i], im1[i]) = (x.re, x.im, y.re, y.im);
+    }
+}
+
+fn apply_parallel(
+    re: &mut [f64],
+    im: &mut [f64],
+    m: &Matrix2,
+    target: usize,
+    controls: u64,
+    workers: usize,
+) {
+    let chunk = (re.len() / workers.next_power_of_two()).max(2);
+    let low = (chunk - 1) as u64;
+    if (1usize << target) < chunk {
+        let high = controls & !low;
+        thread::scope(|scope| {
+            for (i, (r, j)) in re.chunks_mut(chunk).zip(im.chunks_mut(chunk)).enumerate() {
+                if (i * chunk) as u64 & high == high {
+                    scope.spawn(move || simd::apply_1q(r, j, m, target, controls & low));
+                }
+            }
+        });
+        return;
+    }
+    let stride = 1usize << target;
+    let mut tasks: Vec<Halves<'_>> = Vec::new();
+    for (block, (r, j)) in re
+        .chunks_mut(2 * stride)
+        .zip(im.chunks_mut(2 * stride))
+        .enumerate()
+    {
+        let (r0, r1) = r.split_at_mut(stride);
+        let (j0, j1) = j.split_at_mut(stride);
+        let halves = r0
+            .chunks_mut(chunk)
+            .zip(r1.chunks_mut(chunk))
+            .zip(j0.chunks_mut(chunk).zip(j1.chunks_mut(chunk)));
+        for (k, ((a, b), (c, d))) in halves.enumerate() {
+            tasks.push((block * 2 * stride + k * chunk, a, b, c, d));
+        }
+    }
+    thread::scope(|scope| {
+        for task in tasks {
+            scope.spawn(move || pair(task, m, controls));
+        }
+    });
+}
+
 pub const MAX_QUBITS: usize = if cfg!(target_arch = "wasm32") { 20 } else { 30 };
 
 pub fn memory_required(n: usize) -> Option<u64> {
@@ -35,6 +104,19 @@ pub struct Sampler {
 }
 
 impl Sampler {
+    pub fn from_probabilities(probabilities: &[f64]) -> Sampler {
+        let mut running = 0.0;
+        Sampler {
+            cumulative: probabilities
+                .iter()
+                .map(|p| {
+                    running += p;
+                    running
+                })
+                .collect(),
+        }
+    }
+
     pub fn draw(&self, rng: &mut Rng) -> usize {
         let total = self.cumulative.last().copied().unwrap_or(0.0);
         let point = rng.next_unit() * total;
@@ -105,7 +187,25 @@ impl State {
         if target >= self.n {
             return;
         }
-        simd::apply_1q(&mut self.re, &mut self.im, matrix, target, controls);
+        let workers = if cfg!(target_arch = "wasm32") || self.n < PARALLEL_ABOVE {
+            1
+        } else {
+            thread::available_parallelism()
+                .map_or(1, NonZero::get)
+                .min(MAX_WORKERS)
+        };
+        if workers > 1 {
+            apply_parallel(
+                &mut self.re,
+                &mut self.im,
+                matrix,
+                target,
+                controls,
+                workers,
+            );
+        } else {
+            simd::apply_1q(&mut self.re, &mut self.im, matrix, target, controls);
+        }
     }
 
     pub fn swap(&mut self, a: usize, b: usize, controls: u64) {
@@ -256,6 +356,42 @@ impl fmt::Display for State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn threads() {
+        let mut rng = Rng::new(17);
+        for round in 0..40 {
+            let n = 8;
+            let target = round % n;
+            let controls = if round % 3 == 0 {
+                0
+            } else {
+                rng.next_u64() & 0xff & !(1 << target)
+            };
+            let theta = rng.next_unit() * 3.0;
+            let m = Matrix2::new(
+                C64::new(theta.cos(), 0.1),
+                C64::new(0.2, theta.sin()),
+                C64::new(-0.3, 0.4),
+                C64::new(theta.sin(), -theta.cos()),
+            );
+            let re: Vec<f64> = (0..1 << n).map(|_| rng.next_unit() - 0.5).collect();
+            let im: Vec<f64> = (0..1 << n).map(|_| rng.next_unit() - 0.5).collect();
+            let (mut single_re, mut single_im) = (re.clone(), im.clone());
+            simd::apply_1q(&mut single_re, &mut single_im, &m, target, controls);
+            for workers in [2, 4, 8] {
+                let (mut many_re, mut many_im) = (re.clone(), im.clone());
+                apply_parallel(&mut many_re, &mut many_im, &m, target, controls, workers);
+                let gap = single_re
+                    .iter()
+                    .zip(&many_re)
+                    .chain(single_im.iter().zip(&many_im))
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f64::max);
+                assert!(gap < 1e-12, "{round} {workers} {target} {controls:b} {gap}");
+            }
+        }
+    }
+
     use super::*;
     use std::f64::consts::{FRAC_PI_3, FRAC_PI_6};
 

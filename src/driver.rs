@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::f64::consts::FRAC_PI_2;
 use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -13,22 +14,27 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::calibration::Calibration;
 use crate::codegen;
 use crate::cost;
-use crate::diag::{Diagnostic, Severity, SourceFile};
+use crate::diag::{Diagnostic, Severity, SourceFile, suggest};
 use crate::draw;
 use crate::equiv;
+use crate::gridsynth;
 use crate::ir::Program;
 use crate::lower;
-use crate::observable::{self, Observable};
+use crate::observable::{self, Observable, Sampled};
 use crate::opt::{self, OptStats};
 use crate::parse::parse_module;
+use crate::progress::{self, Progress};
 use crate::provider;
 use crate::pulse;
 use crate::qasm;
 use crate::qasm2;
+use crate::resources;
 use crate::reuse::{self, Reused};
+use crate::rotations;
 use crate::route::{self, Coupling, Relabelled, RouteStats};
 use crate::sema;
 use crate::simulator::exec::{self, ExecConfig};
+use crate::simulator::state::Rng;
 use crate::simulator::{mps, state};
 use crate::stim;
 use crate::synth::{self, Cost};
@@ -39,8 +45,19 @@ const DIFF_QUBITS: usize = 20;
 const COMPILER_STACK: usize = 256 << 20;
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_DRAWN: usize = 200_000;
+const STEP: f64 = 1e-5;
+const START: f64 = 0.1;
+const MAX_STEPS: usize = 500;
+const FLAT: f64 = 1e-6;
+const NOISY_SHOTS: u64 = 1000;
+const SPSA_STEPS: usize = 150;
+const SPSA_SHIFT: f64 = 0.2;
+const SPSA_FIRST: f64 = 0.2;
+const SPSA_OFFSET: f64 = 15.0;
+const SPSA_TRIALS: usize = 4;
+const SHIFT: f64 = FRAC_PI_2;
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Emit {
     Run,
     Ir,
@@ -56,30 +73,57 @@ pub enum Emit {
     Quantikz,
     Svg,
     Cost,
+    Resources,
+    Rotations,
     Check,
 }
 
+const EMITS: [(&str, Emit); 21] = [
+    ("run", Emit::Run),
+    ("ir", Emit::Ir),
+    ("qasm", Emit::Qasm3),
+    ("qasm3", Emit::Qasm3),
+    ("qasm2", Emit::Qasm2),
+    ("stim", Emit::Stim),
+    ("pulse", Emit::Pulse),
+    ("openpulse", Emit::Pulse),
+    ("schedule", Emit::Schedule),
+    ("ionq", Emit::Ionq),
+    ("qir", Emit::Qir),
+    ("llvm", Emit::Qir),
+    ("json", Emit::Json),
+    ("circuit", Emit::Circuit),
+    ("quantikz", Emit::Quantikz),
+    ("latex", Emit::Quantikz),
+    ("svg", Emit::Svg),
+    ("cost", Emit::Cost),
+    ("resources", Emit::Resources),
+    ("rotations", Emit::Rotations),
+    ("check", Emit::Check),
+];
+
 impl Emit {
     pub fn parse(text: &str) -> Option<Emit> {
-        Some(match text {
-            "run" => Emit::Run,
-            "ir" => Emit::Ir,
-            "qasm" | "qasm3" => Emit::Qasm3,
-            "qasm2" => Emit::Qasm2,
-            "stim" => Emit::Stim,
-            "pulse" | "openpulse" => Emit::Pulse,
-            "schedule" => Emit::Schedule,
-            "ionq" => Emit::Ionq,
-            "qir" | "llvm" => Emit::Qir,
-            "json" => Emit::Json,
-            "circuit" => Emit::Circuit,
-            "quantikz" | "latex" => Emit::Quantikz,
-            "svg" => Emit::Svg,
-            "cost" => Emit::Cost,
-            "check" => Emit::Check,
-            _ => return None,
-        })
+        EMITS
+            .iter()
+            .find(|(name, _)| *name == text)
+            .map(|&(_, emit)| emit)
     }
+}
+
+fn unknown(what: &str, value: &str, candidates: impl IntoIterator<Item = &'static str>) -> String {
+    match suggest(value, candidates) {
+        Some(found) => format!("unknown {what} `{value}`, did you mean `{found}`?"),
+        None => format!("unknown {what} `{value}`"),
+    }
+}
+
+fn option_names() -> impl Iterator<Item = &'static str> {
+    USAGE
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|word| word.starts_with('-'))
+        .map(|word| word.trim_end_matches(','))
 }
 
 #[derive(Clone, Copy)]
@@ -200,6 +244,11 @@ pub struct Options {
     pub mitigate: bool,
     pub zne: bool,
     pub bond: Option<usize>,
+    pub epsilon: Option<f64>,
+    pub budget: f64,
+    pub bindings: HashMap<String, f64>,
+    pub gradient: bool,
+    pub minimize: bool,
     pub observable: Option<Observable>,
     pub coupling: Option<Coupling>,
     pub calibration: Option<Calibration>,
@@ -220,6 +269,8 @@ impl Options {
             relabel: self.relabel,
             reuse: self.reuse,
             calibration: self.calibration.clone(),
+            epsilon: self.epsilon,
+            bindings: self.bindings.clone(),
         }
     }
 }
@@ -245,6 +296,11 @@ impl Default for Options {
             mitigate: false,
             zne: false,
             bond: None,
+            epsilon: None,
+            budget: 1e-3,
+            bindings: HashMap::new(),
+            gradient: false,
+            minimize: false,
             observable: None,
             coupling: None,
             calibration: None,
@@ -268,12 +324,17 @@ usage:
   qirc submit <input.ll> [options]
                     run on IonQ with the key in IONQ_API_KEY, on --target
                     (default simulator) with --shots
+  qirc explain <code>
+                    explain an error code such as QIR0300
+  qirc surface [--distance 3,5,7] [--error p | --calibration f] [--rounds n] [--shots n]
+                    simulate surface code memory and compare its logical error with
+                    the rate --emit resources assumes
   qirc lsp          report diagnostics for .ll and .qasm files to an editor
                     over the language server protocol on stdin and stdout
 
 options:
   --emit <kind>     run | ir | qasm3 | qasm2 | stim | pulse | schedule | ionq | qir | json
-                    | circuit | quantikz | svg | cost | check
+                    | circuit | quantikz | svg | cost | resources | rotations | check
                     (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
   --shots <n>       sample n measurement outcomes
@@ -286,6 +347,13 @@ options:
   --basis <name>    same as --gates
   --resynth <n>     replace runs of gates by at most n gates, 1 to 6
                     (default 1 from -O2)
+  --epsilon <e>     approximate rotations a gate set like h,s,t,cx cannot express,
+                    each to within e in operator norm, down to about 1e-10
+  --bind <list>     values for OpenQASM 3 inputs, such as theta=0.3,phi=1.2
+  --gradient        print how the --observable changes with every input
+  --minimize        vary the inputs to minimise the --observable, starting from --bind;
+                    with --noisy or --zne it runs SPSA on sampled noisy values
+  --budget <p>      total failure probability for --emit resources      (default: 0.001)
   --cost <model>    what resynthesis minimises: gates | cx | ibm       (default: gates)
   --relabel         remove swaps at the end of the program by permuting qubits
   --reuse           reset measured qubits and reuse them to need fewer qubits
@@ -293,6 +361,8 @@ options:
   --target <name>   IonQ target for submit and --emit ionq, such as qpu.aria-1
   --bond <n>        simulate as a matrix product state with bonds up to n (default 32
                     above 30 qubits)
+  --dd              fill idle windows with echo pulses that cancel detuning, using the
+                    gate times from --calibration
   --mitigate        undo the readout errors from --calibration in the counts
   --zne             extrapolate the --observable to zero noise from 1x, 2x and 3x noise
   --observable <p>  print the exact expectation of a Pauli sum such as 'Z0 Z1 + 0.5 X2'
@@ -317,6 +387,7 @@ pub fn parse_args_with(
     let mut options = Options::default();
     let mut input: Option<PathBuf> = None;
     let mut excluded: Option<&str> = None;
+    let mut decouple = false;
     let mut args = args.iter();
     match args.as_slice().first().map(String::as_str) {
         Some("diff") => {
@@ -336,8 +407,8 @@ pub fn parse_args_with(
 
             "--emit" => {
                 let value = value(&mut args, "--emit needs a kind")?;
-                options.emit =
-                    Emit::parse(value).ok_or_else(|| format!("unknown emit kind `{value}`"))?;
+                options.emit = Emit::parse(value)
+                    .ok_or_else(|| unknown("emit kind", value, EMITS.map(|(name, _)| name)))?;
             }
 
             "--shots" => {
@@ -376,6 +447,40 @@ pub fn parse_args_with(
                 };
             }
 
+            "--bind" => {
+                let list = value(&mut args, "--bind needs values such as theta=0.3")?;
+                for pair in list.split(',') {
+                    let parsed = pair
+                        .split_once('=')
+                        .and_then(|(name, number)| {
+                            Some((name.trim(), number.trim().parse::<f64>().ok()?))
+                        })
+                        .filter(|(name, number)| !name.is_empty() && number.is_finite());
+                    let Some((name, number)) = parsed else {
+                        return Err(format!("`{pair}` is not a binding like theta=0.3"));
+                    };
+                    options.bindings.insert(name.to_string(), number);
+                }
+            }
+            "--gradient" => options.gradient = true,
+            "--minimize" | "--minimise" => options.minimize = true,
+
+            "--budget" => {
+                let value = value(&mut args, "--budget needs an error probability")?;
+                options.budget = match value.parse::<f64>() {
+                    Ok(b) if b > 0.0 && b < 1.0 => b,
+                    _ => return Err(format!("budget `{value}` must be above 0 and below 1")),
+                };
+            }
+
+            "--epsilon" => {
+                let value = value(&mut args, "--epsilon needs a precision")?;
+                options.epsilon = match value.parse::<f64>() {
+                    Ok(e) if e > 0.0 && e < 0.5 => Some(e),
+                    _ => return Err(format!("precision `{value}` must be above 0 and below 0.5")),
+                };
+            }
+
             "--cost" => {
                 let value = value(&mut args, "--cost needs a model")?;
                 options.cost = Cost::parse(value).ok_or_else(|| {
@@ -409,6 +514,7 @@ pub fn parse_args_with(
             }
 
             "--mitigate" => options.mitigate = true,
+            "--dd" => decouple = true,
 
             "--zne" => options.zne = true,
 
@@ -463,7 +569,7 @@ pub fn parse_args_with(
                 options.opt_level = level;
             }
 
-            arg if arg.starts_with('-') => return Err(format!("unknown option `{arg}`")),
+            arg if arg.starts_with('-') => return Err(unknown("option", arg, option_names())),
 
             path if input.is_none() => input = Some(PathBuf::from(path)),
 
@@ -491,6 +597,17 @@ pub fn parse_args_with(
     if options.zne && options.observable.is_none() {
         return Err("--zne needs --observable for the value to extrapolate".into());
     }
+    if (options.gradient || options.minimize) && options.observable.is_none() {
+        return Err("--gradient and --minimize need --observable for the value to vary".into());
+    }
+    if decouple {
+        match &mut options.calibration {
+            Some(calibration) if calibration.timed() => calibration.decouple = true,
+            _ => {
+                return Err("--dd needs --calibration with gate times to find idle windows".into());
+            }
+        }
+    }
     Ok(options)
 }
 
@@ -509,6 +626,8 @@ pub struct Target {
     pub relabel: bool,
     pub reuse: bool,
     pub calibration: Option<Calibration>,
+    pub epsilon: Option<f64>,
+    pub bindings: HashMap<String, f64>,
 }
 
 pub struct Compilation {
@@ -551,12 +670,18 @@ fn compile_now(source: &str, opt_level: u8, verify_each: bool, target: &Target) 
     let mut diagnostics = Vec::new();
 
     let (mut program, parse_time, lower_time) = if qasm::is_qasm(source) {
-        let ((program, errors), time) = timed(|| qasm::lower(source));
+        let ((program, errors), time) = timed(|| qasm::lower_with(source, &target.bindings));
         diagnostics.extend(errors);
         (program, time, Duration::ZERO)
     } else {
         let ((module, parse_errors), parse_time) = timed(|| parse_module(source));
         diagnostics.extend(parse_errors);
+        if !target.bindings.is_empty() {
+            diagnostics.push(
+                Diagnostic::error("--bind sets OpenQASM 3 `input` values, and this program is QIR")
+                    .with_code("QIR0100"),
+            );
+        }
         let (lowered, lower_time) = timed(|| lower::lower(&module));
         diagnostics.extend(lowered.diagnostics);
         (lowered.program, parse_time, lower_time)
@@ -590,10 +715,23 @@ fn compile_now(source: &str, opt_level: u8, verify_each: bool, target: &Target) 
     let relabel = target.relabel || coupling.is_some();
     let mut relabelled = relabel.then(|| route::elide_swaps(&mut program));
 
-    let transpiled = target
-        .gates
-        .as_ref()
-        .map(|set| transpile::transpile(&mut program, set));
+    let mut transpiled = target.gates.as_ref().map(|set| match target.epsilon {
+        Some(_) => transpile::transpile(&mut program, &set.clone().with_rotations()),
+        None => transpile::transpile(&mut program, set),
+    });
+    if let (Some(set), Some(epsilon), Some(stats)) = (&target.gates, target.epsilon, &transpiled) {
+        let before = stats.gates_before;
+        match gridsynth::approximate(&mut program, set, epsilon) {
+            Ok(_) => {
+                let mut again = transpile::transpile(&mut program, set);
+                again.gates_before = before;
+                transpiled = Some(again);
+            }
+            Err(message) => {
+                diagnostics.push(Diagnostic::error(message).with_code("QIR0402"));
+            }
+        }
+    }
     if let Some(stats) = &transpiled
         && !stats.leftover.is_empty()
     {
@@ -720,6 +858,11 @@ fn report(file: &SourceFile, compilation: &Compilation, color: bool, output: &mu
             "error: aborting due to {errors} previous error{}",
             if errors == 1 { "" } else { "s" }
         ));
+        if let Some(code) = compilation.diagnostics.iter().find_map(|d| d.code) {
+            output.eprintln(format_args!(
+                "for more on an error, run `qirc explain {code}`"
+            ));
+        }
         return false;
     }
 
@@ -815,6 +958,359 @@ pub fn run(options: Options) -> i32 {
     code
 }
 
+fn bound(options: &Options, source: &str, values: &[(String, f64)]) -> Result<Program, String> {
+    let mut target = options.target();
+    target.bindings = values.iter().cloned().collect();
+    let compilation = compile_for(source, options.opt_level, false, &target);
+    if let Some(error) = compilation
+        .diagnostics
+        .iter()
+        .find(|d| d.severity == Severity::Error)
+    {
+        return Err(error.message.clone());
+    }
+    Ok(compilation.program)
+}
+
+fn energy(options: &Options, source: &str, values: &[(String, f64)]) -> Result<f64, String> {
+    let observable = options.observable.as_ref().ok_or("no observable to vary")?;
+    observable::expectation(&bound(options, source, values)?, observable)
+}
+
+struct Noisy<'a> {
+    options: &'a Options,
+    source: &'a str,
+    observable: &'a Observable,
+    calibration: &'a Calibration,
+    shots: u64,
+    seed: u64,
+}
+
+fn around((plus, plus_error): Sampled, (minus, minus_error): Sampled) -> (Sampled, Sampled) {
+    let error = plus_error.hypot(minus_error) / 2.0;
+    (((plus + minus) / 2.0, error), ((plus - minus) / 2.0, error))
+}
+
+fn moved(values: &[(String, f64)], i: usize, delta: f64) -> Vec<(String, f64)> {
+    let mut moved = values.to_vec();
+    moved[i].1 += delta;
+    moved
+}
+
+impl<'a> Noisy<'a> {
+    fn new(options: &'a Options, source: &'a str) -> Result<Noisy<'a>, String> {
+        Ok(Noisy {
+            options,
+            source,
+            observable: options.observable.as_ref().ok_or("no observable to vary")?,
+            calibration: options
+                .calibration
+                .as_ref()
+                .ok_or("no calibration for the noise")?,
+            shots: options.shots.max(NOISY_SHOTS),
+            seed: options.seed.unwrap_or_else(clock_seed),
+        })
+    }
+
+    fn value(&mut self, values: &[(String, f64)]) -> Result<Sampled, String> {
+        let program = bound(self.options, self.source, values)?;
+        self.seed = self.seed.wrapping_add(1);
+        if self.options.zne {
+            observable::extrapolate(
+                &program,
+                self.observable,
+                self.calibration,
+                self.shots,
+                self.seed,
+            )
+            .map(|(_, zero)| zero)
+        } else {
+            observable::noisy_expectation(
+                &program,
+                self.observable,
+                self.calibration,
+                self.shots,
+                self.seed,
+            )
+        }
+    }
+
+    fn compared(&self, (value, error): Sampled, exact: f64) -> String {
+        let kind = if self.options.zne {
+            "zero noise extrapolation"
+        } else {
+            "noisy value"
+        };
+        format!(
+            "  {kind:<26}{value:.6} ± {error:.6}\n  {:<26}{exact:.6}",
+            "exact value without noise"
+        )
+    }
+
+    fn kick(
+        &mut self,
+        values: &[(String, f64)],
+        shift: f64,
+        rng: &mut Rng,
+    ) -> Result<(Vec<f64>, Sampled), String> {
+        let signs: Vec<f64> = values
+            .iter()
+            .map(|_| if rng.next_u64() & 1 == 1 { 1.0 } else { -1.0 })
+            .collect();
+        let moved = |direction: f64| {
+            values
+                .iter()
+                .zip(&signs)
+                .map(|((name, value), sign)| (name.clone(), value + direction * shift * sign))
+                .collect::<Vec<_>>()
+        };
+        let (mean, (difference, _)) = around(self.value(&moved(1.0))?, self.value(&moved(-1.0))?);
+        let slope = signs
+            .iter()
+            .map(|sign| difference / (shift * sign))
+            .collect();
+        Ok((slope, mean))
+    }
+}
+
+fn noisy_minimize(
+    options: &Options,
+    source: &str,
+    values: &mut [(String, f64)],
+    output: &mut Output,
+) -> Result<(), String> {
+    let mut noisy = Noisy::new(options, source)?;
+    let mut rng = Rng::new(noisy.seed);
+    let names: Vec<&str> = values.iter().map(|(name, _)| name.as_str()).collect();
+    output.println(format_args!(
+        "minimising {} over {} by SPSA with the calibration's noise, {} shots per value{}\n",
+        noisy.observable,
+        names.join(", "),
+        noisy.shots,
+        if options.zne {
+            ", each extrapolated to zero noise"
+        } else {
+            ""
+        }
+    ));
+    let header: String = names.iter().map(|name| format!("{name:>12}")).collect();
+    output.println(format_args!("{:>6}{:>24}{header}", "step", "value"));
+    let row =
+        |output: &mut Output, step: usize, (value, error): Sampled, values: &[(String, f64)]| {
+            let columns: String = values.iter().map(|(_, v)| format!("{v:>12.6}")).collect();
+            let shown = format!("{value:.6} ± {error:.6}");
+            output.println(format_args!("{step:>6}{shown:>24}{columns}"));
+        };
+    let mut total = 0.0;
+    for _ in 0..SPSA_TRIALS {
+        let (slope, _) = noisy.kick(values, SPSA_SHIFT, &mut rng)?;
+        total += slope.iter().map(|s| s.abs()).sum::<f64>() / slope.len() as f64;
+    }
+    let size = total / SPSA_TRIALS as f64;
+    let rate = SPSA_FIRST * (SPSA_OFFSET + 1.0).powf(0.602) / size.max(1e-3);
+    let mut progress = Progress::new("minimising, steps", SPSA_STEPS as u64);
+    let mut steps = 0;
+    while steps < SPSA_STEPS {
+        if progress::stopped() {
+            output.eprintln(format_args!(
+                "stopped by Ctrl+C after {steps} steps, so this is where SPSA had got to"
+            ));
+            break;
+        }
+        progress.tick(steps as u64);
+        let k = steps as f64;
+        let shift = SPSA_SHIFT / (k + 1.0).powf(0.101);
+        let (slope, value) = noisy.kick(values, shift, &mut rng)?;
+        if steps % 10 == 0 {
+            row(output, steps, value, values);
+        }
+        let gain = rate / (k + 1.0 + SPSA_OFFSET).powf(0.602);
+        for ((_, value), s) in values.iter_mut().zip(&slope) {
+            *value -= gain * s;
+        }
+        steps += 1;
+    }
+    let found = noisy.value(values)?;
+    let exact = energy(options, source, values)?;
+    output.println(format_args!(
+        "\nafter {steps} steps at {}\n{}",
+        listed(values),
+        noisy.compared(found, exact)
+    ));
+    output
+        .println("each row's value is the mean of the two values SPSA measures around that point");
+    Ok(())
+}
+
+fn noisy_gradient(
+    options: &Options,
+    source: &str,
+    values: &[(String, f64)],
+    output: &mut Output,
+) -> Result<(), String> {
+    let mut noisy = Noisy::new(options, source)?;
+    let here = noisy.value(values)?;
+    let exact = energy(options, source, values)?;
+    let slopes = slopes(options, source, values)?;
+    output.println(format_args!(
+        "expectation of {} at {}, {} shots per value\n{}\n\ngradient by the parameter shift rule:{:>18}{:>14}",
+        noisy.observable,
+        listed(values),
+        noisy.shots,
+        noisy.compared(here, exact),
+        "noisy",
+        "exact"
+    ));
+    let mut shifted = Vec::new();
+    for (i, slope) in slopes.into_iter().enumerate() {
+        let (up, down) = (moved(values, i, SHIFT), moved(values, i, -SHIFT));
+        let (_, (difference, error)) = around(noisy.value(&up)?, noisy.value(&down)?);
+        let rule = (energy(options, source, &up)? - energy(options, source, &down)?) / 2.0;
+        if (rule - slope).abs() > 1e-6 {
+            shifted.push(values[i].0.as_str());
+        }
+        let noisy_slope = format!("{difference:.6} ± {error:.6}");
+        output.println(format_args!(
+            "  d/d{:<10}{noisy_slope:>40}{slope:>14.6}",
+            values[i].0
+        ));
+    }
+    if !shifted.is_empty() {
+        output.println(format_args!(
+            "note: the shift rule is exact only for an input that is the angle of one rotation, so the noisy slope of {} measures something else",
+            shifted.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn slopes(options: &Options, source: &str, values: &[(String, f64)]) -> Result<Vec<f64>, String> {
+    (0..values.len())
+        .map(|i| {
+            let shifted = |delta: f64| energy(options, source, &moved(values, i, delta));
+            Ok((shifted(STEP)? - shifted(-STEP)?) / (2.0 * STEP))
+        })
+        .collect()
+}
+
+fn listed(values: &[(String, f64)]) -> String {
+    values
+        .iter()
+        .map(|(name, value)| format!("{name} = {value:.6}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn minimize(
+    options: &Options,
+    source: &str,
+    values: &mut [(String, f64)],
+    output: &mut Output,
+) -> Result<(), String> {
+    let names: Vec<&str> = values.iter().map(|(name, _)| name.as_str()).collect();
+    output.println(format_args!(
+        "minimising {} over {}\n",
+        options
+            .observable
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        names.join(", ")
+    ));
+    let header: String = names.iter().map(|name| format!("{name:>12}")).collect();
+    output.println(format_args!("{:>6}{:>14}{header}", "step", "value"));
+    let row = |output: &mut Output, step: usize, value: f64, values: &[(String, f64)]| {
+        let columns: String = values.iter().map(|(_, v)| format!("{v:>12.6}")).collect();
+        output.println(format_args!("{step:>6}{value:>14.6}{columns}"));
+    };
+    let (mut first, mut second) = (vec![0.0; values.len()], vec![0.0; values.len()]);
+    let mut value = energy(options, source, values)?;
+    let mut steps = 0;
+    let mut progress = Progress::new("minimising, steps", MAX_STEPS as u64);
+    let mut interrupted = false;
+    while steps < MAX_STEPS {
+        if progress::stopped() {
+            interrupted = true;
+            break;
+        }
+        progress.tick(steps as u64);
+        let gradient = slopes(options, source, values)?;
+        if steps % 25 == 0 {
+            row(output, steps, value, values);
+        }
+        if gradient.iter().map(|g| g * g).sum::<f64>().sqrt() < FLAT {
+            break;
+        }
+        steps += 1;
+        for (i, g) in gradient.iter().enumerate() {
+            first[i] = 0.9 * first[i] + 0.1 * g;
+            second[i] = 0.999 * second[i] + 0.001 * g * g;
+            let unbiased = first[i] / (1.0 - 0.9f64.powi(steps as i32));
+            let scale = second[i] / (1.0 - 0.999f64.powi(steps as i32));
+            values[i].1 -= 0.1 * unbiased / (scale.sqrt() + 1e-12);
+        }
+        value = energy(options, source, values)?;
+    }
+    row(output, steps, value, values);
+    if interrupted {
+        output.eprintln(format_args!(
+            "stopped by Ctrl+C after {steps} steps, so this is the lowest value reached so far"
+        ));
+    }
+    output.println(format_args!(
+        "\nminimum {value:.6} after {steps} steps at {}",
+        listed(values)
+    ));
+    Ok(())
+}
+
+fn variational(options: &Options, file: &SourceFile, output: &mut Output) -> i32 {
+    let names = qasm::inputs(&file.text);
+    if names.is_empty() {
+        output.eprintln("error: --gradient and --minimize vary OpenQASM 3 `input` values, and this program declares none");
+        return 1;
+    }
+    let mut values: Vec<(String, f64)> = names
+        .into_iter()
+        .map(|name| {
+            let start = options.bindings.get(&name).copied().unwrap_or(START);
+            (name, start)
+        })
+        .collect();
+    let noisy = options.noisy || options.zne;
+    let result = if options.minimize && noisy {
+        noisy_minimize(options, &file.text, &mut values, output)
+    } else if options.minimize {
+        minimize(options, &file.text, &mut values, output)
+    } else if noisy {
+        noisy_gradient(options, &file.text, &values, output)
+    } else {
+        energy(options, &file.text, &values).and_then(|value| {
+            let gradient = slopes(options, &file.text, &values)?;
+            output.println(format_args!(
+                "expectation of {}: {value:.6} at {}\n\ngradient:",
+                options
+                    .observable
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                listed(&values)
+            ));
+            for ((name, _), slope) in values.iter().zip(gradient) {
+                output.println(format_args!("  d/d{name:<10}{slope:>12.6}"));
+            }
+            Ok(())
+        })
+    };
+    match result {
+        Ok(()) => 0,
+        Err(reason) => {
+            output.eprintln(format_args!("error: {reason}"));
+            1
+        }
+    }
+}
+
 pub fn run_source(
     options: &Options,
     file: &SourceFile,
@@ -823,6 +1319,9 @@ pub fn run_source(
 ) -> i32 {
     if options.diff {
         return diff(options, file, other.unwrap_or(file), output);
+    }
+    if options.gradient || options.minimize {
+        return variational(options, file, output);
     }
 
     let compilation = compile_for(
@@ -904,6 +1403,16 @@ pub fn run_source(
         },
         Emit::Stim => {
             let noise = options.calibration.as_ref().filter(|_| options.noisy);
+            if let Some(calibration) = noise {
+                if calibration.coherent() {
+                    output.eprintln("warning: Stim has no coherent errors, so the calibration's detuning is left out");
+                }
+                if calibration.decouple {
+                    output.eprintln(
+                        "warning: Stim has no timing, so the echo pulses from --dd are left out",
+                    );
+                }
+            }
             match stim::emit(program, noise) {
                 Ok(text) => text,
                 Err(reason) => {
@@ -951,6 +1460,24 @@ pub fn run_source(
         Emit::Quantikz => draw::quantikz(program),
         Emit::Svg => draw::svg(program),
         Emit::Cost => cost::analyse(program, options.calibration.as_ref()).to_string(),
+        Emit::Resources => {
+            match resources::estimate(program, options.calibration.as_ref(), options.budget) {
+                Ok(estimate) => estimate.to_string(),
+                Err(reason) => {
+                    output.eprintln(format_args!("error: cannot estimate resources: {reason}"));
+                    return 1;
+                }
+            }
+        }
+        Emit::Rotations => match rotations::compile(program) {
+            Ok(rotations) => rotations.to_string(),
+            Err(reason) => {
+                output.eprintln(format_args!(
+                    "error: cannot compile to Pauli product rotations: {reason}"
+                ));
+                return 1;
+            }
+        },
         Emit::Run => return execute(options, &compilation, output),
     };
 
@@ -1056,6 +1583,12 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
         ));
     }
 
+    if let Some(done) = outcome.stopped {
+        output.eprintln(format_args!(
+            "stopped by Ctrl+C after {done} of {} shots, so the counts cover only the shots that finished",
+            config.shots.max(1)
+        ));
+    }
     if outcome.aborted {
         output.eprintln(format_args!(
             "error: execution did not terminate within the step limit"
@@ -1128,11 +1661,23 @@ fn execute(options: &Options, compilation: &Compilation, output: &mut Output) ->
         if let (true, Some(calibration)) = (options.zne, &options.calibration) {
             let shots = options.shots.max(1000);
             match observable::extrapolate(program, observable, calibration, shots, seed) {
-                Ok(([one, two, three], zero)) => {
+                Ok((noisy, (zero, spread))) => {
+                    let [one, two, three] =
+                        noisy.map(|(value, error)| format!("{value:.6} ± {error:.6}"));
                     output.println(format_args!(
-                        "noisy expectation at 1x, 2x and 3x noise over {shots} shots: {one:.6}, {two:.6}, {three:.6}"
+                        "noisy expectation at 1x, 2x and 3x noise over {shots} shots: {one}, {two}, {three}"
                     ));
-                    output.println(format_args!("zero noise extrapolation: {:.6}", zero + 0.0));
+                    output.println(format_args!(
+                        "zero noise extrapolation: {:.6} ± {spread:.6}",
+                        zero + 0.0
+                    ));
+                    let bound = observable.bound();
+                    if zero.abs() > bound {
+                        output.println(format_args!(
+                            "  beyond the largest possible value {bound}, so read it as {:.6}",
+                            zero.clamp(-bound, bound)
+                        ));
+                    }
                 }
                 Err(reason) => output.eprintln(format_args!("error: cannot extrapolate: {reason}")),
             }
@@ -1187,10 +1732,15 @@ fn print_tally(output: &mut Output, name: &str, note: &str, tally: &BTreeMap<Str
 
     output.println("");
     output.println(format_args!("{name} over {total} shots{note}:"));
+    let mut widest: f64 = 0.0;
     for (key, count) in rows {
+        let share = *count as f64 / total as f64;
+        widest = widest.max((share * (1.0 - share) / total as f64).sqrt());
+        output.println(format_args!("  {key:<width$}  {count:>8}   {share:.4}"));
+    }
+    if widest > 0.0 {
         output.println(format_args!(
-            "  {key:<width$}  {count:>8}   {:.4}",
-            *count as f64 / total as f64
+            "  each share is within ±{widest:.4} at one standard error"
         ));
     }
 }

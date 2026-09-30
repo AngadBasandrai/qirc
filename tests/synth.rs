@@ -401,3 +401,34 @@ fn clifford_diff() {
         assert!(!equiv::compare(&reference, &changed, true).is_empty());
     }
 }
+
+#[test]
+fn approximates() {
+    let source = "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[3] q;\nh q[0];\nrz(0.3) q[0];\nrx(1.1) q[1];\ncx q[0], q[1];\nry(-0.7) q[2];\ncp(pi / 8) q[1], q[2];\ncrz(0.45) q[0], q[2];\n";
+    let exact = common::final_state(&compile(source, 0));
+    for epsilon in [1e-2, 1e-4] {
+        let target = Target {
+            gates: Some(GateSet::parse("h,s,t,cx").unwrap()),
+            epsilon: Some(epsilon),
+            ..Default::default()
+        };
+        let compilation = driver::compile_for(source, 2, false, &target);
+        assert!(common::errors(&compilation).is_empty(), "{epsilon}");
+        let names = names(&compilation.program);
+        assert!(
+            names
+                .iter()
+                .all(|n| ["h", "s", "t", "cx"].contains(&n.as_str())),
+            "{names:?}"
+        );
+        let approximate = common::final_state(&compilation.program);
+        let overlap: C64 = (0..exact.len())
+            .map(|i| exact.amplitude(i).conj() * approximate.amplitude(i))
+            .sum();
+        assert!(
+            1.0 - overlap.norm_sqr() < 25.0 * epsilon * epsilon,
+            "{epsilon} {}",
+            overlap.norm()
+        );
+    }
+}

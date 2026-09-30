@@ -1123,6 +1123,7 @@ attributes #0 = { \"entry_point\" \"qir_profiles\"=\"base_profile\" \"required_n
             gates: 4,
             depth: 5,
             live: 2,
+            rotations: 0,
             success: None,
             time: None,
         }
@@ -1486,8 +1487,9 @@ fn zero_noise() {
     let program = compile(&source, 1);
     let parity = Observable::parse("Z0 Z4").unwrap();
     let exact = observable::expectation(&program, &parity).unwrap();
-    let ([noisy, twice, thrice], zero) =
+    let ([(noisy, _), (twice, _), (thrice, _)], (zero, spread)) =
         observable::extrapolate(&program, &parity, &calibration, 20_000, 5).unwrap();
+    assert!(spread > 0.0 && spread < 0.05, "{spread}");
     assert!((exact - 1.0).abs() < 1e-9);
     assert!(noisy > twice && twice > thrice, "{noisy} {twice} {thrice}");
     assert!(
@@ -1790,8 +1792,9 @@ ry(0.7) q[0];
     for (program, text) in [(ghz, "Z0 Z39 + 0.5 X0 X1"), (rotated, "Z0 Z39 + Y39")] {
         let observable = Observable::parse(text).unwrap();
         let exact = observable::expectation(&program, &observable).unwrap();
-        let averaged =
+        let (averaged, spread) =
             observable::noisy_expectation(&program, &observable, &silent, 20, 1).unwrap();
+        assert!(spread < 1e-9, "{spread}");
         assert!(
             (exact - averaged).abs() < 1e-9,
             "{text}: {exact} vs {averaged}"

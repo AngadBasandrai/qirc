@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::codegen::zyz_angles;
-use crate::diag::Span;
+use crate::diag::{Span, suggest};
 use crate::ir::*;
 use crate::phase;
 use crate::simulator::matrix::{Matrix2, matrix_for};
@@ -86,6 +86,15 @@ impl GateSet {
         self
     }
 
+    pub fn with_rotations(mut self) -> GateSet {
+        for gate in [(GateKind::Rz, 0), (GateKind::Ry, 0)] {
+            if !self.gates.contains(&gate) {
+                self.gates.push(gate);
+            }
+        }
+        self
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -102,27 +111,39 @@ impl GateSet {
     }
 }
 
+const NAMES: [(&str, GateKind); 18] = [
+    ("id", GateKind::I),
+    ("i", GateKind::I),
+    ("x", GateKind::X),
+    ("y", GateKind::Y),
+    ("z", GateKind::Z),
+    ("h", GateKind::H),
+    ("s", GateKind::S),
+    ("sdg", GateKind::SDag),
+    ("t", GateKind::T),
+    ("tdg", GateKind::TDag),
+    ("sx", GateKind::SX),
+    ("sxdg", GateKind::SXDag),
+    ("rx", GateKind::Rx),
+    ("ry", GateKind::Ry),
+    ("rz", GateKind::Rz),
+    ("r1", GateKind::R1),
+    ("p", GateKind::R1),
+    ("swap", GateKind::Swap),
+];
+
 fn named(name: &str) -> Result<(GateKind, usize), String> {
     let name = name.trim();
     let base = name.trim_start_matches('c');
-    let kind = match base {
-        "id" | "i" => GateKind::I,
-        "x" => GateKind::X,
-        "y" => GateKind::Y,
-        "z" => GateKind::Z,
-        "h" => GateKind::H,
-        "s" => GateKind::S,
-        "sdg" => GateKind::SDag,
-        "t" => GateKind::T,
-        "tdg" => GateKind::TDag,
-        "sx" => GateKind::SX,
-        "sxdg" => GateKind::SXDag,
-        "rx" => GateKind::Rx,
-        "ry" => GateKind::Ry,
-        "rz" => GateKind::Rz,
-        "r1" | "p" => GateKind::R1,
-        "swap" => GateKind::Swap,
-        _ => return Err(format!("unknown gate `{name}`")),
+    let Some(&(_, kind)) = NAMES.iter().find(|(known, _)| *known == base) else {
+        let names: Vec<String> = NAMES
+            .iter()
+            .flat_map(|(known, _)| ["", "c", "cc"].map(|prefix| format!("{prefix}{known}")))
+            .collect();
+        let hint = suggest(name, names.iter().map(String::as_str))
+            .map(|found| format!(", did you mean `{found}`?"))
+            .unwrap_or_default();
+        return Err(format!("unknown gate `{name}`{hint}"));
     };
     Ok((kind, name.len() - base.len()))
 }

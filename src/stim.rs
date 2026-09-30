@@ -53,7 +53,8 @@ pub fn emit(program: &Program, noise: Option<&Calibration>) -> Result<String, St
         match step {
             Step::Op(op @ (Op::Gate(_) | Op::Measure { .. } | Op::Reset { .. })) => {
                 if let Some(calibration) = noise {
-                    for (q, [x, y, z]) in clock.begin(calibration, op) {
+                    for idle in clock.begin(calibration, op) {
+                        let ([x, y, z], q) = (idle.paulis, idle.qubit);
                         if x + y + z > 0.0 {
                             writeln!(out, "PAULI_CHANNEL_1({x}, {y}, {z}) {q}").unwrap();
                         }

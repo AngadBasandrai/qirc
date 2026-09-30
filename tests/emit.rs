@@ -4,6 +4,7 @@ use common::{compile, errors, run};
 use qirc::codegen;
 use qirc::driver;
 use qirc::ir::*;
+use qirc::json::Json;
 use qirc::transpile::{self, GateSet};
 
 fn module(body: &str) -> String {
@@ -521,4 +522,28 @@ fn diagrams() {
     assert_eq!(svg.matches("class=\"wire\"").count(), 2);
     assert_eq!(svg.matches("class=\"plus\"").count(), 1);
     assert_eq!(svg.matches("M r").count(), 2);
+}
+
+#[test]
+fn fused_matrices() {
+    let program = compile("OPENQASM 3.0;\nqubit q;\nh q;\nt q;\nh q;\n", 3);
+    let json = Json::parse(&codegen::emit_json(&program)).unwrap();
+    let Some(Json::List(blocks)) = json.get("blocks") else {
+        panic!("{json:?}");
+    };
+    let Some(Json::List(ops)) = blocks[0].get("ops") else {
+        panic!("{:?}", blocks[0]);
+    };
+    let Some(Json::List(matrix)) = ops[0].get("matrix") else {
+        panic!("{:?}", ops[0]);
+    };
+    let entries: Vec<f64> = matrix
+        .iter()
+        .map(|entry| match entry {
+            Json::Number(value) => *value,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let row = entries[..4].iter().map(|x| x * x).sum::<f64>();
+    assert!((row - 1.0).abs() < 1e-9, "{entries:?}");
 }

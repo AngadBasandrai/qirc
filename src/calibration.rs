@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::f64::consts::PI;
 use std::hash::Hash;
 
 use crate::ir::{Gate, GateKind, Op, Program};
@@ -22,12 +23,21 @@ pub struct Calibration {
     drive: HashMap<usize, (f64, f64)>,
     cross: HashMap<(usize, usize), f64>,
     resonator: HashMap<usize, (f64, f64)>,
+    detuning: HashMap<usize, f64>,
+    pub decouple: bool,
 }
 
 fn lookup<K: Eq + Hash>(map: &HashMap<K, f64>, key: K) -> f64 {
     map.get(&key)
         .copied()
         .unwrap_or_else(|| map.values().sum::<f64>() / map.len().max(1) as f64)
+}
+
+pub(crate) struct Idle {
+    pub(crate) qubit: usize,
+    pub(crate) paulis: [f64; 3],
+    pub(crate) phase: f64,
+    pub(crate) echo: bool,
 }
 
 #[derive(Default)]
@@ -37,7 +47,7 @@ pub(crate) struct Clock {
 }
 
 impl Clock {
-    pub(crate) fn begin(&mut self, calibration: &Calibration, op: &Op) -> Vec<(usize, [f64; 3])> {
+    pub(crate) fn begin(&mut self, calibration: &Calibration, op: &Op) -> Vec<Idle> {
         let qubits: Vec<usize> = op.qubits().iter().map(|q| q.index()).collect();
         if let Some(&top) = qubits.iter().max()
             && top >= self.free.len()
@@ -50,7 +60,17 @@ impl Clock {
             .fold(0.0, f64::max);
         qubits
             .iter()
-            .filter_map(|&q| self.free[q].map(|last| (q, calibration.idle(q, self.start - last))))
+            .filter_map(|&q| {
+                self.free[q].map(|last| {
+                    let gap = self.start - last;
+                    Idle {
+                        qubit: q,
+                        paulis: calibration.idle(q, gap),
+                        phase: calibration.drift(q, gap),
+                        echo: calibration.echoes(q, gap),
+                    }
+                })
+            })
             .collect()
     }
 
@@ -73,7 +93,7 @@ impl Calibration {
             }
             let shape = || {
                 format!(
-                    "line {number}: expected `cx a b error`, `single q error`, `readout q error`, `time cx a b ns`, `time single q ns`, `time readout q ns`, `t1 q us`, `t2 q us`, `frequency q GHz`, `drive q amplitude beta`, `cross a b amplitude` or `resonator q GHz [amplitude]`"
+                    "line {number}: expected `cx a b error`, `single q error`, `readout q error`, `time cx a b ns`, `time single q ns`, `time readout q ns`, `t1 q us`, `t2 q us`, `frequency q GHz`, `drive q amplitude beta`, `cross a b amplitude`, `resonator q GHz [amplitude]` or `detuning q kHz`"
                 )
             };
             let length = |word: &str| match word.parse::<f64>() {
@@ -167,6 +187,18 @@ impl Calibration {
                         .insert(q, (number_in(ghz, 0.0, 1000.0)?, amplitude));
                     q
                 }
+                ["detuning", q, khz] => {
+                    let q = qubit(q)?;
+                    let value = khz
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|v| v.is_finite() && v.abs() <= 1e6)
+                        .ok_or_else(|| {
+                            format!("line {number}: detuning `{khz}` must be a number of kHz")
+                        })?;
+                    calibration.detuning.insert(q, value);
+                    q
+                }
                 ["cross", a, b, amplitude] => {
                     let (a, b) = (qubit(a)?, qubit(b)?);
                     calibration
@@ -192,6 +224,7 @@ impl Calibration {
         scaled.readout.values_mut().for_each(|e| *e = rate(e));
         scaled.t1.values_mut().for_each(|t| *t /= factor);
         scaled.t2.values_mut().for_each(|t| *t /= factor);
+        scaled.detuning.values_mut().for_each(|d| *d *= factor);
         scaled
     }
 
@@ -206,6 +239,36 @@ impl Calibration {
 
     pub fn cx(&self, a: usize, b: usize) -> f64 {
         lookup(&self.cx, (a.min(b), a.max(b)))
+    }
+
+    pub fn surface(&self) -> (Option<f64>, Option<f64>) {
+        let mean = |values: Vec<f64>| {
+            (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+        };
+        let error = mean(self.cx.values().copied().collect())
+            .or_else(|| mean(self.single.values().copied().collect()));
+        let cycle = mean(self.cx_time.values().copied().collect())
+            .zip(mean(self.readout_time.values().copied().collect()))
+            .map(|(cx, readout)| 4.0 * cx + 2.0 * readout);
+        (error, cycle)
+    }
+
+    pub fn coherent(&self) -> bool {
+        !self.detuning.is_empty()
+    }
+
+    pub fn drift(&self, q: usize, ns: f64) -> f64 {
+        self.detuning
+            .get(&q)
+            .map_or(0.0, |khz| 2.0 * PI * khz * ns * 1e-6)
+    }
+
+    pub fn pulse(&self, q: usize) -> f64 {
+        lookup(&self.single_time, q)
+    }
+
+    pub fn echoes(&self, q: usize, ns: f64) -> bool {
+        self.decouple && ns >= 2.0 * self.pulse(q) + 1e-9
     }
 
     pub fn timed(&self) -> bool {
@@ -287,8 +350,13 @@ impl Calibration {
         let mut clock = Clock::default();
         let mut loss = 0.0;
         for op in ops {
-            for (_, idle) in clock.begin(self, op) {
-                loss += -(-idle.iter().sum::<f64>()).ln_1p();
+            for idle in clock.begin(self, op) {
+                let coherent = if idle.echo {
+                    2.0 * lookup(&self.single, idle.qubit)
+                } else {
+                    (idle.phase / 2.0).sin().powi(2)
+                };
+                loss += -(-(idle.paulis.iter().sum::<f64>() + coherent).min(0.999_999)).ln_1p();
             }
             clock.end(self, op);
         }

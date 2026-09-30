@@ -19,3 +19,5 @@ With `--calibration` and `--noisy`, every gate is followed by a random Pauli err
 ## Zero noise extrapolation
 
 `--zne` with `--observable` and `--calibration` runs zero noise extrapolation. The program is simulated with the calibration's errors at one, two and three times their rates, with T1 and T2 shortened to match, the expectation value is averaged over the final state of every shot, and a quadratic through the three points is extended to zero noise, which is 3 E1 - 3 E2 + E3. For `Z0 Z4` on a 5 qubit GHZ state on `examples/line5.cal`, the exact value is 1, one times noise gives 0.938 and the extrapolation gives 0.993.
+
+## Detuning and dynamical decoupling

@@ -259,6 +259,42 @@ impl Diagnostic {
     }
 }
 
+fn distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut table = vec![vec![0; b.len() + 1]; a.len() + 1];
+    for (i, row) in table.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in table[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let change = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (table[i - 1][j - 1] + change)
+                .min(table[i - 1][j] + 1)
+                .min(table[i][j - 1] + 1);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(table[i - 2][j - 2] + 1);
+            }
+            table[i][j] = best;
+        }
+    }
+    table[a.len()][b.len()]
+}
+
+pub fn suggest<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let limit = (name.chars().count() / 3).max(1);
+    candidates
+        .into_iter()
+        .filter(|candidate| *candidate != name)
+        .map(|candidate| (distance(name, candidate), candidate))
+        .filter(|&(steps, _)| steps <= limit)
+        .min_by_key(|&(steps, _)| steps)
+        .map(|(_, candidate)| candidate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +352,13 @@ mod tests {
             caret_line.matches('^').count(),
             "@__quantum__qis__foo".len()
         );
+    }
+
+    #[test]
+    fn suggests() {
+        assert_eq!(suggest("--gate", ["--gates", "--emit"]), Some("--gates"));
+        assert_eq!(suggest("qams3", ["qasm3", "qasm2", "qir"]), Some("qasm3"));
+        assert_eq!(suggest("toffoli", ["h", "cx"]), None);
+        assert_eq!(suggest("h", ["h", "x"]), Some("x"));
     }
 }

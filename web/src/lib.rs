@@ -47,8 +47,11 @@ fn execute(source: &str, args: &str, output: &mut Output) -> i32 {
     let words: Vec<String> = args.split_whitespace().map(String::from).collect();
     let device = |path: &str| match path {
         "line5.cal" => Ok(LINE5.to_string()),
+        "detuned.cal" => Ok((0..5).fold(LINE5.to_string(), |text, q| {
+            text + &format!("detuning {q} 300\n")
+        })),
         _ => Err(format!(
-            "the playground only has the calibration line5.cal, not {path}"
+            "the playground only has the calibrations line5.cal and detuned.cal, not {path}"
         )),
     };
     let options = match driver::parse_args_with(&words, device) {

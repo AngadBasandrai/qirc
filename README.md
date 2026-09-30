@@ -30,10 +30,12 @@ output recording:
 returned over 1000 shots:
   (0, 0)       515   0.5150
   (1, 1)       485   0.4850
+  each share is within ±0.0158 at one standard error
 
 measurement over 1000 shots (sampled from the final state):
   00       515   0.5150
   11       485   0.4850
+  each share is within ±0.0158 at one standard error
 
 simulated in 851.600µs
 ```
@@ -67,15 +69,19 @@ qirc <input.ll | input.qasm> [options]
 qirc diff <a> [b] [options]
 qirc submit <input> [options]
 qirc lsp
+qirc explain <code>
+qirc surface [--distance 3,5,7] [--error p | --calibration f]
 
   --emit <kind>     run | ir | qasm3 | qasm2 | stim | pulse | schedule | ionq | qir | json
-                    | circuit | quantikz | svg | cost | check
+                    | circuit | quantikz | svg | cost | resources | rotations | check
                     (default: run)
   -O<n>             optimisation level 0 to 3                         (default: 1)
   --gates <set>     target gate set: rz-sx-cx, rz-ry-cz or a list such as rz,sx,cx
   --exclude <list>  leave gates out of the target set, such as h,t
   --resynth <n>     replace runs of gates by at most n gates, 1 to 6
   --cost <model>    what resynthesis minimises: gates, cx or ibm
+  --epsilon <e>     approximate gates the target set cannot express to within e
+  --budget <p>      total failure probability for --emit resources (default 0.001)
   --coupling <map>  route onto line:N, ring:N, grid:RxC, full:N or 0-1,1-2,...
   --calibration <f> route by device error rates and estimate success
   --relabel         remove swaps at the end of the program by permuting qubits
@@ -85,7 +91,11 @@ qirc lsp
   --target <name>   IonQ target for submit and --emit ionq (default simulator)
   --mitigate        undo the readout errors from --calibration in the counts
   --zne             extrapolate the --observable to zero noise from 1x, 2x and 3x noise
+  --dd              fill idle windows with echo pulses, timed from --calibration
   --observable <p>  print the exact expectation of a Pauli sum such as 'Z0 Z1 + 0.5 X2'
+  --bind <list>     values for OpenQASM 3 inputs, such as theta=0.3,phi=1.2
+  --gradient        print how the --observable changes with every input
+  --minimize        vary the inputs to minimise the --observable
   --shots <n>       sample n measurement outcomes
   --seed <n>        seed the random number generator
   --no-state        do not print the final state vector
@@ -133,6 +143,8 @@ error[QIR0300]: the Base Profile forbids branching
    = note: branching needs the Adaptive Profile
 ```
 
+`qirc explain QIR0300` prints a longer explanation of any code, and a mistyped option, emit kind or gate name gets a suggestion, as in ``unknown emit kind `qsam3`, did you mean `qasm3`?``.
+
 ## OpenQASM input
 
 A file whose first statement is `OPENQASM 2.0;` or `OPENQASM 3.0;` is read as OpenQASM instead of LLVM IR, so every command works on it: simulate it, optimise and route it, `qirc diff` it against a QIR program, or turn it into QIR with `--emit qir`.
@@ -148,6 +160,32 @@ Every circuit Qiskit exports for the benchmarks, in both versions, `qirc diff` f
 `--emit qasm2` writes OpenQASM 2 with `qelib1.inc` gates for tools that only read that version. OpenQASM 2 has no `else`, loops or classical variables, so it covers straight line programs and a branch on one measurement to a block of gates, which becomes `if(c1==1) x q[2];` with one single bit register per result, as teleportation needs. Anything else is refused with a pointer to `--emit qasm3`. Every corpus program that fits is accepted by Qiskit's OpenQASM 2 parser and reads back into qirc with the same outcome probabilities.
 
 `--emit stim` writes a Clifford program as a [Stim](https://github.com/quantumlib/Stim) circuit for error correction tools. Rotations by quarter turns become `S`, `SQRT_X` or `SQRT_Y` gates, measurements become `M` and resets `R`, and an X, Y or Z gate that depends on one measurement becomes feedback such as `CX rec[-1] 2`. Stim numbers measurements in the order they happen, so after routing the records can come in a different order from the result numbers. With `--noisy` and a calibration the circuit carries the same noise the simulator uses: `DEPOLARIZE1` and `DEPOLARIZE2` after each gate, `M(p)` for readout errors, `X_ERROR` after a reset, and `PAULI_CHANNEL_1` for idle decoherence from T1 and T2. On 200 random programs, half with feedback and half with noise on `examples/line5.cal`, Stim's samples match qirc's to within 0.007 in total variation.
+
+## Variational circuits
+
+`input float theta;` or `input angle[32] theta;` declares a value that is given at compile time with `--bind theta=0.3`, so one file describes a whole family of circuits, and an input without a value is reported with the `--bind` that would fix it.
+
+```text
+$ qirc ansatz.qasm --observable "Z0 Z1 + 0.5 X0 + 0.5 X1" --minimize
+minimising Z0 Z1 + 0.5 X0 + 0.5 X1 over theta, phi
+...
+minimum -1.414214 after 262 steps at theta = 1.570799, phi = -2.356194
+```
+
+`--gradient` prints how the `--observable` changes with each input at the bound values, from central differences of exact expectation values with a step of 1e-5, which agree with the analytic derivative to about 1e-9. The parameter shift rule is what hardware needs, where every value is sampled, but on an exact simulator it adds nothing and it breaks when an input feeds more than one gate or an expression. `--minimize` runs Adam from the bound values, or 0.1 for an input without one, until the gradient vanishes. On a two qubit ansatz of two `ry` rotations and a CNOT, it reaches -1.414214, the exact ground energy of `Z0 Z1 + 0.5 X0 + 0.5 X1`, in 262 steps and 0.7 seconds. From Python, every function takes `bind={"theta": 0.3}`.
+
+With `--noisy` or `--zne` and a calibration, both run as they would on hardware, where every value is sampled with the calibration's errors, at least 1000 shots each. `--minimize` switches to SPSA, which moves every input at once by a random plus or minus step and measures only two values per step whatever the number of inputs, with step sizes that shrink as Spall recommends and a learning rate set from the first few slopes. It prints each tenth step with the standard error of its value and, at the end, the noisy value at the inputs found beside the exact value there without noise. `--gradient` uses the parameter shift rule, half the difference of the values a quarter turn either side, with its standard error beside the exact slope, and notes any input for which the rule does not hold. `--zne` extrapolates every value to zero noise first, at three times the shots.
+
+```text
+$ qirc ansatz.qasm --observable "Z0 Z1 + 0.5 X0 + 0.5 X1" --minimize --noisy --calibration noise.cal --seed 5
+minimising Z0 Z1 + 0.5 X0 + 0.5 X1 over theta, phi by SPSA with the calibration's noise, 1000 shots per value
+...
+after 150 steps at theta = 1.579071, phi = -2.369776
+  noisy value               -1.373005 ± 0.008590
+  exact value without noise -1.414071
+```
+
+With a 3% CNOT error, SPSA finds inputs within 0.0002 of the true ground energy in 2 seconds, although the device can only show -1.373 there. With `--zne` the same run reports -1.427 ± 0.052 against an exact -1.405, so extrapolation recovers the energy within its error bar.
 
 ## Lowering
 
@@ -215,6 +253,8 @@ On `tests/corpus/pyqir_simple.ll`, `-O3` takes the circuit from 12 gates at dept
 
 `--gates` rebuilds every gate from a target set: a preset such as `rz-sx-cx` for IBM style devices or `rz-ry-cz`, or any list of gates such as `rx,ry,cy`. `--exclude` removes gates from the full QIR set instead, and `--basis` is kept as a name for `--gates`. Multi qubit gates reduce to CNOTs and single qubit matrices first. The CNOT is then mapped onto whichever entangler the set has, and each single qubit matrix is rebuilt from Euler angles over two rotation axes, from one axis plus a fixed gate, or by an exact search over fixed gates such as `h,s,t`. A gate the set cannot express exactly is reported and left as written. A Toffoli that a later identical Toffoli undoes, with only gates in between that use its three qubits as controls or only add phases to them, is lowered together with its partner as a pair of relative phase Toffolis, each 3 CNOTs and 4 T gates instead of 6 and 7, because the phases the two halves add cancel. A six control X gate built from a ladder of Toffolis on ancillas drops from 63 T gates and 54 CNOTs to 39 and 30 on `h,s,t,cx`. On 600 random programs full of such pairs, with phases, rotations and conflicting gates in between, `qirc diff` finds every result equivalent.
 
+`--epsilon e` makes a finite set such as `h,s,t,cx` usable for any angle. Every gate the set cannot express exactly is rebuilt from H, S and T to within e in operator norm, its Euler rotations sharing the precision. Each rotation is found as in Ross and Selinger's gridsynth: the candidates are exact Clifford+T unitaries whose top left entry lies in a thin region around the rotation, drawn from the grid of the ring Z[√2], and a candidate is kept once the norm equation for its other entry can be solved by factoring over Z[√2] and Z[ω]. The T count grows as about 3 log2(1/e), and qirc reaches e down to about 1e-10: below about 1e-7 the region is thinner than a double can resolve next to 1, so it is searched in double-double arithmetic, about 106 bits, and the norm equations are factored over 128 bit integers. A rotation takes milliseconds at 1e-8, about 0.4 seconds at 1e-9 and 0.5 seconds at 1e-10, with 102 T gates at 1e-10. A circuit with an `rz(0.3)` and a controlled `rz(0.45)` needs 82 T gates at 1e-2 and 156 at 1e-4.
+
 ```text
 $ qirc tests/corpus/base_profile_bell.ll --exclude h,cx --emit ir
   x q0
@@ -239,6 +279,8 @@ A calibration can also give durations in nanoseconds as `time cx a b ns`, `time 
 `--mitigate` undoes readout errors in the measurement counts, for a noisy simulation or for counts from a device described by the same calibration. Each result bit's flip matrix is inverted and applied across the distribution, negative quasi probabilities are clipped and the rest is renormalised. On a 5 qubit GHZ state with readout errors of 5 to 15 percent, 59 percent of raw shots are correct and the mitigated distribution puts 0.499 and 0.492 on the two correct outcomes.
 
 `--zne` with `--observable` and `--calibration` runs zero noise extrapolation. The program is simulated with the calibration's errors at one, two and three times their rates, with T1 and T2 shortened to match, the expectation value is averaged over the final state of every shot, and a quadratic through the three points is extended to zero noise, which is 3 E1 - 3 E2 + E3. For `Z0 Z4` on a 5 qubit GHZ state on `examples/line5.cal`, the exact value is 1, one times noise gives 0.938 and the extrapolation gives 0.993. In a program with branches or loops every block starts from the same layout, and a block that jumps elsewhere swaps its qubits back before the jump, so each successor sees the layout it expects.
+
+A calibration line `detuning q kHz` gives a qubit a frequency offset, so it turns about Z by 2π times the offset for as long as it waits between operations. Unlike T1 and T2 this error is coherent, and `--noisy` applies it as a rotation. `--dd` removes it with dynamical decoupling: every idle window long enough for two X pulses gets them at a quarter and three quarters of the window, so the phase gathered before each pulse is undone after it, and the pulses carry the calibration's single qubit error. `--emit pulse` writes the pulses with their delays, and the success estimate in `--emit cost` counts the coherent error, or the pulses instead of it under `--dd`. On `examples/line5.cal` with 300 kHz of detuning on every qubit, a circuit that leaves one qubit waiting through three CNOTs comes out right in 42% of shots, and in 97% with `--dd`.
 
 ```text
 $ qirc tests/corpus/qsharp_loop.ll --emit qasm3 --basis rz-sx-cx --coupling line:4
@@ -276,7 +318,7 @@ assert qirc.diff(source, opt=3, gates="rz-sx-cx", resynth=4) == "equivalent"
 worst = qirc.cost(source, gates="rz-sx-cx")["worst"]
 ```
 
-`compile` returns the text of any emit kind, `run` returns measurement counts, `diff` returns `"equivalent"`, `"different"` or `"inconclusive"`, and `cost` returns the per path counts from `--emit cost` as dictionaries. Options are keywords with the command line values: `opt`, `gates`, `exclude`, `resynth`, `cost`, `coupling` and `calibration`, plus `relabel=True`. With a calibration, `cost` also reports the estimated `success` probability. Compile errors raise `qirc.CompileError` with the rendered diagnostics, and warnings go through the `warnings` module.
+`compile` returns the text of any emit kind, `run` returns measurement counts, `diff` returns `"equivalent"`, `"different"` or `"inconclusive"`, and `cost` returns the per path counts from `--emit cost` as dictionaries. Options are keywords with the command line values: `opt`, `gates`, `exclude`, `resynth`, `cost`, `coupling`, `calibration`, `epsilon` and `budget`, plus `relabel=True`, `reuse=True`, `noisy=True` and `dd=True`, and `bind` takes a dictionary of input values. `compile(..., emit="resources")` returns the resource estimate. The package ships type stubs, so editors complete every function and keyword. With a calibration, `cost` also reports the estimated `success` probability. Compile errors raise `qirc.CompileError` with the rendered diagnostics, and warnings go through the `warnings` module.
 
 With `pip install "qirc[qiskit]"`, qirc is also a Qiskit optimization stage: `transpile(circuit, basis_gates=["rz", "sx", "x", "cx"], optimization_level=3, optimization_method="qirc")` runs Qiskit's optimization and then qirc's, keeping whichever circuit has fewer two qubit gates.
 
@@ -310,13 +352,13 @@ counts = qirc.run(module.ir(), shots=1000)
 
 ## Editors
 
-`qirc lsp` is a language server: it reads QIR and OpenQASM files from an editor over stdin and stdout and answers with the same diagnostics the command line prints, codes and notes included, on every change. Any editor with a language client can start it as `qirc lsp` to show qirc's errors as you type.
+`qirc lsp` is a language server: it reads QIR and OpenQASM files from an editor over stdin and stdout and answers with the same diagnostics the command line prints, codes and notes included, on every change. Any editor with a language client can start it as `qirc lsp` to show qirc's errors as you type. It skips a check when a newer edit to the same file is already waiting, and files over 1 MB are not checked, so typing stays responsive in large generated programs.
 
 ## Playground
 
 Try it at <https://angadbasandrai.github.io/qirc/>.
 
-`web/` builds qirc for the browser. The page has the full command line and every emit kind, an editor with QIR highlighting, line numbers and example programs, and it runs the compiler in a Web Worker so a long simulation can be stopped. Diagnostics keep their colours and link to the line they point at. Beside the text output it draws the compiled circuit block by block, with zoom, a fit to view button, qubit labels that stay in place while scrolling and the gate under the pointer named in a tooltip, charts measurement counts or final state probabilities, and shows how qubits, gates, two qubit gates, T gates and depth changed from the source. A `.ll` file can be opened or dropped on the editor, and when the page is served on its own it can save the output and copy a link that carries the program, the command and every setting, so the link opens on the same output and view. Nothing is sent to a server.
+`web/` builds qirc for the browser. The page has the full command line and every emit kind, controls for rotation precision, OpenQASM inputs and minimising an observable over them, a detuned device with and without echo pulses, an editor with QIR highlighting, line numbers and example programs, and it runs the compiler in a Web Worker so a long simulation can be stopped. Diagnostics keep their colours and link to the line they point at. Beside the text output it draws the compiled circuit block by block, with zoom, a fit to view button, qubit labels that stay in place while scrolling and the gate under the pointer named in a tooltip, lets a straight line circuit of up to 12 qubits be stepped through gate by gate with the state and every qubit's Bloch vector after each one, saves the drawing as a PNG, charts measurement counts or final state probabilities, and shows how qubits, gates, two qubit gates, T gates and depth changed from the source. A `.ll` file can be opened or dropped on the editor, and when the page is served on its own it can save the output and copy a link that carries the program, the command and every setting, so the link opens on the same output and view. Nothing is sent to a server.
 
 ```text
 cargo build --release --target wasm32-unknown-unknown --manifest-path web/Cargo.toml
@@ -353,6 +395,67 @@ entry > join_x > then_z > join_z                0       2      17      13       
 entry > join_x > join_z                         0       2      16      13       3
 worst case                                      0       2      18      13       3
 ```
+
+## Resource estimation
+
+`--emit resources` estimates what the compiled program would need on a fault tolerant machine built from surface codes.
+
+```text
+$ qirc adder_8.qasm --emit resources -O2
+logical qubits    24
+T gates           173
+T depth           12, as layers of commuting Pauli product rotations
+magic states      173
+logical steps     173
+code distance     15
+distillation      1 level of 15-to-1, 11 factories of 11 tiles
+physical qubits   82,800 (28,350 for data, 54,450 for factories)
+runtime           1.104 ms, 2,760 cycles of 400 ns
+error budget      0.001: 5.0e-4 logical, 5.0e-4 magic states
+```
+
+The program is lowered to Clifford gates, T gates and rotations, and the worst path's peak live qubits, T gates and rotations are counted, so phase teleportation's savings carry straight through. Each rotation costs about 3 log2(1/e) T gates, as gridsynth needs, with e its share of the budget. The logical qubits sit in a fast block of 2n + ⌈√(8n)⌉ + 1 tiles, where each T gate takes one logical step of d code cycles, and 15-to-1 distillation factories of 11 tiles, taking 11 steps per state, supply one magic state per step, with a second or third level when the first is not clean enough. The failure budget, 0.001 by default or `--budget`, is split evenly between logical errors, distillation and rotation synthesis, and the code distance is the smallest odd d for which every tile over every cycle stays within its share at a logical error rate of 0.03 (p/0.01)^((d+1)/2). The physical error rate p and the cycle time come from the calibration's CNOT errors and 4 CNOT times plus 2 readout times, or default to 0.001 and 400 ns, the gate based figures Azure's resource estimator also uses. A physical error rate at the threshold of 0.01 or above has no surface code estimate.
+
+## Pauli product rotations
+
+`--emit rotations` rewrites the program in the form Litinski's Game of Surface Codes starts from: a list of rotations about multi-qubit Pauli products followed by Pauli product measurements, with every Clifford gate gone. The program is lowered to Clifford gates, T gates and rotations as for a resource estimate, and qirc walks through it keeping the image of each qubit's X and Z under the Clifford gates seen so far. A T gate on a qubit becomes a pi/8 rotation about the current image of its Z, any other rotation keeps its angle, and a measurement measures the image of Z. A new rotation is moved back past every rotation and measurement it commutes with, and when it meets one about the same Pauli product the two angles add: pi/8 and -pi/8 cancel, and two pi/8 rotations make a Clifford, which is folded into the images of the gates that follow.
+
+```text
+$ qirc mod5_4.qasm --emit rotations
+Pauli product rotations for main, 5 qubits
+
+layer  step
+    1  +pi/8     Z0 Z3 X4
+    1  -pi/8     Z0 Z3
+    1  +pi/8     Z2 Z3 X4
+    1  -pi/8     Z2 Z3
+    1  +pi/8     Z1 Z2 X4
+    1  -pi/8     Z1 Z2
+    1  +pi/8     Z0 Z1 X4
+    1  -pi/8     Z0 Z1
+
+8 pi/8 rotations in T depth 1, 0 other rotations, 0 measurements, 1 layer in all
+10 rotations merged with an earlier one about the same Pauli product
+a rotation by a about P applies exp(-i a P), and the Clifford gates are folded into the rotations and measurements
+```
+
+Each step goes in the layer after the last earlier step it does not commute with, so the steps within a layer commute and can run in any order, and the T depth counts the layers that hold pi/8 rotations. `--emit resources` reports it too. On the eleven Clifford+T benchmarks from the optimisation section, merging rotations this way reaches from `-O0` the same 938 T gates that phase teleportation and PyZX reach, circuit by circuit, with T depths from 1 for `mod5_4` and `gf2^4_mult` to 17 for `tof_10`, each in about a tenth of a second. The tests check on random five qubit circuits with arbitrary rotations that the rotations and measurements give the same outcome distribution as the circuit. A program with branches has no single list of rotations, and a reset after a qubit is used needs a correction that depends on a measurement, so both are refused. Qubits that are never measured are left with a Clifford gate at the end, which the list does not show.
+
+## Surface code simulation
+
+`qirc surface` checks the logical error rate that resource estimates assume by simulating it. For each distance it lays out a rotated surface code, measures its stabilizers for d rounds with the usual CNOT orders, which keep hook errors across the logical operator, and applies a Pauli error with probability p after every gate, reset and measurement, p coming from `--error` or from a calibration's CNOT errors. A Pauli frame simulator runs 64 shots at once in the bits of a machine word, the decoding graph is built by injecting every possible single fault and recording which checks it trips and whether it flips the logical qubit, and each shot is decoded by union find.
+
+```text
+$ qirc surface --error 0.001 --shots 200000
+surface code memory, physical error 0.001 on every gate, reset and measurement
+
+distance  rounds     shots  failures      per round          model
+       3       3    200000       215       3.586e-4       3.000e-4
+       5       5    200000        34       3.400e-5       3.000e-5
+       7       7    200000         8       5.714e-6       3.000e-6
+```
+
+At an error rate of 0.001 the simulated logical error per round follows 0.03 (p/0.01)^((d+1)/2), the formula `--emit resources` uses, within about a factor of two. Near the threshold it does not: at 0.005 the rate falls from 7.0e-3 to only 2.9e-3 between distances 3 and 7, where the formula expects 1.9e-3, so estimates for such noisy devices are optimistic. Every single fault is corrected at distances 3 and 5, which the tests check fault by fault.
 
 ## Releasing
 
@@ -430,7 +533,7 @@ Branches below a probability of 1e-12 are pruned and the search stops after 20,0
 
 The state vector is stored as separate real and imaginary arrays, so a single qubit gate is a 2x2 complex matrix applied to every pair of amplitudes at once. On x86_64 with AVX2 and FMA, four amplitudes are processed per instruction.
 
-When the target qubit is 2 or higher, each pair's two halves are contiguous and load directly. When the target is qubit 0 or 1, both halves sit in the same register and are paired with a permute. Controls are a bit mask: a control above bit 1 is constant across a register, so whole registers are skipped, and a control on bit 0 or 1 is blended per lane. This covers Toffoli and controlled swap without a separate code path. CPUs without AVX2 use a scalar fallback.
+When the target qubit is 2 or higher, each pair's two halves are contiguous and load directly. When the target is qubit 0 or 1, both halves sit in the same register and are paired with a permute. Controls are a bit mask: a control above bit 1 is constant across a register, so whole registers are skipped, and a control on bit 0 or 1 is blended per lane. This covers Toffoli and controlled swap without a separate code path. CPUs without AVX2 use a scalar fallback. From 21 qubits each gate is split across the CPU's threads, a chunk of the amplitudes each, or a pair of chunks when the target qubit is above the chunk size. At 26 qubits, where the state is a gigabyte and every gate reads and writes all of it, 16 threads make a random circuit 1.5 times faster, which is as far as memory bandwidth allows without applying several gates in one pass.
 
 Straight line programs are evolved once and sampled. Programs that branch on a measurement, reset a qubit, or act on a qubit after measuring it are simulated shot by shot with real collapse.
 
@@ -440,13 +543,15 @@ A program with more than 20 qubits whose gates only permute basis states (X, Y, 
 
 `--observable` prints the exact expectation value of a sum of Pauli strings, written like `Z0 Z1 + 0.5 X2 - 2*Y3`. Measurements at the end of the program are left out, so the value is taken on the state just before them, and a program that branches on mid circuit measurements is averaged exactly over every branch, weighted by its probability. On the teleportation example the teleported qubit gives 0.707107 for both `Z2` and `X2`, as `ry(pi/4)` should. A program without mid circuit measurements is not limited to 30 qubits: each Pauli string only depends on the gates in its backward light cone, so each is simulated on a small circuit over just the qubits of its cone. A 200 qubit layer of `ry` rotations and CNOT pairs gives `Z199 + X0 X1` exactly in 50 ms. A cone of permutation and phase gates is a basis state, where a string with an X or Y gives 0 and a string of Z gives the sign of the parity of its bits. A cone of Clifford gates is simulated on the stabilizer tableau instead, however wide it is: after basis changes and CNOTs fold the Pauli string onto one qubit, its value is 0 if measuring that qubit would be random and the sign of the deterministic outcome otherwise, so `Y0 Y1 X2 ... X999` on a 1000 qubit GHZ state gives -1. A cone that is neither Clifford nor small enough for a state vector is lowered to `rz`, `sx` and `cx` and the Pauli string is pushed backwards through it in the Heisenberg picture: a CNOT maps each string to one string, a rotation splits a string that anticommutes with it into a cosine and a sine part, and at the start only strings of I and Z count. This stays exact while few rotations touch the cone, so `rz(0.3)`, `t` and `rx(0.2)` on a 100 qubit GHZ state give `X0 ... X99 + Z0 Z99` = 1.446627 in 80 ms, and it gives up once a term expands past 65536 strings.
 
-When the expansion gives up, the cone is cut instead. qirc splits its qubits into two groups of at most 30 that as few two qubit gates as possible connect, and writes each connecting gate as a sum of products of one qubit operators: a controlled gate as |0⟩⟨0| ⊗ I + |1⟩⟨1| ⊗ U, and a swap as half the sum of P ⊗ P over the four Paulis. Each half is simulated as a state vector once for every choice of those terms, branching at each cut so the gates before it run only once, and the expectation is recombined exactly from the overlaps between those states, one for each pair of choices, so the work grows with the square of the number of choices and a few cuts are practical. A 40 qubit circuit made of two 20 qubit halves of random rotations and CNOT chains, joined by two CNOTs, gives `Z0 Z39 + X10 + Z19 Z20` exactly in about 5 seconds, and followed by its own inverse, four cuts, it gives exactly 2. Terms whose light cones keep the same gates share one set of simulations.
+When the expansion gives up, the cone is cut instead. qirc splits its qubits into the fewest groups of at most 30 that as few two qubit gates as possible connect, peeling off one group at a time and moving qubits between groups while that removes connecting gates, and tries smaller groups when larger ones would need more memory than it allows, and writes each connecting gate as a sum of products of one qubit operators: a controlled gate as |0⟩⟨0| ⊗ I + |1⟩⟨1| ⊗ U, and a swap as half the sum of P ⊗ P over the four Paulis. Each half is simulated as a state vector once for every choice of those terms, branching at each cut so the gates before it run only once, and the expectation is recombined exactly from the overlaps between those states, one for each pair of choices, so the work grows with the square of the number of choices and a few cuts are practical. A 40 qubit circuit made of two 20 qubit halves of random rotations and CNOT chains, joined by two CNOTs, gives `Z0 Z39 + X10 + Z19 Z20` exactly in about 5 seconds, and followed by its own inverse, four cuts, it gives exactly 2. Terms whose light cones keep the same gates share one set of simulations. Three 20 qubit blocks joined by two CNOTs give an exact expectation on 60 qubits in about a second.
+
+Cutting also samples. A straight line program above 30 qubits that measures at most 20 of them at the end, and cuts within the same limits, runs as circuit cutting before falling back to the matrix product state: each piece's states give a table of overlaps for every outcome of its measured qubits, and the tables recombine into the exact distribution over the measured bits, which the shots are drawn from. The 40 qubit circuit above, measuring 6 qubits, samples 4,000 shots in about 2 seconds.
 
 A straight line program with more than 30 qubits whose gates are Clifford apart from up to 10 rotations by other angles, such as T gates, runs on a sum of stabilizer states. Each state is kept in CH form, which unlike a tableau tracks its global phase, so the terms of the sum can interfere. Lowered to `rz`, `sx` and `cx`, a CNOT or a quarter turn is a row operation on each term, a Hadamard folds the two basis strings it produces back into one state with a few CNOTs, CZs and an S, and a rotation by any other angle splits every term into two with cos(θ/2) I - i sin(θ/2) Z. Shots are drawn exactly by gate by gate sampling, which needs only amplitudes: every shot moves through the circuit with the state, a CNOT or X flips its bits, a phase changes nothing, and only an `sx` redraws one bit from the amplitudes of its two neighbours. Shots that agree so far share those amplitudes. Measurements and resets in the middle of a straight line program are deferred: a measurement becomes a CNOT onto a fresh qubit read at the end, and a reset swaps the qubit with a fresh one, which gives the same statistics exactly. A program that branches on a result goes to the matrix product state instead. A 40 qubit circuit with three T gates spread along a CNOT chain takes 3 seconds for 40,000 shots, and every qubit's frequency of 1 matches the exact value from the light cone expectation to within 0.0004.
 
 Any other program with more than 30 qubits runs as a matrix product state: one small tensor per qubit, joined by bonds whose size grows with entanglement. A two qubit gate on neighbouring tensors is applied to their product and split back with a singular value decomposition, gates between distant qubits move one tensor next to the other with swaps, and the bonds are capped at 32 by default or at `--bond n`, dropping the smallest singular values. The run reports the weight it dropped, so an approximate answer says so. Without the cap the result is exact, which the tests check against the state vector amplitude by amplitude. A 60 qubit circuit of four layers of arbitrary rotations and CNOTs runs in 1.3 seconds and its marginals match exact light cone values to within sampling noise, and a 40 qubit circuit of twelve layers drops 0.09% of the weight at bond 32. `--bond` also forces this kernel on a small program.
 
-The stabilizer tableau, the bit vector, the stabilizer sum and the matrix product state are chosen in that order, the first that fits, and the run prints which.
+The stabilizer tableau, the bit vector, the stabilizer sum, circuit cutting and the matrix product state are chosen in that order, the first that fits, and the run prints which. A matrix product state reports the weight it dropped as one minus the product of the fractions each truncation keeps.
 
 ## Pulse schedules
 
@@ -478,6 +583,8 @@ The tests include:
 - The stabilizer tableau checked against the state vector on random Clifford circuits, measurement by measurement, and `qirc diff` on 24 qubit Clifford circuits both for compiled programs and for programs with a single extra gate.
 - Phase folding, qubit reuse and noisy simulation, each checked against an exact or statistical expectation.
 - OpenQASM input on hand checked programs, error cases and deeply nested or exponentially expanding input.
+- `scripts/sweep.sh`, run in CI, which proves every corpus program equivalent to itself under sixteen combinations of optimisation, gate sets, resynthesis, routing, relabelling, reuse and calibration, and 600 randomly damaged programs run through every emit kind without a crash.
+- Phase teleportation on random Clifford+T circuits and on phase gadgets, circuit cutting against the state vector for two and three pieces, expectations and distributions, rotation synthesis against its precision and T count bound, and resource estimates, decoupling and variational inputs against exact values.
 
 ## Limitations
 
@@ -485,6 +592,9 @@ The tests include:
 - Recursion that is not a tail call is only expanded when its depth is known at compile time, up to 10,000 calls deep, or 32 in the browser.
 - Above 30 qubits a circuit without structure to exploit runs as a matrix product state, which is exact only while its entanglement fits the bond cap and otherwise reports the weight it dropped.
 - OpenQASM 3 input reads classical values that are set once. Values that change, `bool`, `break` and subroutines are refused.
+- `--epsilon` reaches a precision of about 1e-10 for each rotation, and some angles take several seconds there, since the candidates are enumerated one coordinate at a time rather than by Ross and Selinger's grid operators.
+- Circuit cutting pays off only while few gates join the pieces, because the work grows with the square of the product of the terms of every cut, and cut sampling measures at most 20 qubits.
+- Resource estimates follow one layout, a fast block with 15-to-1 factories and one error rate for every operation, so they are a first estimate rather than a compiled fault tolerant schedule.
 - `qirc submit` talks to IonQ only, and has been tested against a local imitation of its API rather than a live account.
 - OpenQASM 3 output writes branches as `if` and `else`, loops as a `while` over blocks, classical values as typed variables and recorded values as `output` variables. A floating point remainder, a pointer cast or a value recorded inside a loop is refused rather than approximated, and `--emit qir` keeps them.
 - QIR output decomposes a controlled gate that has no QIR function of its own, and refuses one with three or more controls.

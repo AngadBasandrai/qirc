@@ -1456,9 +1456,16 @@ fn json_op(op: &Op) -> Option<String> {
 
             let controls: Vec<String> = gate.controls.iter().map(|q| q.0.to_string()).collect();
             let targets: Vec<String> = gate.targets.iter().map(|q| q.0.to_string()).collect();
+            let matrix = match gate.kind {
+                GateKind::Unitary(m) => {
+                    let entries = [m.a, m.b, m.c, m.d].map(|(re, im)| format!("{re}, {im}"));
+                    format!(", \"matrix\": [{}]", entries.join(", "))
+                }
+                _ => String::new(),
+            };
 
             Some(format!(
-                "        {{ \"op\": \"gate\", \"name\": {:?}, \"controls\": [{}], \"targets\": [{}], \"params\": [{}] }}",
+                "        {{ \"op\": \"gate\", \"name\": {:?}, \"controls\": [{}], \"targets\": [{}], \"params\": [{}]{matrix} }}",
                 gate.kind.name(),
                 controls.join(", "),
                 targets.join(", "),

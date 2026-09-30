@@ -1,12 +1,16 @@
 mod common;
 
+use std::collections::HashMap;
 use std::f64::consts::PI;
 
 use common::{compile, errors, final_state, run};
 use qirc::calibration::Calibration;
-use qirc::driver;
+use qirc::diag::SourceFile;
+use qirc::driver::{self, Output};
 use qirc::equiv;
 use qirc::ir::Profile;
+use qirc::observable::{self, Observable};
+use qirc::qasm;
 
 const BELL: &str = "OPENQASM 3.0;
 include \"stdgates.inc\";
@@ -339,4 +343,149 @@ out = measure q;
         let found = errors(&driver::compile(source, 1)).join("\n");
         assert!(found.contains(message), "{found}");
     }
+}
+
+const ANSATZ: &str = "OPENQASM 3.0;
+include \"stdgates.inc\";
+input float theta;
+input angle[32] phi;
+qubit[2] q;
+ry(theta) q[0];
+ry(phi) q[1];
+cx q[0], q[1];
+";
+
+const NOISE: &str = "cx 0 1 0.03
+single 0 0.005
+single 1 0.005
+readout 0 0.02
+readout 1 0.02
+";
+
+fn drive(args: &[&str]) -> (i32, String) {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let options = driver::parse_args_with(&args, |path| match path {
+        "noise.cal" => Ok(NOISE.into()),
+        _ => Err("no files".into()),
+    })
+    .unwrap();
+    let mut output = Output::default();
+    let code = driver::run_source(
+        &options,
+        &SourceFile::new("ansatz.qasm", ANSATZ),
+        None,
+        &mut output,
+    );
+    (code, output.stdout + &output.stderr)
+}
+
+#[test]
+fn inputs() {
+    assert_eq!(qasm::inputs(ANSATZ), ["theta", "phi"]);
+    let bound = HashMap::from([("theta".to_string(), 0.4), ("phi".to_string(), -1.1)]);
+    let (program, found) = qasm::lower_with(ANSATZ, &bound);
+    assert!(found.is_empty(), "{found:?}");
+    let observable = Observable::parse("Z0 + X1").unwrap();
+    let value = observable::expectation(&program, &observable).unwrap();
+    assert!((value - 0.029853633941449735).abs() < 1e-9, "{value}");
+    let (_, unbound) = qasm::lower(ANSATZ);
+    assert!(
+        unbound[0].message.contains("--bind theta=<value>"),
+        "{unbound:?}"
+    );
+    let extra = HashMap::from([
+        ("theta".to_string(), 0.0),
+        ("phi".to_string(), 0.0),
+        ("psi".to_string(), 0.0),
+    ]);
+    assert!(
+        qasm::lower_with(ANSATZ, &extra).1[0]
+            .message
+            .contains("`psi`")
+    );
+}
+
+#[test]
+fn minimizes() {
+    let observable = "Z0 Z1 + 0.5 X0 + 0.5 X1";
+    let (code, text) = drive(&["ansatz.qasm", "--observable", observable, "--minimize"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("minimum -1.414214"), "{text}");
+    let (code, text) = drive(&[
+        "ansatz.qasm",
+        "--observable",
+        observable,
+        "--gradient",
+        "--bind",
+        "theta=0.3,phi=1.2",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let slope = |name: &str| -> f64 {
+        let line = text
+            .lines()
+            .find(|l| l.contains(&format!("d/d{name}")))
+            .unwrap();
+        line.split_whitespace().last().unwrap().parse().unwrap()
+    };
+    assert!((slope("theta") - 0.445205).abs() < 1e-6, "{text}");
+    assert!((slope("phi") + 0.697318).abs() < 1e-6, "{text}");
+}
+
+#[test]
+fn minimizes_noisy() {
+    let observable = "Z0 Z1 + 0.5 X0 + 0.5 X1";
+    let noisy = ["--noisy", "--calibration", "noise.cal", "--seed", "5"];
+    let (code, text) = drive(
+        &[
+            &["ansatz.qasm", "--observable", observable, "--minimize"],
+            &noisy[..],
+        ]
+        .concat(),
+    );
+    assert_eq!(code, 0, "{text}");
+    let value = |label: &str| -> f64 {
+        let line = text.lines().find(|l| l.contains(label)).unwrap();
+        line.split_whitespace()
+            .nth(label.split_whitespace().count())
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert!(value("exact value without noise") < -1.4, "{text}");
+    assert!(
+        value("noisy value") > value("exact value without noise"),
+        "{text}"
+    );
+    let at = [
+        "--gradient",
+        "--bind",
+        "theta=0.3,phi=1.2",
+        "--shots",
+        "20000",
+    ];
+    let (code, text) = drive(
+        &[
+            &["ansatz.qasm", "--observable", observable],
+            &at[..],
+            &noisy[..],
+        ]
+        .concat(),
+    );
+    assert_eq!(code, 0, "{text}");
+    let slopes = |name: &str| -> (f64, f64) {
+        let line = text
+            .lines()
+            .find(|l| l.contains(&format!("d/d{name}")))
+            .unwrap();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        (words[1].parse().unwrap(), words[4].parse().unwrap())
+    };
+    for name in ["theta", "phi"] {
+        let (noisy, exact) = slopes(name);
+        assert!(
+            (0.8..1.0).contains(&(noisy / exact)),
+            "{name} {noisy} {exact}\n{text}"
+        );
+    }
+    assert!(!text.contains("shift rule is exact only"), "{text}");
 }

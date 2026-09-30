@@ -1,6 +1,9 @@
 use super::matrix::{C64, Matrix2, matrix_for};
 use super::state::Rng;
-use crate::ir::{Gate, GateKind};
+use std::collections::VecDeque;
+use std::iter;
+
+use crate::ir::{Gate, GateKind, Program};
 
 pub const DEFAULT_BOND: usize = 32;
 const NEGLIGIBLE: f64 = 1e-14;
@@ -29,6 +32,76 @@ pub struct Mps {
     center: usize,
     bond: usize,
     pub discarded: f64,
+}
+
+fn spread(weight: &[Vec<usize>], position: &[usize]) -> usize {
+    let mut total = 0;
+    for (a, row) in weight.iter().enumerate() {
+        for (b, &w) in row.iter().enumerate().skip(a + 1) {
+            total += w * position[a].abs_diff(position[b]);
+        }
+    }
+    total
+}
+
+fn degree(weight: &[Vec<usize>], q: usize) -> usize {
+    weight[q].iter().filter(|&&w| w > 0).count()
+}
+
+fn cuthill_mckee(weight: &[Vec<usize>], start: usize) -> Vec<usize> {
+    let n = weight.len();
+    let mut placed = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    let mut queue = VecDeque::new();
+    let mut seeds = iter::once(start).chain(0..n);
+    while order.len() < n {
+        if queue.is_empty() {
+            let Some(seed) = seeds.find(|&q| !placed[q]) else {
+                break;
+            };
+            placed[seed] = true;
+            queue.push_back(seed);
+        }
+        while let Some(q) = queue.pop_front() {
+            order.push(q);
+            let mut next: Vec<usize> = (0..n).filter(|&r| !placed[r] && weight[q][r] > 0).collect();
+            next.sort_by_key(|&r| (degree(weight, r), r));
+            for r in next {
+                placed[r] = true;
+                queue.push_back(r);
+            }
+        }
+    }
+    order.reverse();
+    let mut position = vec![0; n];
+    for (at, &q) in order.iter().enumerate() {
+        position[q] = at;
+    }
+    position
+}
+
+pub(crate) fn arrangement(program: &Program) -> Option<Vec<usize>> {
+    let n = program.num_qubits as usize;
+    let mut weight = vec![vec![0; n]; n];
+    for gate in program.gates() {
+        let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
+        if let [a, b] = wires[..] {
+            weight[a][b] += 1;
+            weight[b][a] += 1;
+        }
+    }
+    let identity: Vec<usize> = (0..n).collect();
+    let current = spread(&weight, &identity);
+    let mut starts: Vec<usize> = (0..n).collect();
+    starts.sort_by_key(|&q| (degree(&weight, q), q));
+    starts.truncate(8);
+    starts
+        .into_iter()
+        .map(|start| cuthill_mckee(&weight, start))
+        .map(|position| (spread(&weight, &position), position))
+        .filter(|(cost, _)| *cost < current)
+        .min_by_key(|(cost, _)| *cost)
+        .map(|(_, position)| position)
 }
 
 pub fn supports(gate: &Gate) -> bool {
@@ -337,7 +410,7 @@ impl Mps {
         keep = keep.min(s.len());
         let kept: f64 = s[..keep].iter().map(|x| x * x).sum();
         if total > 0.0 {
-            self.discarded += (total - kept) / total;
+            self.discarded = 1.0 - (1.0 - self.discarded) * (kept / total);
         }
         let scale = if kept > 0.0 {
             (total / kept).sqrt()
@@ -380,6 +453,19 @@ impl Mps {
     }
 
     pub fn two(&mut self, first: usize, second: usize, m: &Square) {
+        let home = self.site_of[second];
+        self.meet(first, second, m);
+        while self.site_of[second] < home {
+            let k = self.site_of[second];
+            self.swap_sites(k);
+        }
+        while self.site_of[second] > home {
+            let k = self.site_of[second] - 1;
+            self.swap_sites(k);
+        }
+    }
+
+    fn meet(&mut self, first: usize, second: usize, m: &Square) {
         let anchor = self.site_of[first];
         while self.site_of[second] > anchor + 1 {
             let k = self.site_of[second] - 1;

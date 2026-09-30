@@ -23,6 +23,12 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - run: cargo build --release --target wasm32-unknown-unknown --manifest-path web/Cargo.toml
+      - run: cargo build --release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install qiskit pytket
+      - run: python bench/page.py
       - run: |
           mkdir site
           cp web/index.html site/index.html

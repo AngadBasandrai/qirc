@@ -1,6 +1,6 @@
 # Diagnostics
 
-Every error and warning carries a code. The command line prints it with the source line it points at, the [language server](../editors.md) sends it to the editor, and Python raises it inside `qirc.CompileError`.
+Every error and warning carries a code. The command line prints it with the source line it points at, the [language server](../editors.md) sends it to the editor, and Python raises it inside `qirc.CompileError`. `qirc explain <code>` prints a longer explanation of any of them, and a mistyped option, emit kind or gate name gets a suggestion of the nearest valid one.
 
 ## Reading the source
 
@@ -40,4 +40,5 @@ The profile comes from the `qir_profiles` attribute on the entry point, and the 
 | Code | Meaning |
 | --- | --- |
 | `QIR0400` | the program cannot be routed onto the coupling map, usually because it needs more qubits than the map has or the map is not connected |
-| `QIR0401` | a warning that the gate set has no exact form for some gates, which are left as written |
+| `QIR0401` | a warning that the gate set has no exact form for some gates, which are left as written; `--epsilon` approximates them instead |
+| `QIR0402` | `--epsilon` cannot approximate a rotation, because the set lacks `h` or `t` or the precision is below about 1e-10 |

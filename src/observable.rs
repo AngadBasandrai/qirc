@@ -13,6 +13,8 @@ use crate::simulator::mps::Mps;
 use crate::simulator::state::{self, State};
 use crate::simulator::tableau::Tableau;
 
+pub type Sampled = (f64, f64);
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Pauli {
     X,
@@ -130,6 +132,10 @@ impl Product {
 }
 
 impl Observable {
+    pub fn bound(&self) -> f64 {
+        self.terms.iter().map(|term| term.weight.abs()).sum()
+    }
+
     pub fn parse(text: &str) -> Result<Observable, String> {
         let mut terms = Vec::new();
         let mut qubits = 0;
@@ -338,7 +344,7 @@ pub fn noisy_expectation(
     calibration: &Calibration,
     shots: u64,
     seed: u64,
-) -> Result<f64, String> {
+) -> Result<Sampled, String> {
     check(program, observable)?;
     let config = ExecConfig {
         shots,
@@ -357,12 +363,14 @@ pub fn extrapolate(
     calibration: &Calibration,
     shots: u64,
     seed: u64,
-) -> Result<([f64; 3], f64), String> {
-    let mut values = [0.0; 3];
+) -> Result<([Sampled; 3], Sampled), String> {
+    let mut values = [(0.0, 0.0); 3];
     for (value, scale) in values.iter_mut().zip([1.0, 2.0, 3.0]) {
         *value = noisy_expectation(program, observable, &calibration.scaled(scale), shots, seed)?;
     }
-    Ok((values, 3.0 * values[0] - 3.0 * values[1] + values[2]))
+    let [(one, a), (two, b), (three, c)] = values;
+    let spread = (9.0 * a * a + 9.0 * b * b + c * c).sqrt();
+    Ok((values, (3.0 * one - 3.0 * two + three, spread)))
 }
 
 pub fn expectation(program: &Program, observable: &Observable) -> Result<f64, String> {

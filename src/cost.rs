@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::f64::consts::FRAC_PI_2;
 use std::fmt;
 
 use crate::calibration::Calibration;
@@ -13,6 +14,7 @@ pub struct Tally {
     pub gates: usize,
     pub depth: usize,
     pub live: usize,
+    pub rotations: usize,
     pub success: Option<f64>,
     pub time: Option<f64>,
 }
@@ -51,6 +53,17 @@ impl Tally {
                         gate.controls.is_empty()
                             && matches!(gate.kind, GateKind::T | GateKind::TDag),
                     );
+                    tally.rotations += usize::from(
+                        gate.controls.is_empty()
+                            && matches!(
+                                gate.kind,
+                                GateKind::Rx | GateKind::Ry | GateKind::Rz | GateKind::R1
+                            )
+                            && gate.constant_angle().is_none_or(|angle| {
+                                let quarters = angle / FRAC_PI_2;
+                                (quarters - quarters.round()).abs() > 1e-9
+                            }),
+                    );
                 }
                 Op::Reset { qubit, .. } => {
                     intervals.extend(open.remove(qubit).map(|start| (start, layer)))
@@ -71,6 +84,7 @@ impl Tally {
             gates: self.gates.max(other.gates),
             depth: self.depth.max(other.depth),
             live: self.live.max(other.live),
+            rotations: self.rotations.max(other.rotations),
             success: match (self.success, other.success) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),

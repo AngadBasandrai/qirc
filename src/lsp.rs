@@ -1,9 +1,14 @@
+use std::collections::VecDeque;
 use std::io::{self, BufRead, ErrorKind, Write};
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::mpsc;
+use std::thread;
 
 use crate::diag::{Diagnostic, Severity, SourceFile, Span};
 use crate::driver;
 use crate::json::{self, Json};
+
+const MAX_TEXT: usize = 1 << 20;
 
 fn receive(input: &mut impl BufRead) -> io::Result<Option<String>> {
     let mut length = None;
@@ -86,7 +91,15 @@ fn entry(file: &SourceFile, diagnostic: &Diagnostic) -> String {
 
 pub fn check(uri: &str, text: &str) -> String {
     let file = SourceFile::new(uri, text);
-    let entries: Vec<String> =
+    let entries: Vec<String> = if text.len() > MAX_TEXT {
+        vec![entry(
+            &file,
+            &Diagnostic::warning(format!(
+                "this file is {} KB, too large to check while typing, so run qirc on it instead",
+                text.len() / 1024
+            )),
+        )]
+    } else {
         match panic::catch_unwind(AssertUnwindSafe(|| driver::compile(text, 0))) {
             Ok(compilation) => compilation
                 .diagnostics
@@ -97,7 +110,8 @@ pub fn check(uri: &str, text: &str) -> String {
                 &file,
                 &Diagnostic::error("internal error: qirc panicked on this file"),
             )],
-        };
+        }
+    };
     format!(
         r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":{},"diagnostics":[{}]}}}}"#,
         json::quoted(uri),
@@ -105,70 +119,126 @@ pub fn check(uri: &str, text: &str) -> String {
     )
 }
 
-fn document(params: Option<&Json>) -> Option<(&str, &str)> {
-    let params = params?;
-    let uri = params.get("textDocument")?.get("uri")?.text()?;
+fn method(message: &Json) -> Option<&str> {
+    message.get("method").and_then(Json::text)
+}
+
+fn uri(message: &Json) -> Option<&str> {
+    message
+        .get("params")?
+        .get("textDocument")?
+        .get("uri")?
+        .text()
+}
+
+fn document(message: &Json) -> Option<(&str, &str)> {
+    let params = message.get("params")?;
     let text = match params.get("contentChanges") {
         Some(Json::List(changes)) => changes.last()?.get("text")?.text()?,
         _ => params.get("textDocument")?.get("text")?.text()?,
     };
-    Some((uri, text))
+    Some((uri(message)?, text))
 }
 
-pub fn serve(mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
-    while let Some(body) = receive(&mut input)? {
-        let Ok(message) = Json::parse(&body) else {
+fn superseded(message: &Json, later: &VecDeque<Json>) -> bool {
+    matches!(
+        method(message),
+        Some("textDocument/didOpen" | "textDocument/didChange")
+    ) && later.iter().any(|next| {
+        matches!(
+            method(next),
+            Some("textDocument/didChange" | "textDocument/didClose")
+        ) && uri(next) == uri(message)
+    })
+}
+
+fn handle(message: &Json, output: &mut impl Write) -> io::Result<bool> {
+    let id = message.get("id").map(raw);
+    let reply = |result: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{},"result":{result}}}"#,
+            id.as_deref().unwrap_or("null")
+        )
+    };
+    match method(message) {
+        Some("initialize") => send(
+            output,
+            &reply(&format!(
+                r#"{{"capabilities":{{"textDocumentSync":1}},"serverInfo":{{"name":"qirc","version":"{}"}}}}"#,
+                env!("CARGO_PKG_VERSION")
+            )),
+        )?,
+        Some("shutdown") => send(output, &reply("null"))?,
+        Some("exit") => return Ok(false),
+        Some("textDocument/didOpen" | "textDocument/didChange") => {
+            if let Some((uri, text)) = document(message) {
+                send(output, &check(uri, text))?;
+            }
+        }
+        Some("textDocument/didClose") => {
+            if let Some(uri) = uri(message) {
+                send(output, &check(uri, ""))?;
+            }
+        }
+        Some(method) if id.is_some() => send(
+            output,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":-32601,"message":{}}}}}"#,
+                id.as_deref().unwrap_or("null"),
+                json::quoted(&format!("qirc does not handle {method}"))
+            ),
+        )?,
+        _ => {}
+    }
+    Ok(true)
+}
+
+fn enqueue(body: io::Result<String>, pending: &mut VecDeque<Json>) -> io::Result<()> {
+    pending.extend(Json::parse(&body?).ok());
+    Ok(())
+}
+
+pub fn serve(input: impl BufRead + Send + 'static, mut output: impl Write) -> io::Result<()> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut input = input;
+        loop {
+            let message = receive(&mut input).transpose();
+            let end = !matches!(message, Some(Ok(_)));
+            if let Some(message) = message
+                && sender.send(message).is_err()
+            {
+                return;
+            }
+            if end {
+                return;
+            }
+        }
+    });
+    let mut pending = VecDeque::new();
+    loop {
+        if pending.is_empty() {
+            match receiver.recv() {
+                Ok(body) => enqueue(body, &mut pending)?,
+                Err(_) => return Ok(()),
+            }
+        }
+        for body in receiver.try_iter() {
+            enqueue(body, &mut pending)?;
+        }
+        let Some(message) = pending.pop_front() else {
             continue;
         };
-        let id = message.get("id").map(raw);
-        let params = message.get("params");
-        let reply = |result: &str| {
-            format!(
-                r#"{{"jsonrpc":"2.0","id":{},"result":{result}}}"#,
-                id.as_deref().unwrap_or("null")
-            )
-        };
-        match message.get("method").and_then(Json::text) {
-            Some("initialize") => send(
-                &mut output,
-                &reply(&format!(
-                    r#"{{"capabilities":{{"textDocumentSync":1}},"serverInfo":{{"name":"qirc","version":"{}"}}}}"#,
-                    env!("CARGO_PKG_VERSION")
-                )),
-            )?,
-            Some("shutdown") => send(&mut output, &reply("null"))?,
-            Some("exit") => return Ok(()),
-            Some("textDocument/didOpen" | "textDocument/didChange") => {
-                if let Some((uri, text)) = document(params) {
-                    send(&mut output, &check(uri, text))?;
-                }
-            }
-            Some("textDocument/didClose") => {
-                if let Some(uri) = params
-                    .and_then(|p| p.get("textDocument"))
-                    .and_then(|d| d.get("uri"))
-                    .and_then(Json::text)
-                {
-                    send(&mut output, &check(uri, ""))?;
-                }
-            }
-            Some(method) if id.is_some() => send(
-                &mut output,
-                &format!(
-                    r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":-32601,"message":{}}}}}"#,
-                    id.as_deref().unwrap_or("null"),
-                    json::quoted(&format!("qirc does not handle {method}"))
-                ),
-            )?,
-            _ => {}
+        if !superseded(&message, &pending) && !handle(&message, &mut output)? {
+            return Ok(());
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn frame(body: &str) -> String {
         format!("Content-Length: {}\r\n\r\n{body}", body.len())
@@ -204,17 +274,31 @@ mod tests {
         .map(|body| frame(&body))
         .concat();
         let mut output = Vec::new();
-        serve(session.as_bytes(), &mut output).unwrap();
+        serve(Cursor::new(session.into_bytes()), &mut output).unwrap();
         let replies = replies(&output);
-        assert_eq!(replies.len(), 5, "{}", String::from_utf8_lossy(&output));
         let sync = replies[0]
             .get("result")
             .and_then(|r| r.get("capabilities"))
             .and_then(|c| c.get("textDocumentSync"));
         assert_eq!(sync, Some(&Json::Number(1.0)));
-        let Some(Json::List(found)) = replies[1].get("params").and_then(|p| p.get("diagnostics"))
+        let published: Vec<&Json> = replies
+            .iter()
+            .filter_map(|reply| reply.get("params")?.get("diagnostics"))
+            .collect();
+        assert_eq!(
+            published.last(),
+            Some(&&Json::List(Vec::new())),
+            "{replies:?}"
+        );
+        let tail = &replies[replies.len() - 2..];
+        assert_eq!(tail[0].get("id"), Some(&Json::Text("x".into())));
+        assert!(tail[0].get("error").is_some(), "{:?}", tail[0]);
+        assert_eq!(tail[1].get("result"), Some(&Json::Null));
+
+        let checked = Json::parse(&check("file:///a.qasm", broken)).unwrap();
+        let Some(Json::List(found)) = checked.get("params").and_then(|p| p.get("diagnostics"))
         else {
-            panic!("{:?}", replies[1]);
+            panic!("no diagnostics for {broken}");
         };
         let [problem] = &found[..] else {
             panic!("{found:?}");
@@ -226,13 +310,38 @@ mod tests {
             "{problem:?}"
         );
         assert_eq!(problem.get("severity"), Some(&Json::Number(1.0)));
-        assert_eq!(
-            replies[2].get("params").and_then(|p| p.get("diagnostics")),
-            Some(&Json::List(Vec::new()))
+    }
+
+    #[test]
+    fn skips_stale() {
+        let message = |method: &str, uri: &str| {
+            Json::parse(&format!(
+                r#"{{"method":"{method}","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+            ))
+            .unwrap()
+        };
+        let open = message("textDocument/didOpen", "file:///a.ll");
+        let later = VecDeque::from([message("textDocument/didChange", "file:///b.ll")]);
+        assert!(!superseded(&open, &later));
+        let later = VecDeque::from([message("textDocument/didChange", "file:///a.ll")]);
+        assert!(superseded(&open, &later));
+        let close = VecDeque::from([message("textDocument/didClose", "file:///a.ll")]);
+        assert!(superseded(
+            &message("textDocument/didChange", "file:///a.ll"),
+            &close
+        ));
+        assert!(!superseded(&message("shutdown", "file:///a.ll"), &close));
+    }
+
+    #[test]
+    fn caps_size() {
+        let huge = format!("OPENQASM 3.0;\n{}", "// padding\n".repeat(MAX_TEXT / 8));
+        let reply = check("file:///huge.qasm", &huge);
+        assert!(
+            reply.contains("too large to check while typing"),
+            "{}",
+            &reply[..200]
         );
-        assert_eq!(replies[3].get("id"), Some(&Json::Text("x".into())));
-        assert!(replies[3].get("error").is_some(), "{:?}", replies[3]);
-        assert_eq!(replies[4].get("result"), Some(&Json::Null));
     }
 
     #[test]

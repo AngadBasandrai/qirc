@@ -187,16 +187,27 @@ pub fn emit(program: &Program, calibration: &Calibration) -> Result<String, Stri
     let ops = &program.blocks[0].ops;
     let times = calibration.timeline(ops);
     let mut free = vec![0.0; program.num_qubits as usize];
+    let mut used = vec![false; program.num_qubits as usize];
     for (op, &(start, end)) in ops.iter().zip(&times) {
         let Some(line) = statement(op) else {
             continue;
         };
         for q in op.qubits() {
             let gap = start - free[q.index()];
-            if gap > 1e-9 {
+            if used[q.index()] && calibration.echoes(q.index(), gap) {
+                let quarter = (gap - 2.0 * calibration.pulse(q.index())) / 4.0;
+                let half = 2.0 * quarter;
+                let wire = q.0;
+                writeln!(
+                    out,
+                    "delay[{quarter}ns] ${wire};\nx ${wire};\ndelay[{half}ns] ${wire};\nx ${wire};\ndelay[{quarter}ns] ${wire};"
+                )
+                .unwrap();
+            } else if gap > 1e-9 {
                 writeln!(out, "delay[{gap}ns] ${};", q.0).unwrap();
             }
             free[q.index()] = end;
+            used[q.index()] = true;
         }
         writeln!(out, "{line}").unwrap();
     }

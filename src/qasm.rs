@@ -1,8 +1,34 @@
 use std::collections::HashMap;
 use std::f64::consts::{E, PI};
 
-use crate::diag::{Diagnostic, Span};
+use crate::diag::{Diagnostic, Span, suggest};
 use crate::ir::*;
+
+const SIMPLE: [(&str, GateKind); 12] = [
+    ("x", GateKind::X),
+    ("y", GateKind::Y),
+    ("z", GateKind::Z),
+    ("h", GateKind::H),
+    ("s", GateKind::S),
+    ("sdg", GateKind::SDag),
+    ("t", GateKind::T),
+    ("tdg", GateKind::TDag),
+    ("sx", GateKind::SX),
+    ("sxdg", GateKind::SXDag),
+    ("id", GateKind::I),
+    ("i", GateKind::I),
+];
+const ROTATIONS: [(&str, GateKind); 6] = [
+    ("rx", GateKind::Rx),
+    ("ry", GateKind::Ry),
+    ("rz", GateKind::Rz),
+    ("p", GateKind::R1),
+    ("phase", GateKind::R1),
+    ("u1", GateKind::R1),
+];
+const NAMED: [&str; 12] = [
+    "CX", "cnot", "swap", "ccx", "toffoli", "ccz", "cswap", "fredkin", "U", "u", "u3", "u2",
+];
 
 const MAX_DEPTH: usize = 64;
 const MAX_NESTING: usize = 256;
@@ -419,6 +445,9 @@ struct Builder {
     branches: usize,
     emitted: usize,
     env: HashMap<String, f64>,
+    bindings: HashMap<String, f64>,
+    inputs: Vec<String>,
+    collecting: bool,
 }
 
 fn op(kind: GateKind, controls: &[usize], targets: &[usize], params: &[f64], span: Span) -> Op {
@@ -617,39 +646,17 @@ impl Builder {
             }
             Ok(())
         };
-        let simple = [
-            ("x", GateKind::X),
-            ("y", GateKind::Y),
-            ("z", GateKind::Z),
-            ("h", GateKind::H),
-            ("s", GateKind::S),
-            ("sdg", GateKind::SDag),
-            ("t", GateKind::T),
-            ("tdg", GateKind::TDag),
-            ("sx", GateKind::SX),
-            ("sxdg", GateKind::SXDag),
-            ("id", GateKind::I),
-            ("i", GateKind::I),
-        ];
-        let rotations = [
-            ("rx", GateKind::Rx),
-            ("ry", GateKind::Ry),
-            ("rz", GateKind::Rz),
-            ("p", GateKind::R1),
-            ("phase", GateKind::R1),
-            ("u1", GateKind::R1),
-        ];
         let name = call.name.as_str();
-        if let Some(&(_, kind)) = simple.iter().find(|(n, _)| *n == name) {
+        if let Some(&(_, kind)) = SIMPLE.iter().find(|(n, _)| *n == name) {
             want(0, 1)?;
             self.push(op(kind, &[], qubits, &[], span));
-        } else if let Some(&(_, kind)) = rotations.iter().find(|(n, _)| *n == name) {
+        } else if let Some(&(_, kind)) = ROTATIONS.iter().find(|(n, _)| *n == name) {
             want(1, 1)?;
             self.push(op(kind, &[], qubits, params, span));
         } else if let Some(kind) = name.strip_prefix('c').and_then(|base| {
-            simple
+            SIMPLE
                 .iter()
-                .chain(&rotations)
+                .chain(&ROTATIONS)
                 .find(|(n, _)| *n == base)
                 .map(|&(_, k)| k)
         }) {
@@ -692,8 +699,22 @@ impl Builder {
                 }
                 _ => {
                     let definition = self.definitions.get(name).cloned().ok_or_else(|| {
-                        Diagnostic::error(format!("unknown gate `{name}`"))
-                            .primary(span, "not a standard gate or one defined in this file")
+                        let standard: Vec<String> = SIMPLE
+                            .iter()
+                            .chain(&ROTATIONS)
+                            .flat_map(|(n, _)| [n.to_string(), format!("c{n}")])
+                            .chain(NAMED.map(String::from))
+                            .collect();
+                        let candidates = standard
+                            .iter()
+                            .map(String::as_str)
+                            .chain(self.definitions.keys().map(String::as_str));
+                        let error = Diagnostic::error(format!("unknown gate `{name}`"))
+                            .primary(span, "not a standard gate or one defined in this file");
+                        match suggest(name, candidates) {
+                            Some(found) => error.note(format!("did you mean `{found}`?")),
+                            None => error,
+                        }
                     })?;
                     want(definition.params.len(), definition.qubits.len())?;
                     self.budget(definition.size, span)?;
@@ -1008,6 +1029,40 @@ impl Builder {
         Ok(())
     }
 
+    fn input(&mut self, parser: &mut Parser) -> Result<(), Diagnostic> {
+        let (ty, at) = parser.name()?;
+        if !matches!(ty.as_str(), "float" | "angle") {
+            return Err(Diagnostic::error(format!(
+                "`input {ty}` is not supported, only float and angle inputs"
+            ))
+            .primary(at, "here"));
+        }
+        if parser.symbol("[") {
+            parser.at += 1;
+            parser.expr()?;
+            parser.expect("]")?;
+        }
+        let (name, span) = parser.name()?;
+        parser.expect(";")?;
+        if self.env.contains_key(&name) || self.registers.contains_key(&name) {
+            return Err(Diagnostic::error(format!("`{name}` is already declared"))
+                .primary(span, "declared again here"));
+        }
+        let value = match self.bindings.get(&name) {
+            Some(&value) => value,
+            None if self.collecting => 0.0,
+            None => {
+                return Err(Diagnostic::error(format!(
+                    "input `{name}` has no value, give it one with --bind {name}=<value>"
+                ))
+                .primary(span, "declared here"));
+            }
+        };
+        self.inputs.push(name.clone());
+        self.env.insert(name, value);
+        Ok(())
+    }
+
     fn body(&mut self, parser: &mut Parser, depth: usize) -> Result<(), Diagnostic> {
         if parser.symbol("{") {
             parser.at += 1;
@@ -1114,12 +1169,13 @@ impl Builder {
                 );
             }
             "const" | "int" | "uint" | "float" | "angle" => self.constant(parser, &word)?,
+            "input" => self.input(parser)?,
             "for" => self.repeat_for(parser, depth)?,
             "while" => self.repeat_while(parser, depth)?,
-            "bool" | "complex" | "output" | "input" | "def" | "let" | "duration" | "stretch"
-            | "delay" | "box" | "break" | "continue" | "return" => {
+            "bool" | "complex" | "output" | "def" | "let" | "duration" | "stretch" | "delay"
+            | "box" | "break" | "continue" | "return" => {
                 return Err(Diagnostic::error(format!(
-                    "`{word}` is not supported yet: qirc reads OpenQASM gates, registers, measurements, resets, constants, `if`, `for` and `while`"
+                    "`{word}` is not supported yet: qirc reads OpenQASM gates, registers, measurements, resets, constants, inputs, `if`, `for` and `while`"
                 ))
                 .primary(span, "unsupported here"));
             }
@@ -1214,6 +1270,34 @@ pub fn is_qasm(source: &str) -> bool {
 }
 
 pub fn lower(source: &str) -> (Program, Vec<Diagnostic>) {
+    lower_with(source, &HashMap::new())
+}
+
+pub fn lower_with(source: &str, bindings: &HashMap<String, f64>) -> (Program, Vec<Diagnostic>) {
+    let (program, mut errors, inputs) = build(source, bindings, false);
+    if errors.is_empty() {
+        let mut unknown: Vec<&String> = bindings
+            .keys()
+            .filter(|name| !inputs.contains(name))
+            .collect();
+        unknown.sort();
+        errors.extend(unknown.into_iter().map(|name| {
+            Diagnostic::error(format!("the program has no input named `{name}` to bind"))
+                .with_code("QIR0100")
+        }));
+    }
+    (program, errors)
+}
+
+pub fn inputs(source: &str) -> Vec<String> {
+    build(source, &HashMap::new(), true).2
+}
+
+fn build(
+    source: &str,
+    bindings: &HashMap<String, f64>,
+    collecting: bool,
+) -> (Program, Vec<Diagnostic>, Vec<String>) {
     let mut builder = Builder {
         program: Program::new("main", Profile::Base),
         current: 0,
@@ -1226,6 +1310,9 @@ pub fn lower(source: &str) -> (Program, Vec<Diagnostic>) {
         branches: 0,
         emitted: 0,
         env: HashMap::new(),
+        bindings: bindings.clone(),
+        inputs: Vec::new(),
+        collecting,
     };
     builder.block("entry".into());
     let prelude = lex(PRELUDE).unwrap();
@@ -1261,7 +1348,7 @@ pub fn lower(source: &str) -> (Program, Vec<Diagnostic>) {
         });
         empty.num_qubits = builder.qubits as u32;
         empty.num_results = builder.bits as u32;
-        return (empty, vec![error.with_code("QIR0100")]);
+        return (empty, vec![error.with_code("QIR0100")], builder.inputs);
     }
 
     let end = builder.current;
@@ -1293,5 +1380,5 @@ pub fn lower(source: &str) -> (Program, Vec<Diagnostic>) {
     if builder.adaptive {
         builder.program.profile = Profile::Adaptive;
     }
-    (builder.program, Vec::new())
+    (builder.program, Vec::new(), builder.inputs)
 }

@@ -672,18 +672,48 @@ mod tests {
     use crate::qasm;
     use crate::simulator::state::Rng;
 
-    const GATES: [&str; 9] = ["h", "s", "sdg", "t", "tdg", "x", "cx", "cz", "rz(0.3)"];
+    const GATES: [&str; 16] = [
+        "h", "s", "sdg", "t", "tdg", "x", "y", "sx", "rz(0.3)", "rx(0.7)", "ry(0.4)", "t", "cx",
+        "cz", "swap", "cx",
+    ];
+    const ANGLES: [&str; 4] = ["t", "tdg", "rz(0.3)", "rz(-1.1)"];
+
+    fn header(qubits: usize) -> String {
+        format!("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{qubits}];\n")
+    }
 
     fn random(rng: &mut Rng, qubits: usize, length: usize) -> String {
-        let mut text = format!("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{qubits}];\n");
+        let mut text = header(qubits);
         for _ in 0..length {
             let gate = GATES[rng.next_u64() as usize % GATES.len()];
             let a = rng.next_u64() as usize % qubits;
-            if gate.starts_with('c') {
+            if matches!(gate, "cx" | "cz" | "swap") {
                 let b = (a + 1 + rng.next_u64() as usize % (qubits - 1)) % qubits;
                 text += &format!("{gate} q[{a}], q[{b}];\n");
             } else {
                 text += &format!("{gate} q[{a}];\n");
+            }
+        }
+        text
+    }
+
+    fn gadgets(rng: &mut Rng, qubits: usize, count: usize) -> String {
+        let mut text = header(qubits);
+        for _ in 0..count {
+            let parity: Vec<usize> = (0..qubits)
+                .filter(|_| rng.next_u64().is_multiple_of(2))
+                .collect();
+            let Some((&last, rest)) = parity.split_last() else {
+                continue;
+            };
+            let ladder: String = rest
+                .iter()
+                .map(|q| format!("cx q[{q}], q[{last}];\n"))
+                .collect();
+            let angle = ANGLES[rng.next_u64() as usize % ANGLES.len()];
+            text += &format!("{ladder}{angle} q[{last}];\n{ladder}");
+            if rng.next_u64().is_multiple_of(3) {
+                text += &format!("h q[{}];\n", rng.next_u64() as usize % qubits);
             }
         }
         text
@@ -706,9 +736,13 @@ mod tests {
     fn teleports() {
         let mut rng = Rng::new(3);
         let (mut folded_total, mut teleported_total) = (0, 0);
-        for round in 0..300 {
-            let qubits = 2 + round % 4;
-            let source = random(&mut rng, qubits, 10 + round % 50);
+        for round in 0..600 {
+            let qubits = 2 + round % 5;
+            let source = if round % 3 == 2 {
+                gadgets(&mut rng, qubits, 4 + round % 12)
+            } else {
+                random(&mut rng, qubits, 10 + round % 50)
+            };
             let (original, errors) = qasm::lower(&source);
             assert!(errors.is_empty(), "{errors:?}");
             let mut folded = original.clone();

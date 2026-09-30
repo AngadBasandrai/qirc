@@ -345,6 +345,20 @@ a.loc { color: inherit; text-decoration: underline dotted; cursor: pointer; }
 .zoom .ghost { font-family: var(--mono); min-width: 30px; }
 .canvas { display: flex; width: max-content; padding-right: 8px; }
 .canvas .labels { position: sticky; left: 0; z-index: 1; flex: none; background: var(--panel); }
+.circuit g.later { opacity: 0.28; }
+.circuit g.current .box, .circuit g.current .meter, .circuit g.current .plus { stroke-width: 2.6; }
+.stepper { position: sticky; left: 0; display: grid; gap: 8px; max-width: 560px; padding: 10px 12px 4px; border-top: 1px solid var(--line); }
+.stepper label { display: flex; align-items: center; gap: 10px; font: 500 12px var(--mono); color: var(--muted); }
+.stepper input[type="range"] { flex: 1; accent-color: var(--accent); }
+.stepper .caption { font: 12.5px var(--mono); }
+.spheres { display: flex; flex-wrap: wrap; gap: 4px 10px; }
+.spheres svg { width: 88px; height: 104px; }
+.sphere-rim { fill: none; stroke: var(--line); stroke-width: 1.2; }
+.sphere-axis { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 3; fill: none; }
+.sphere-arrow { stroke: var(--accent); stroke-width: 2.2; }
+.sphere-tip { fill: var(--accent); }
+.spheres text { font: 10.5px var(--mono); fill: var(--muted); }
+.stepper h3 { margin: 4px 0 0; font: 500 11px var(--sans); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
 .circuit .wire { stroke: var(--wire); stroke-width: 1; }
 .circuit .link { stroke: var(--accent); stroke-width: 1.5; }
 .circuit .box { fill: var(--panel); stroke: var(--accent); stroke-width: 1.2; }
@@ -411,6 +425,7 @@ footer a { color: var(--accent); }
         <button type="button" role="radio" data-emit="pulse">pulse</button>
         <button type="button" role="radio" data-emit="schedule">schedule</button>
         <button type="button" role="radio" data-emit="cost">cost</button>
+        <button type="button" role="radio" data-emit="resources">resources</button>
         <button type="button" role="radio" data-emit="diff">diff</button>
       </div>
     </div>
@@ -429,6 +444,14 @@ footer a { color: var(--accent); }
         <option value="rz-ry-cz">rz ry cz</option>
         <option value="h,s,t,cx">h s t cx (Clifford+T)</option>
         <option value="rx,ry,cy">rx ry cy</option>
+      </select>
+    </label>
+    <label class="field" for="epsilon">Precision
+      <select id="epsilon">
+        <option value="">exact only</option>
+        <option value="1e-2">1e-2</option>
+        <option value="1e-3">1e-3</option>
+        <option value="1e-4">1e-4</option>
       </select>
     </label>
     <label class="field" for="resynth">Resynthesis
@@ -476,6 +499,18 @@ footer a { color: var(--accent); }
         <option value="noisy">line5.cal, noisy</option>
         <option value="mitigate">noisy, mitigated</option>
         <option value="zne">noisy, zero noise</option>
+        <option value="detuned">detuned.cal, noisy</option>
+        <option value="decoupled">detuned, echo pulses</option>
+      </select>
+    </label>
+    <label class="field" for="bind" id="bind-field">Inputs
+      <input id="bind" type="text" spellcheck="false" autocomplete="off" placeholder="theta=0.3,phi=1.2">
+    </label>
+    <label class="field" for="vary" id="vary-field">Vary
+      <select id="vary">
+        <option value="">off</option>
+        <option value="gradient">gradient</option>
+        <option value="minimize">minimise</option>
       </select>
     </label>
     <label class="field" for="observable" id="observable-field">Observable
@@ -541,7 +576,7 @@ footer a { color: var(--accent); }
     </section>
   </div>
 
-  <footer>Reads Base Profile, Adaptive Profile, Q# and PyQIR output and OpenQASM 2 and 3. <code>diff</code> checks the compiled program against the original at <code>-O0</code>, branch by branch. The state vector is limited to 20 qubits here. Wider programs still run: Clifford programs on a stabilizer tableau up to 5,000 qubits, permutation and phase gates such as adders on a bit vector at any width, Clifford circuits with a few T gates as a sum of stabilizer states, and anything else as a matrix product state that reports any truncation. <code>line5.cal</code> is a five qubit device with gate, readout and T1 and T2 errors. Drop a <code>.ll</code> or <code>.qasm</code> file on the editor to open it. <a href="book/">Guide</a> and <a href="https://github.com/AngadBasandrai/qirc">source on GitHub</a>.</footer>
+  <footer>Reads Base Profile, Adaptive Profile, Q# and PyQIR output and OpenQASM 2 and 3. <code>diff</code> checks the compiled program against the original at <code>-O0</code>, branch by branch. The state vector is limited to 20 qubits here. Wider programs still run: Clifford programs on a stabilizer tableau up to 5,000 qubits, permutation and phase gates such as adders on a bit vector at any width, Clifford circuits with a few T gates as a sum of stabilizer states, circuits whose halves are joined by a few gates by circuit cutting, and anything else as a matrix product state that reports any truncation. <code>line5.cal</code> is a five qubit device with gate, readout and T1 and T2 errors, and <code>detuned.cal</code> adds 300 kHz of detuning to every qubit. Precision approximates rotations in a finite gate set, Inputs binds OpenQASM 3 <code>input</code> values, and Vary differentiates or minimises the observable over them. Drop a <code>.ll</code> or <code>.qasm</code> file on the editor to open it. <a href="book/">Guide</a> and <a href="https://github.com/AngadBasandrai/qirc">source on GitHub</a>.</footer>
 </div>
 
 <script type="text/plain" id="bell" data-example="Bell pair, Base Profile" data-file="bell.ll">
@@ -1326,6 +1361,108 @@ for uint k in {0, 1} swap q[k], q[n - 1 - k];
 c = measure q;
 </script>
 
+<script type="text/plain" id="gridsynth" data-example="Rotations as Clifford+T gates" data-file="rotations.qasm" data-settings='{"emit": "qasm3", "gates": "h,s,t,cx", "epsilon": "1e-3", "coupling": "", "device": ""}'>
+// A rotation by an angle that is not a multiple of pi / 4 has no exact form
+// in H, S and T. With a precision chosen, qirc approximates it, and the
+// T count grows as about 3 log2(1 / precision).
+OPENQASM 3.0;
+include "stdgates.inc";
+qubit[2] q;
+h q[0];
+rz(0.3) q[0];
+crz(0.45) q[0], q[1];
+</script>
+<script type="text/plain" id="resources" data-example="Fault tolerant resources" data-file="grover.qasm" data-settings='{"emit": "resources", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
+// Two rounds of Grover search for 111 on three qubits, with a phase kick.
+// The resource estimate counts T gates and rotations and sizes a surface
+// code and its magic state factories for the result.
+OPENQASM 3.0;
+include "stdgates.inc";
+qubit[4] q;
+h q[0];
+h q[1];
+h q[2];
+for int round in [0:1] {
+  h q[2];
+  ccx q[0], q[1], q[2];
+  h q[2];
+  h q[0];
+  h q[1];
+  h q[2];
+  x q[0];
+  x q[1];
+  x q[2];
+  h q[2];
+  ccx q[0], q[1], q[2];
+  h q[2];
+  x q[0];
+  x q[1];
+  x q[2];
+  h q[0];
+  h q[1];
+  h q[2];
+}
+rz(0.3) q[3];
+cx q[0], q[3];
+</script>
+<script type="text/plain" id="vqe" data-example="Variational ground state" data-file="ansatz.qasm" data-settings='{"emit": "run", "observable": "Z0 Z1 + 0.5 X0 + 0.5 X1", "vary": "minimize", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
+// Each input is a parameter of the circuit. Vary: minimise runs gradient
+// descent on the observable; the ground energy of this one is -sqrt(2).
+OPENQASM 3.0;
+include "stdgates.inc";
+input float theta;
+input float phi;
+qubit[2] q;
+ry(theta) q[0];
+ry(phi) q[1];
+cx q[0], q[1];
+</script>
+<script type="text/plain" id="echo" data-example="Echo pulses on a detuned device" data-file="idle.qasm" data-settings='{"emit": "run", "device": "decoupled", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": ""}'>
+// Qubit 0 waits through three CNOTs while its frequency is off by 300 kHz.
+// Switch Device between "detuned" and "echo pulses" to see the phase undone.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[4];
+creg c[1];
+h q[0];
+cx q[1], q[2];
+cx q[2], q[3];
+cx q[1], q[2];
+cz q[1], q[0];
+h q[0];
+measure q[0] -> c[0];
+</script>
+<script type="text/plain" id="cutting" data-example="40 qubits by circuit cutting" data-file="halves.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
+// Two 20 qubit blocks joined by two CNOTs. Neither fits a 20 qubit state
+// vector together, but each half does, so qirc cuts the two CNOTs and
+// recombines the halves into the exact distribution of the measured bits.
+OPENQASM 3.0;
+include "stdgates.inc";
+qubit[40] q;
+bit[6] c;
+for int layer in [0:1] {
+  for int i in [0:39] {
+    ry(0.3 + 0.07 * i + 0.5 * layer) q[i];
+  }
+  for int i in [0:18] {
+    cx q[i], q[i + 1];
+  }
+  for int i in [20:38] {
+    cx q[i], q[i + 1];
+  }
+}
+cx q[19], q[20];
+for int i in [0:39] {
+  ry(0.2 * i) q[i];
+}
+cx q[39], q[0];
+c[0] = measure q[0];
+c[1] = measure q[7];
+c[2] = measure q[19];
+c[3] = measure q[20];
+c[4] = measure q[33];
+c[5] = measure q[39];
+</script>
 <script type="text/plain" id="pyqir" data-example="Circuit from PyQIR" data-file="pyqir.ll">
 ; ModuleID = 'bell'
 source_filename = "bell"
@@ -1410,11 +1547,12 @@ onmessage = async (event) => {
 };
 `;
 
-const EMITS = ["run", "circuit", "qasm3", "qir", "ir", "json", "qasm2", "stim", "quantikz", "svg", "pulse", "schedule", "cost", "diff"];
-const CONTROLS = ["opt", "gates", "resynth", "cost", "coupling", "relabel", "reuse", "device", "observable", "shots", "seed"];
-const EXTENSIONS = { qasm3: "qasm", qasm2: "qasm", stim: "stim", qir: "ll", json: "json", ir: "txt", circuit: "txt", quantikz: "tex", svg: "svg", pulse: "qasm", schedule: "txt", cost: "txt", run: "txt", diff: "txt" };
+const EMITS = ["run", "circuit", "qasm3", "qir", "ir", "json", "qasm2", "stim", "quantikz", "svg", "pulse", "schedule", "cost", "resources", "diff"];
+const CONTROLS = ["opt", "gates", "epsilon", "resynth", "cost", "coupling", "relabel", "reuse", "device", "bind", "vary", "observable", "shots", "seed"];
+const EXTENSIONS = { qasm3: "qasm", qasm2: "qasm", stim: "stim", qir: "ll", json: "json", ir: "txt", circuit: "txt", quantikz: "tex", svg: "svg", pulse: "qasm", schedule: "txt", cost: "txt", resources: "txt", run: "txt", diff: "txt" };
 const MAX_HIGHLIGHT = 400000;
 const MAX_DRAWN = 4000;
+const MAX_STEPPED = 12;
 
 const $ = (id) => document.getElementById(id);
 const editor = $("editor");
@@ -1455,6 +1593,7 @@ let paint = 0;
 let marks = new Map();
 let last = null;
 let zoom = 1;
+let stepping = null;
 
 function escape(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -1604,19 +1743,26 @@ function commandFromControls() {
   parts.push(current.file, "-O" + $("opt").value);
   if (emit !== "run" && emit !== "diff") parts.push("--emit", emit);
   if ($("gates").value) parts.push("--gates", $("gates").value);
+  if ($("gates").value && $("epsilon").value) parts.push("--epsilon", $("epsilon").value);
   if ($("resynth").value) parts.push("--resynth", $("resynth").value);
   if ($("cost").value !== "gates") parts.push("--cost", $("cost").value);
   if ($("coupling").value) parts.push("--coupling", $("coupling").value);
   if ($("relabel").value) parts.push("--relabel");
   if ($("reuse").value) parts.push("--reuse");
   const device = $("device").value;
-  if (device) parts.push("--calibration", "line5.cal");
+  const detuned = device === "detuned" || device === "decoupled";
+  if (device) parts.push("--calibration", detuned ? "detuned.cal" : "line5.cal");
   if (device && device !== "cal") parts.push("--noisy");
   if (device === "mitigate") parts.push("--mitigate");
+  if (device === "decoupled") parts.push("--dd");
+  const bind = $("bind").value.replace(/\s+/g, "");
+  if (bind) parts.push("--bind", bind);
   const observable = $("observable").value.trim();
   if (emit === "run" && observable) {
     parts.push("--observable", observable.replace(/\s+/g, "*"));
     if (device === "zne") parts.push("--zne");
+    if ($("vary").value === "gradient") parts.push("--gradient");
+    if ($("vary").value === "minimize") parts.push("--minimize");
   }
   if (emit === "run") parts.push("--shots", $("shots").value || "0", "--seed", $("seed").value || "0");
   return parts.join(" ");
@@ -1629,6 +1775,7 @@ function showEmit() {
   $("shots-field").hidden = emit !== "run";
   $("seed-field").hidden = emit !== "run";
   $("observable-field").hidden = emit !== "run";
+  $("vary-field").hidden = emit !== "run";
 }
 
 function showView() {
@@ -1798,8 +1945,10 @@ function show(reply, tokens) {
   const compiled = parse(compiledJob);
   const source = parse(sourceJob);
   showStats(source, compiled);
+  stepping = null;
   $("view-circuit").innerHTML = compiled ? drawCircuit(compiled) : `<p class="empty">The circuit appears here once the program compiles.</p>`;
   showZoom();
+  if (stepping) showStep(stepping.ops.length);
   $("view-results").innerHTML = drawResults(tokens[0] === "diff" ? "" : result.stdout);
 }
 
@@ -1888,6 +2037,7 @@ function drawCircuit(program) {
         truncated = true;
         break;
       }
+      const step = drawn;
       drawn++;
       const lo = Math.min(...wires);
       const hi = Math.max(...wires);
@@ -1895,7 +2045,7 @@ function drawCircuit(program) {
       for (let q = lo; q <= hi; q++) column = Math.max(column, frontier[q]);
       for (let q = lo; q <= hi; q++) frontier[q] = column + 1;
       columns[column] = columns[column] || [];
-      columns[column].push(op);
+      columns[column].push({ op, step });
     }
     if (program.blocks.length > 1) {
       if (index > 0) separators.push(x - GAP / 2);
@@ -1903,13 +2053,13 @@ function drawCircuit(program) {
     }
     for (const ops of columns) {
       let width = 26;
-      for (const op of ops) {
+      for (const { op } of ops) {
         if (op.op === "gate" && !(isTarget(op) || op.name === "swap")) width = Math.max(width, textWidth(gateLabel(op)));
         if (op.op === "reset") width = Math.max(width, textWidth("|0⟩"));
         if (op.op === "measure") width = Math.max(width, textWidth(`M→r${op.result}`));
       }
       const cx = x + width / 2;
-      for (const op of ops) parts.push(drawOp(op, cx, width, y));
+      for (const { op, step } of ops) parts.push(drawOp(op, cx, width, y, step));
       x += width + GAP;
     }
     if (program.blocks.length > 1) {
@@ -1928,17 +2078,24 @@ function drawCircuit(program) {
   }
   const lines = separators.map((sx) => `<line class="sep" x1="${sx}" x2="${sx}" y1="20" y2="${TOP + n * ROW}"/>`);
   const note = truncated ? `<p class="empty">Showing the first ${MAX_DRAWN} operations.</p>` : "";
+  const ops = program.blocks[0].ops.filter((op) => ["gate", "measure", "reset"].includes(op.op));
+  stepping = program.blocks.length === 1 && n <= MAX_STEPPED && !truncated && ops.every(steppable) ? { ops, n } : null;
+  const stepper = stepping
+    ? `<div class="stepper"><label>step <input type="range" id="step" min="0" max="${ops.length}" value="${ops.length}" aria-label="Step through the circuit"></label>` +
+      `<div class="caption" id="step-caption"></div><div id="step-state"></div></div>`
+    : "";
   const tools =
     `<div class="zoom" role="toolbar" aria-label="Zoom">` +
     `<button type="button" class="ghost" data-zoom="out" aria-label="Zoom out">−</button>` +
     `<span id="zoom-level"></span>` +
     `<button type="button" class="ghost" data-zoom="in" aria-label="Zoom in">+</button>` +
     `<button type="button" class="ghost" data-zoom="fit">Fit</button>` +
-    `<button type="button" class="ghost" data-zoom="reset">1:1</button></div>`;
+    `<button type="button" class="ghost" data-zoom="reset">1:1</button>` +
+    `<button type="button" class="ghost" data-zoom="png">PNG</button></div>`;
   return (
     tools +
     `<div class="canvas"><svg class="labels" data-width="${side}" data-height="${height}" viewBox="0 0 ${side} ${height}" aria-hidden="true">${labels.join("")}</svg>` +
-    `<svg class="drawing" data-width="${width - side}" data-height="${height}" viewBox="${side} 0 ${width - side} ${height}" role="img" aria-label="Circuit diagram">${wires.join("")}${lines.join("")}${parts.join("")}</svg></div>${note}`
+    `<svg class="drawing" data-width="${width - side}" data-height="${height}" viewBox="${side} 0 ${width - side} ${height}" role="img" aria-label="Circuit diagram">${wires.join("")}${lines.join("")}${parts.join("")}</svg></div>${stepper}${note}`
   );
 }
 
@@ -1961,6 +2118,193 @@ function fit() {
   return Math.min(1, (box.clientWidth - 16) / width, (box.clientHeight - bar - 16) / height);
 }
 
+function unit(angle) {
+  return [Math.cos(angle), Math.sin(angle)];
+}
+
+function gateMatrix(op) {
+  const theta = op.params[0];
+  const c = Math.cos(theta / 2);
+  const s = Math.sin(theta / 2);
+  const half = Math.SQRT1_2;
+  switch (op.name) {
+    case "i": return [[1, 0], [0, 0], [0, 0], [1, 0]];
+    case "x": return [[0, 0], [1, 0], [1, 0], [0, 0]];
+    case "y": return [[0, 0], [0, -1], [0, 1], [0, 0]];
+    case "z": return [[1, 0], [0, 0], [0, 0], [-1, 0]];
+    case "h": return [[half, 0], [half, 0], [half, 0], [-half, 0]];
+    case "s": return [[1, 0], [0, 0], [0, 0], [0, 1]];
+    case "sdg": return [[1, 0], [0, 0], [0, 0], [0, -1]];
+    case "t": return [[1, 0], [0, 0], [0, 0], unit(Math.PI / 4)];
+    case "tdg": return [[1, 0], [0, 0], [0, 0], unit(-Math.PI / 4)];
+    case "sx": return [[0.5, 0.5], [0.5, -0.5], [0.5, -0.5], [0.5, 0.5]];
+    case "sxdg": return [[0.5, -0.5], [0.5, 0.5], [0.5, 0.5], [0.5, -0.5]];
+    case "rx": return [[c, 0], [0, -s], [0, -s], [c, 0]];
+    case "ry": return [[c, 0], [-s, 0], [s, 0], [c, 0]];
+    case "rz": return [unit(-theta / 2), [0, 0], [0, 0], unit(theta / 2)];
+    case "r1": return [[1, 0], [0, 0], [0, 0], unit(theta)];
+    case "unitary": return op.matrix ? [0, 2, 4, 6].map((i) => [op.matrix[i], op.matrix[i + 1]]) : null;
+    default: return null;
+  }
+}
+
+function steppable(op) {
+  if (op.op !== "gate") return true;
+  if (op.params.some((p) => p === null)) return false;
+  return op.name === "swap" || gateMatrix(op) !== null;
+}
+
+function evolve(ops, n) {
+  const re = new Float64Array(1 << n);
+  const im = new Float64Array(1 << n);
+  re[0] = 1;
+  for (const op of ops) {
+    if (op.op !== "gate") continue;
+    const mask = op.controls.reduce((m, q) => m | (1 << q), 0);
+    if (op.name === "swap") {
+      const [a, b] = op.targets;
+      for (let i = 0; i < re.length; i++) {
+        if ((i & mask) !== mask || !(i & (1 << a)) || i & (1 << b)) continue;
+        const j = (i & ~(1 << a)) | (1 << b);
+        [re[i], re[j]] = [re[j], re[i]];
+        [im[i], im[j]] = [im[j], im[i]];
+      }
+      continue;
+    }
+    const [[ar, ai], [br, bi], [cr, ci], [dr, di]] = gateMatrix(op);
+    for (const target of op.targets) {
+      const bit = 1 << target;
+      for (let i = 0; i < re.length; i++) {
+        if (i & bit || (i & mask) !== mask) continue;
+        const j = i | bit;
+        const [xr, xi, yr, yi] = [re[i], im[i], re[j], im[j]];
+        re[i] = ar * xr - ai * xi + br * yr - bi * yi;
+        im[i] = ar * xi + ai * xr + br * yi + bi * yr;
+        re[j] = cr * xr - ci * xi + dr * yr - di * yi;
+        im[j] = cr * xi + ci * xr + dr * yi + di * yr;
+      }
+    }
+  }
+  return { re, im };
+}
+
+function showStep(step) {
+  if (!stepping) return;
+  const { ops, n } = stepping;
+  for (const g of $("view-circuit").querySelectorAll("g[data-step]")) {
+    const at = Number(g.dataset.step);
+    g.classList.toggle("later", at >= step);
+    g.classList.toggle("current", at === step - 1);
+  }
+  const done = ops.slice(0, step);
+  const last = done[done.length - 1];
+  const measured = done.some((op) => op.op !== "gate");
+  $("step-caption").textContent =
+    (step === 0 ? `${step} of ${ops.length}: every qubit starts in |0⟩` : `${step} of ${ops.length}: after ${describe(last)}`) +
+    (measured ? ", shown before any measurement or reset collapses the state" : "");
+  const { re, im } = evolve(done, n);
+  const probability = Array.from(re, (r, i) => r * r + im[i] * im[i]);
+  const ones = Array.from({ length: n }, (_, q) => probability.reduce((sum, p, i) => (i & (1 << q) ? sum + p : sum), 0));
+  const top = probability
+    .map((p, i) => ({ p, i }))
+    .filter(({ p }) => p > 1e-9)
+    .sort((a, b) => b.p - a.p)
+    .slice(0, 6);
+  const row = (label, share) =>
+    `<span>${label}</span><div class="bar" style="width:${(share * 100).toFixed(1)}%"></div><span class="value">${(share * 100).toFixed(1)}%</span>`;
+  const spheres = Array.from({ length: n }, (_, q) => sphere(q, bloch(re, im, q))).join("");
+  $("step-state").innerHTML =
+    `<h3>Bloch vector of each qubit</h3><div class="spheres">${spheres}</div>` +
+    `<h3>chance each qubit reads 1</h3><div class="bars">${ones.map((p, q) => row("q" + q, p)).join("")}</div>` +
+    `<h3>most likely states</h3><div class="bars">${top.map(({ p, i }) => row("|" + i.toString(2).padStart(n, "0") + "⟩", p)).join("")}</div>`;
+}
+
+function bloch(re, im, q) {
+  const bit = 1 << q;
+  let x = 0;
+  let y = 0;
+  let z = 0;
+  for (let i = 0; i < re.length; i++) {
+    if (i & bit) continue;
+    const j = i | bit;
+    z += re[i] * re[i] + im[i] * im[i] - re[j] * re[j] - im[j] * im[j];
+    x += 2 * (re[i] * re[j] + im[i] * im[j]);
+    y -= 2 * (im[i] * re[j] - re[i] * im[j]);
+  }
+  return { x, y, z };
+}
+
+function sphere(q, { x, y, z }) {
+  const r = 32;
+  const c = 44;
+  const tipX = c + r * (0.94 * y - 0.42 * x);
+  const tipY = c - r * (0.94 * z - 0.3 * x);
+  const length = Math.sqrt(x * x + y * y + z * z);
+  const f = (v) => v.toFixed(2);
+  return (
+    `<svg viewBox="0 0 88 104" role="img" aria-label="q${q}: x ${f(x)}, y ${f(y)}, z ${f(z)}">` +
+    `<circle class="sphere-rim" cx="${c}" cy="${c}" r="${r}"/>` +
+    `<ellipse class="sphere-axis" cx="${c}" cy="${c}" rx="${r}" ry="${r * 0.3}"/>` +
+    `<line class="sphere-axis" x1="${c}" y1="${c - r}" x2="${c}" y2="${c + r}"/>` +
+    `<line class="sphere-arrow" x1="${c}" y1="${c}" x2="${f(tipX)}" y2="${f(tipY)}"/>` +
+    `<circle class="sphere-tip" cx="${f(tipX)}" cy="${f(tipY)}" r="3.2"/>` +
+    `<text x="${c}" y="${c + r + 16}" text-anchor="middle">q${q} ${length > 0.995 ? "pure" : "|r| " + f(length)}</text>` +
+    `</svg>`
+  );
+}
+
+function circuitStyle() {
+  const root = getComputedStyle(document.documentElement);
+  const rules = [];
+  for (const sheet of document.styleSheets) {
+    let list;
+    try {
+      list = sheet.cssRules;
+    } catch (error) {
+      continue;
+    }
+    for (const rule of list) {
+      const selector = rule.selectorText || "";
+      if (selector.startsWith(".circuit ") && !/later|current|svg$/.test(selector)) {
+        rules.push(rule.cssText.replace(/\.circuit /g, "").replace(/var\((--[\w-]+)\)/g, (_, name) => root.getPropertyValue(name).trim()));
+      }
+    }
+  }
+  return rules.join("\n");
+}
+
+function exportPng() {
+  const labels = $("view-circuit").querySelector("svg.labels");
+  const drawing = $("view-circuit").querySelector("svg.drawing");
+  if (!labels || !drawing) return;
+  const width = Number(labels.dataset.width) + Number(drawing.dataset.width);
+  const height = Number(drawing.dataset.height);
+  const scale = Math.min(2, 16000 / width, 16000 / height);
+  const background = getComputedStyle(document.documentElement).getPropertyValue("--panel").trim();
+  const text =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width * scale}" height="${height * scale}" viewBox="0 0 ${width} ${height}">` +
+    `<style>${circuitStyle()}</style><rect width="${width}" height="${height}" fill="${background}"/>` +
+    labels.innerHTML +
+    drawing.innerHTML +
+    `</svg>`;
+  const image = new Image();
+  image.onload = () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.ceil(width * scale);
+    canvas.height = Math.ceil(height * scale);
+    canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+    URL.revokeObjectURL(image.src);
+    canvas.toBlob((blob) => {
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = current.file.replace(/\.(ll|qasm)$/, "") + ".png";
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    });
+  };
+  image.src = URL.createObjectURL(new Blob([text], { type: "image/svg+xml" }));
+}
+
 function describe(op) {
   if (op.op === "measure") return `measure q${op.qubit} → r${op.result}`;
   if (op.op === "reset") return `reset q${op.qubit}`;
@@ -1972,8 +2316,8 @@ function isTarget(op) {
   return op.controls.length > 0 && (op.name === "x" || op.name === "z");
 }
 
-function drawOp(op, cx, width, y) {
-  const out = [`<g><title>${escape(describe(op))}</title>`];
+function drawOp(op, cx, width, y, step) {
+  const out = [`<g data-step="${step}"><title>${escape(describe(op))}</title>`];
   const box = (q, label, cls = "box") => {
     const w = Math.max(26, Math.min(width, 12 + label.length * 6.9));
     out.push(`<rect class="${cls}" x="${cx - w / 2}" y="${y(q) - 12}" width="${w}" height="24" rx="4"/>`);
@@ -2127,7 +2471,7 @@ async function start() {
 exampleSelect.addEventListener("change", () => {
   const example = examples.find((e) => e.id === exampleSelect.value);
   load(example);
-  for (const [id, value] of Object.entries({ device: "", observable: "", ...example.settings })) {
+  for (const [id, value] of Object.entries({ device: "", observable: "", epsilon: "", bind: "", vary: "", ...example.settings })) {
     if (id === "emit") {
       emit = value;
       showEmit();
@@ -2137,10 +2481,17 @@ exampleSelect.addEventListener("change", () => {
   }
   sync();
 });
+$("view-circuit").addEventListener("input", (event) => {
+  if (event.target.id === "step") showStep(Number(event.target.value));
+});
 $("view-circuit").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-zoom]");
   if (!button) return;
   const kind = button.dataset.zoom;
+  if (kind === "png") {
+    exportPng();
+    return;
+  }
   const next = kind === "fit" ? fit() : kind === "reset" ? 1 : zoom * (kind === "in" ? 1.25 : 0.8);
   zoom = Math.min(4, Math.max(0.05, next));
   showZoom();

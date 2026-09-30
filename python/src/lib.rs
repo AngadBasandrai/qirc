@@ -14,7 +14,7 @@ use pyo3::types::{PyDict, PyList};
 
 create_exception!(qirc, CompileError, PyException);
 
-const FLAGS: [(&str, &str); 10] = [
+const FLAGS: [(&str, &str); 14] = [
     ("opt", "-O"),
     ("gates", "--gates"),
     ("exclude", "--exclude"),
@@ -25,6 +25,10 @@ const FLAGS: [(&str, &str); 10] = [
     ("calibration", "--calibration"),
     ("reuse", "--reuse"),
     ("noisy", "--noisy"),
+    ("epsilon", "--epsilon"),
+    ("budget", "--budget"),
+    ("dd", "--dd"),
+    ("bind", "--bind"),
 ];
 
 fn flags(options: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<String>> {
@@ -39,7 +43,7 @@ fn flags(options: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<String>> {
         }
         let Some(&(_, flag)) = FLAGS.iter().find(|(name, _)| *name == key) else {
             return Err(PyTypeError::new_err(format!(
-                "unexpected keyword argument `{key}`, expected one of name, opt, gates, exclude, resynth, cost, coupling, relabel, calibration, reuse or noisy"
+                "unexpected keyword argument `{key}`, expected one of name, opt, gates, exclude, resynth, cost, coupling, relabel, calibration, reuse, noisy, epsilon, budget, dd or bind"
             )));
         };
         if value.is_none() {
@@ -49,6 +53,15 @@ fn flags(options: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<String>> {
             if on {
                 args.push(flag.to_string());
             }
+            continue;
+        }
+        if let Ok(bound) = value.cast::<PyDict>() {
+            let pairs = bound
+                .iter()
+                .map(|(name, number)| Ok(format!("{}={}", name.str()?, number.extract::<f64>()?)))
+                .collect::<PyResult<Vec<String>>>()?;
+            args.push(flag.to_string());
+            args.push(pairs.join(","));
             continue;
         }
         let value = value.str()?.to_string();
@@ -227,10 +240,11 @@ fn expectation(
     let program = compilation.program;
     py.detach(|| match (&options.calibration, zne, options.noisy) {
         (Some(c), true, _) => {
-            observable::extrapolate(&program, &observable, c, shots, seed).map(|(_, zero)| zero)
+            observable::extrapolate(&program, &observable, c, shots, seed)
+                .map(|(_, (zero, _))| zero.clamp(-observable.bound(), observable.bound()))
         }
         (Some(c), false, true) => {
-            observable::noisy_expectation(&program, &observable, c, shots, seed)
+            observable::noisy_expectation(&program, &observable, c, shots, seed).map(|(value, _)| value)
         }
         _ => observable::expectation(&program, &observable),
     })

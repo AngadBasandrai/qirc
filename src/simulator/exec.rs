@@ -8,8 +8,12 @@ use super::rank::{self, Rank};
 use super::simd;
 use super::state::{self, Rng, Sampler, State};
 use super::tableau::{self, Tableau};
-use crate::calibration::{Calibration, Clock};
+use crate::calibration::{Calibration, Clock, Idle};
+use crate::cut::{self, Recorder};
+use crate::diag::Span;
 use crate::ir::*;
+use crate::progress::{self, Progress};
+use crate::route::remap;
 use crate::transpile::{self, GateSet};
 
 const STABILIZER_ABOVE: usize = 20;
@@ -294,6 +298,32 @@ fn local(program: &Program) -> Option<Program> {
     supported.then_some(lowered)
 }
 
+fn arranged(program: &Program) -> Option<Program> {
+    let mut lowered = local(program)?;
+    if let Some(position) = mps::arrangement(&lowered) {
+        for block in &mut lowered.blocks {
+            block.ops = block
+                .ops
+                .drain(..)
+                .map(|op| remap(op, |q| position[q.index()]))
+                .collect();
+        }
+    }
+    Some(lowered)
+}
+
+fn cuttable(program: &Program) -> Option<(Program, Vec<QubitId>)> {
+    if !wide(program) || needs_per_shot(program) {
+        return None;
+    }
+    let lowered = local(program)?;
+    let measured: Vec<QubitId> = measurement_plan(&lowered)
+        .into_iter()
+        .map(|(q, _)| q)
+        .collect();
+    cut::samples(&lowered, &measured).then_some((lowered, measured))
+}
+
 pub fn scalable(program: &Program) -> bool {
     classical(program) || stabilizer(program) || wide(program) && local(program).is_some()
 }
@@ -314,6 +344,8 @@ pub fn kernel(program: &Program) -> &'static str {
         "stabilizer tableau"
     } else if ranked(program).is_some() {
         "stabilizer rank"
+    } else if cuttable(program).is_some() {
+        "circuit cutting"
     } else if wide(program) {
         "matrix product state"
     } else {
@@ -349,6 +381,7 @@ pub struct ExecOutcome {
     pub outputs: Vec<String>,
     pub sampled: bool,
     pub discarded: f64,
+    pub stopped: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -401,7 +434,7 @@ pub fn needs_per_shot(program: &Program) -> bool {
 }
 
 pub fn execute_bonded(program: &Program, config: ExecConfig, bond: usize) -> Option<ExecOutcome> {
-    let lowered = local(program)?;
+    let lowered = arranged(program)?;
     let fresh = || Mps::new(lowered.num_qubits as usize, bond);
     let (mut outcome, state) = if needs_per_shot(&lowered) {
         shots(&lowered, config, None, fresh, Mps::measure, &mut |_| {})
@@ -419,6 +452,10 @@ pub fn execute(program: &Program, config: ExecConfig) -> ExecOutcome {
         let width = lowered.num_qubits as usize;
         let rank = Rank::new(width, config.shots as usize, config.seed);
         return execute_sampled(&lowered, config, rank).0;
+    }
+    if let Some((lowered, measured)) = cuttable(program) {
+        let width = lowered.num_qubits as usize;
+        return execute_sampled(&lowered, config, Recorder::new(width, &measured)).0;
     }
     if wide(program)
         && let Some(outcome) = execute_bonded(program, config, mps::DEFAULT_BOND)
@@ -554,11 +591,18 @@ fn execute_sampled<S: Sample>(
         .collect();
     let mut counts = BTreeMap::new();
     let mut returns = BTreeMap::new();
+    let mut stopped = None;
 
     if config.shots > 0 && !(plan.is_empty() && records.is_empty()) {
         let mut rng = Rng::new(config.seed);
         let sampler = state.sampler();
-        for _ in 0..config.shots {
+        let mut progress = Progress::new("samples", config.shots);
+        for shot in 0..config.shots {
+            if progress::stopped() {
+                stopped = Some(shot);
+                break;
+            }
+            progress.tick(shot);
             let mut results = vec![false; program.num_results as usize];
             state.sample(&sampler, &plan, &mut rng, &mut results);
             if !plan.is_empty() {
@@ -583,6 +627,7 @@ fn execute_sampled<S: Sample>(
         outputs,
         sampled: true,
         discarded: 0.0,
+        stopped,
     };
     (outcome, state)
 }
@@ -593,6 +638,7 @@ pub fn execute_noisy(
     calibration: &Calibration,
 ) -> ExecOutcome {
     let qubits = program.num_qubits as usize;
+    let tableau = stabilizer(program) && !calibration.coherent();
     if classical(program) {
         return shots(
             program,
@@ -604,7 +650,7 @@ pub fn execute_noisy(
         )
         .0;
     }
-    if stabilizer(program) {
+    if tableau {
         return shots(
             program,
             config,
@@ -615,8 +661,8 @@ pub fn execute_noisy(
         )
         .0;
     }
-    if wide(program)
-        && let Some(lowered) = local(program)
+    if (wide(program) || !tableau && qubits > state::MAX_QUBITS && !classical(program))
+        && let Some(lowered) = arranged(program)
     {
         let (mut outcome, state) = shots(
             &lowered,
@@ -656,47 +702,68 @@ pub fn average_noisy(
     config: ExecConfig,
     calibration: &Calibration,
     value: impl Fn(Snapshot) -> f64,
-) -> Option<f64> {
+) -> Option<(f64, f64)> {
     let qubits = program.num_qubits as usize;
     let noise = Some(calibration);
-    let mut total = 0.0;
+    let tableau = stabilizer(program) && !calibration.coherent();
+    let (mut total, mut squares) = (0.0, 0.0);
+    let finished: Option<u64>;
+    let mut record = |v: f64| {
+        total += v;
+        squares += v * v;
+    };
     if classical(program) {
-        let mut add = |s: &Bits| total += value(Snapshot::Bits(s));
-        shots(
+        let mut add = |s: &Bits| record(value(Snapshot::Bits(s)));
+        finished = shots(
             program,
             config,
             noise,
             || Bits::new(qubits),
             Bits::measure,
             &mut add,
-        );
-    } else if stabilizer(program) {
-        let mut add = |s: &Tableau| total += value(Snapshot::Tableau(s));
-        shots(
+        )
+        .0
+        .stopped;
+    } else if tableau {
+        let mut add = |s: &Tableau| record(value(Snapshot::Tableau(s)));
+        finished = shots(
             program,
             config,
             noise,
             || Tableau::new(qubits),
             Tableau::measure,
             &mut add,
-        );
-    } else if wide(program) {
+        )
+        .0
+        .stopped;
+    } else if qubits > state::MAX_QUBITS {
         let lowered = local(program)?;
         let fresh = || Mps::new(qubits, mps::DEFAULT_BOND);
-        let mut add = |s: &Mps| total += value(Snapshot::Chain(s));
-        shots(&lowered, config, noise, fresh, Mps::measure, &mut add);
+        let mut add = |s: &Mps| record(value(Snapshot::Chain(s)));
+        finished = shots(&lowered, config, noise, fresh, Mps::measure, &mut add)
+            .0
+            .stopped;
     } else {
-        let mut add = |s: &State| total += value(Snapshot::Vector(s));
-        shots(
+        let mut add = |s: &State| record(value(Snapshot::Vector(s)));
+        finished = shots(
             program,
             config,
             noise,
             || State::new(qubits),
             State::measure,
             &mut add,
-        );
+        )
+        .0
+        .stopped;
     }
-    Some(total / config.shots.max(1) as f64)
+    let n = finished.unwrap_or(config.shots.max(1)).max(1) as f64;
+    let mean = total / n;
+    let spread = if n > 1.0 {
+        ((squares - n * mean * mean).max(0.0) / (n - 1.0) / n).sqrt()
+    } else {
+        0.0
+    };
+    Some((mean, spread))
 }
 
 fn depolarize<S: Backend>(state: &mut S, gate: &Gate, calibration: &Calibration, rng: &mut Rng) {
@@ -710,6 +777,33 @@ fn depolarize<S: Backend>(state: &mut S, gate: &Gate, calibration: &Calibration,
         let pauli = choice >> (2 * i) & 3;
         state.pauli(q, pauli & 1 == 1, pauli & 2 == 2);
     }
+}
+
+fn single(kind: GateKind, qubit: usize) -> Gate {
+    Gate {
+        kind,
+        controls: Vec::new(),
+        targets: vec![QubitId(qubit as u32)],
+        params: Vec::new(),
+        span: Span::DUMMY,
+    }
+}
+
+fn drift<S: Backend>(state: &mut S, idle: &Idle, calibration: &Calibration, rng: &mut Rng) {
+    let rz = single(GateKind::Rz, idle.qubit);
+    if !idle.echo {
+        if idle.phase != 0.0 {
+            state.gate(&rz, &[idle.phase]);
+        }
+        return;
+    }
+    let pulse = single(GateKind::X, idle.qubit);
+    for share in [0.25, 0.5] {
+        state.gate(&rz, &[share * idle.phase]);
+        state.gate(&pulse, &[]);
+        depolarize(state, &pulse, calibration, rng);
+    }
+    state.gate(&rz, &[0.25 * idle.phase]);
 }
 
 fn shots<S: Backend>(
@@ -733,7 +827,14 @@ fn shots<S: Backend>(
         .ops()
         .any(|op| matches!(op, Op::RecordOutput { .. }));
 
+    let mut progress = Progress::new("shots", shots);
+    let mut stopped = None;
     for shot in 0..shots {
+        if progress::stopped() {
+            stopped = Some(shot);
+            break;
+        }
+        progress.tick(shot);
         let mut state = fresh();
         let mut clock = Clock::default();
         let run = run_with(
@@ -749,11 +850,13 @@ fn shots<S: Backend>(
                     return;
                 };
                 if !done {
-                    for (q, [x, y, z]) in clock.begin(calibration, op) {
+                    for idle in clock.begin(calibration, op) {
+                        let [x, y, z] = idle.paulis;
                         let draw = errors.next_unit();
                         if draw < x + y + z {
-                            state.pauli(q, draw < x + y, draw >= x);
+                            state.pauli(idle.qubit, draw < x + y, draw >= x);
                         }
+                        drift(state, &idle, calibration, &mut errors);
                     }
                     return;
                 }
@@ -793,6 +896,7 @@ fn shots<S: Backend>(
         outputs,
         sampled: false,
         discarded: 0.0,
+        stopped,
     };
     (outcome, last_state)
 }
@@ -1118,7 +1222,6 @@ mod tests {
     use std::f64::consts::FRAC_PI_2;
 
     use super::*;
-    use crate::diag::Span;
     use crate::qasm;
 
     fn random_circuit(qubits: usize, gates: usize, seed: u64) -> Program {
@@ -1196,7 +1299,11 @@ mod tests {
             .sum();
         assert!(distance < 2400, "{distance}");
         let truncated = execute_bonded(&random_circuit(8, 120, 3), config, 1).unwrap();
-        assert!(truncated.discarded > 0.01);
+        assert!(
+            truncated.discarded > 0.01 && truncated.discarded < 1.0,
+            "{}",
+            truncated.discarded
+        );
     }
 
     #[test]
@@ -1401,5 +1508,83 @@ cx q[4], q[1];
             .sum();
         assert!(bits.len() > 4);
         assert!(distance < 1600, "{distance}");
+    }
+    #[test]
+    fn decouples() {
+        let (program, errors) = qasm::lower(
+            "OPENQASM 2.0;
+include \"qelib1.inc\";
+qreg q[4];
+creg c[1];
+h q[0];
+cx q[1], q[2];
+cx q[2], q[3];
+cx q[1], q[2];
+cz q[1], q[0];
+h q[0];
+measure q[0] -> c[0];
+",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut calibration = Calibration::parse(
+            "cx 0 1 0
+cx 1 2 0
+cx 2 3 0
+time single 0 50
+time cx 0 1 300
+time cx 1 2 300
+time cx 2 3 300
+detuning 0 500
+",
+        )
+        .unwrap();
+        let config = ExecConfig {
+            shots: 400,
+            seed: 3,
+            keep_state: false,
+        };
+        let ones = |calibration: &Calibration| {
+            execute_noisy(&program, config, calibration)
+                .counts
+                .get("1")
+                .copied()
+                .unwrap_or(0)
+        };
+        let drifting = ones(&calibration);
+        let phase = calibration.drift(0, 850.0);
+        let expected = 400.0 * (phase / 2.0).sin().powi(2);
+        assert!(
+            (drifting as f64 - expected).abs() < 40.0,
+            "{drifting} {expected}"
+        );
+        calibration.decouple = true;
+        assert_eq!(ones(&calibration), 0);
+    }
+    #[test]
+    fn arranges_chains() {
+        let mut text =
+            "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[16];\ncreg c[2];\n".to_string();
+        for layer in 0..2 {
+            for q in 0..16 {
+                let angle = 0.37 * q as f64 + 1.3 * layer as f64;
+                text += &format!("ry({angle:.3}) q[{q}];\n");
+            }
+            for (a, b) in (0..15)
+                .map(|q| (q, q + 1))
+                .chain([0, 3, 6].map(|q| (q, 15 - q)))
+            {
+                text += &format!("cx q[{a}], q[{b}];\n");
+            }
+        }
+        text += "measure q[0] -> c[0];\nmeasure q[15] -> c[1];\n";
+        let (program, errors) = qasm::lower(&text);
+        assert!(errors.is_empty(), "{errors:?}");
+        let config = ExecConfig {
+            shots: 10,
+            seed: 1,
+            keep_state: false,
+        };
+        let outcome = execute_bonded(&program, config, 16).unwrap();
+        assert!(outcome.discarded < 1e-12, "{}", outcome.discarded);
     }
 }
