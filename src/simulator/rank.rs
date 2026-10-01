@@ -292,6 +292,7 @@ pub struct Rank {
     terms: Vec<(C64, Ch)>,
     samples: Vec<Vec<u64>>,
     rng: Rng,
+    qubits: usize,
 }
 
 impl Rank {
@@ -301,6 +302,7 @@ impl Rank {
             terms: vec![(C64::new(1.0, 0.0), Ch::new(qubits))],
             samples: vec![vec![0; words]; shots],
             rng: Rng::new(seed),
+            qubits,
         }
     }
 
@@ -355,6 +357,29 @@ impl Rank {
     }
 
     pub fn apply(&mut self, gate: &Gate, params: &[f64]) {
+        assert!(
+            matches!(
+                (
+                    gate.kind,
+                    gate.controls.len(),
+                    gate.targets.len(),
+                    params.len()
+                ),
+                (GateKind::X, 0 | 1, 1, 0) | (GateKind::SX, 0, 1, 0) | (GateKind::Rz, 0, 1, 1)
+            ),
+            "gate is not supported by the rank simulator"
+        );
+        let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
+        assert!(
+            wires.iter().all(|&q| q < self.qubits),
+            "gate qubit is outside the rank simulator"
+        );
+        for (i, &wire) in wires.iter().enumerate() {
+            assert!(
+                !wires[..i].contains(&wire),
+                "a gate cannot use the same qubit more than once"
+            );
+        }
         match (gate.kind, &gate.controls[..], &gate.targets[..]) {
             (GateKind::X, [], [q]) => self.pauli(q.index(), true, false),
             (GateKind::X, [c], [t]) => {
@@ -379,7 +404,7 @@ impl Rank {
                     self.rotate(q.index(), theta);
                 }
             }
-            _ => {}
+            _ => unreachable!("supported gate shape was checked above"),
         }
     }
 
@@ -508,5 +533,18 @@ mod tests {
                 assert!(difference < 1e-9, "{index}");
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "not supported")]
+    fn apply_rejects_unsupported_gate() {
+        let gate = Gate {
+            kind: GateKind::H,
+            controls: Vec::new(),
+            targets: vec![QubitId(0)],
+            params: Vec::new(),
+            span: Span::DUMMY,
+        };
+        Rank::new(1, 1, 1).apply(&gate, &[]);
     }
 }

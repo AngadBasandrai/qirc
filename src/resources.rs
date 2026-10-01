@@ -112,14 +112,30 @@ pub fn estimate(
     calibration: Option<&Calibration>,
     budget: f64,
 ) -> Result<Estimate, String> {
+    if !budget.is_finite() || budget <= 0.0 || budget >= 1.0 {
+        return Err(format!(
+            "the error budget must be finite, above 0 and below 1, not {budget}"
+        ));
+    }
     let (error, cycle) = calibration.map_or((None, None), Calibration::surface);
     let error = error.unwrap_or(DEFAULT_ERROR);
     let cycle = cycle.unwrap_or(DEFAULT_CYCLE);
+    if !error.is_finite() || error < 0.0 {
+        return Err(format!(
+            "the physical error rate must be finite and at least 0, not {error}"
+        ));
+    }
     if error >= THRESHOLD {
         return Err(format!(
             "a physical error rate of {error} is above the surface code threshold of {THRESHOLD}"
         ));
     }
+    if !cycle.is_finite() || cycle < 0.0 {
+        return Err(format!(
+            "the cycle time must be finite and at least 0, not {cycle}"
+        ));
+    }
+    let too_large = || "the resource estimate is too large to represent".to_string();
     let lowered = lowered(program)?;
     let report = cost::analyse(&lowered, None);
     let t_depth = rotations::build(&lowered)
@@ -135,11 +151,18 @@ pub fn estimate(
         [budget / 2.0, budget / 2.0, 0.0]
     };
     let per_rotation = if rotations > 0 {
-        (3.0 * (rotations as f64 / shares[2]).log2()).ceil() as usize
+        let required = (3.0 * (rotations as f64 / shares[2]).log2()).ceil();
+        if !required.is_finite() || required < 0.0 || required > usize::MAX as f64 {
+            return Err(too_large());
+        }
+        required as usize
     } else {
         0
     };
-    let states = t + rotations * per_rotation;
+    let states = rotations
+        .checked_mul(per_rotation)
+        .and_then(|synthesized| t.checked_add(synthesized))
+        .ok_or_else(&too_large)?;
     let steps = states.max(1);
 
     let mut levels = 0;
@@ -158,8 +181,18 @@ pub fn estimate(
         }
     }
     let factories = states.min(FACTORY_STEPS);
-    let data_tiles = 2 * logical + (8.0 * logical as f64).sqrt().ceil() as usize + 1;
-    let tiles = data_tiles + factories * factory_tiles;
+    let boundary_tiles = (8.0 * logical as f64).sqrt().ceil() as usize;
+    let data_tiles = logical
+        .checked_mul(2)
+        .and_then(|tiles| tiles.checked_add(boundary_tiles))
+        .and_then(|tiles| tiles.checked_add(1))
+        .ok_or_else(&too_large)?;
+    let factory_total = factories
+        .checked_mul(factory_tiles)
+        .ok_or_else(&too_large)?;
+    let tiles = data_tiles
+        .checked_add(factory_total)
+        .ok_or_else(&too_large)?;
     let latency = if states > 0 {
         FACTORY_STEPS * levels
     } else {
@@ -168,11 +201,27 @@ pub fn estimate(
     let distance = (3..=MAX_DISTANCE)
         .step_by(2)
         .find(|&d| {
-            tiles as f64 * ((steps + latency) * d) as f64 * logical_rate(error, d) <= shares[0]
+            tiles as f64
+                * (steps as f64 + latency as f64)
+                * d as f64
+                * logical_rate(error, d)
+                <= shares[0]
         })
         .ok_or_else(|| format!("no code distance up to {MAX_DISTANCE} keeps logical errors within the budget of {budget}"))?;
     let per_tile = 2 * distance * distance;
-    let cycles = (steps + latency) * distance;
+    let cycles = steps
+        .checked_add(latency)
+        .and_then(|steps| steps.checked_mul(distance))
+        .ok_or_else(&too_large)?;
+    let data_qubits = data_tiles.checked_mul(per_tile).ok_or_else(&too_large)?;
+    let factory_qubits = factory_total.checked_mul(per_tile).ok_or_else(&too_large)?;
+    data_qubits
+        .checked_add(factory_qubits)
+        .ok_or_else(&too_large)?;
+    let runtime = cycles as f64 * cycle;
+    if !runtime.is_finite() {
+        return Err(too_large());
+    }
     Ok(Estimate {
         logical,
         t,
@@ -185,10 +234,10 @@ pub fn estimate(
         factories,
         factory_tiles,
         data_tiles,
-        data_qubits: data_tiles * per_tile,
-        factory_qubits: factories * factory_tiles * per_tile,
+        data_qubits,
+        factory_qubits,
         cycles,
-        runtime: cycles as f64 * cycle,
+        runtime,
         error,
         cycle,
         budget,
@@ -343,5 +392,16 @@ mod tests {
         assert!(looped.looped && looped.to_string().contains("counted once"));
         let noisy = Calibration::parse("cx 0 1 0.02\n").unwrap();
         assert!(estimate(&program("t q[0];\n"), Some(&noisy), 1e-3).is_err());
+    }
+
+    #[test]
+    fn validates_public_inputs() {
+        let rotated = program("rz(0.3) q[0];\n");
+        for budget in [0.0, -1.0, 1.0, f64::INFINITY, f64::NAN] {
+            let error = estimate(&rotated, None, budget)
+                .err()
+                .expect("an invalid budget should be rejected");
+            assert!(error.contains("budget"), "{budget}: {error}");
+        }
     }
 }

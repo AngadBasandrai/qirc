@@ -1,8 +1,14 @@
 use crate::ast;
 pub use crate::ast::{BinOp, CastOp, FloatPredicate, IntPredicate};
 use crate::diag::Span;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+
+/// Maximum number of addressable qubits or classical result wires in a program.
+///
+/// Keeping this bound shared by text frontends prevents hostile declarations
+/// from turning directly into multi-gigabyte allocations.
+pub const MAX_WIRES: u32 = 1 << 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BlockId(pub u32);
@@ -146,6 +152,7 @@ impl Scalar {
     pub fn signed(self, c: Const) -> i64 {
         match self {
             Scalar::Bool => -(c.as_i64() & 1),
+            Scalar::Int(bits) => wrap(c.as_i64(), bits),
             _ => c.as_i64(),
         }
     }
@@ -218,6 +225,7 @@ impl Operand {
 
 impl BinOp {
     pub fn apply(self, ty: Scalar, a: Const, b: Const) -> Const {
+        let (a, b) = (ty.normalize(a), ty.normalize(b));
         if self.is_float() {
             let (x, y) = (a.as_f64(), b.as_f64());
             return ty.normalize(Const::Float(match self {
@@ -297,6 +305,7 @@ impl FloatPredicate {
 
 impl CastOp {
     pub fn apply(self, from: Scalar, to: Scalar, value: Const) -> Const {
+        let value = from.normalize(value);
         let result = match self {
             CastOp::Trunc | CastOp::SExt => Const::Int(from.signed(value)),
             CastOp::ZExt => Const::Int(from.unsigned(value) as i64),
@@ -524,6 +533,14 @@ impl Gate {
             .iter()
             .filter_map(|p| p.constant().map(|c| c.as_f64()))
             .collect()
+    }
+
+    pub(crate) fn has_valid_shape(&self) -> bool {
+        if self.targets.len() != self.kind.arity() || self.params.len() != self.kind.param_count() {
+            return false;
+        }
+        let mut wires = HashSet::with_capacity(self.controls.len() + self.targets.len());
+        self.wires().all(|wire| wires.insert(wire))
     }
 }
 
@@ -999,5 +1016,21 @@ mod tests {
             span: Span::DUMMY,
         };
         assert_eq!(gate.constant_params(), [2.0]);
+
+        // LLVM integer constants are bit patterns. Signed operations must
+        // interpret narrow values using the declared type, not as positive
+        // host i64 values.
+        assert_eq!(
+            BinOp::SDiv.apply(Scalar::Int(8), Const::Int(255), Const::Int(2)),
+            Const::Int(0)
+        );
+        assert_eq!(
+            CastOp::SIToFP.apply(Scalar::Int(8), Scalar::Double, Const::Int(255)),
+            Const::Float(-1.0)
+        );
+        assert_eq!(
+            CastOp::FPExt.apply(Scalar::Float, Scalar::Double, Const::Float(0.1)),
+            Const::Float(f64::from(0.1_f32))
+        );
     }
 }

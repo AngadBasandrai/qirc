@@ -9,13 +9,71 @@ use crate::driver;
 use crate::json::{self, Json};
 
 const MAX_TEXT: usize = 1 << 20;
+const MAX_MESSAGE: usize = 8 << 20;
+const MAX_HEADERS: usize = 64 << 10;
+const MAX_PENDING: usize = 8;
+
+fn header_line(input: &mut impl BufRead, line: &mut String) -> io::Result<usize> {
+    let mut bytes = Vec::new();
+    loop {
+        let (take, ended) = {
+            let available = input.fill_buf()?;
+            if available.is_empty() {
+                if bytes.is_empty() {
+                    return Ok(0);
+                }
+                break;
+            }
+            let take = available
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            let next = bytes.len().checked_add(take).ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidData, "LSP headers are too large")
+            })?;
+            if next > MAX_HEADERS {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("an LSP header line exceeds {MAX_HEADERS} bytes"),
+                ));
+            }
+            bytes.extend_from_slice(&available[..take]);
+            (take, available[take - 1] == b'\n')
+        };
+        input.consume(take);
+        if ended {
+            break;
+        }
+    }
+    *line = String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "an LSP header is not UTF-8"))?;
+    Ok(line.len())
+}
 
 fn receive(input: &mut impl BufRead) -> io::Result<Option<String>> {
     let mut length = None;
+    let mut header_bytes = 0usize;
     loop {
         let mut line = String::new();
-        if input.read_line(&mut line)? == 0 {
-            return Ok(None);
+        let read = header_line(input, &mut line)?;
+        if read == 0 {
+            return if header_bytes == 0 {
+                Ok(None)
+            } else {
+                Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "the LSP headers ended before an empty line",
+                ))
+            };
+        }
+        header_bytes = header_bytes
+            .checked_add(read)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "LSP headers are too large"))?;
+        if header_bytes > MAX_HEADERS {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("LSP headers exceed {MAX_HEADERS} bytes"),
+            ));
         }
         let line = line.trim_end();
         if line.is_empty() {
@@ -24,13 +82,35 @@ fn receive(input: &mut impl BufRead) -> io::Result<Option<String>> {
         if let Some((name, value)) = line.split_once(':')
             && name.eq_ignore_ascii_case("content-length")
         {
-            length = value.trim().parse::<usize>().ok();
+            let parsed = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "an invalid Content-Length"))?;
+            if length.replace(parsed).is_some() {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "more than one Content-Length header",
+                ));
+            }
         }
     }
     let length = length.ok_or_else(|| {
         io::Error::new(ErrorKind::InvalidData, "a message without Content-Length")
     })?;
-    let mut body = vec![0; length];
+    if length > MAX_MESSAGE {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("Content-Length {length} exceeds the {MAX_MESSAGE} byte message limit"),
+        ));
+    }
+    let mut body = Vec::new();
+    body.try_reserve_exact(length).map_err(|error| {
+        io::Error::new(
+            ErrorKind::OutOfMemory,
+            format!("cannot allocate a {length} byte message: {error}"),
+        )
+    })?;
+    body.resize(length, 0);
     input.read_exact(&mut body)?;
     String::from_utf8(body)
         .map(Some)
@@ -194,12 +274,30 @@ fn handle(message: &Json, output: &mut impl Write) -> io::Result<bool> {
 }
 
 fn enqueue(body: io::Result<String>, pending: &mut VecDeque<Json>) -> io::Result<()> {
-    pending.extend(Json::parse(&body?).ok());
+    if let Ok(message) = Json::parse(&body?) {
+        pending.push_back(message);
+    }
+    Ok(())
+}
+
+fn fill_pending(
+    receiver: &mpsc::Receiver<io::Result<String>>,
+    pending: &mut VecDeque<Json>,
+) -> io::Result<()> {
+    for _ in 0..MAX_PENDING {
+        if pending.len() >= MAX_PENDING {
+            break;
+        }
+        match receiver.try_recv() {
+            Ok(body) => enqueue(body, pending)?,
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
     Ok(())
 }
 
 pub fn serve(input: impl BufRead + Send + 'static, mut output: impl Write) -> io::Result<()> {
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(8);
     thread::spawn(move || {
         let mut input = input;
         loop {
@@ -223,9 +321,7 @@ pub fn serve(input: impl BufRead + Send + 'static, mut output: impl Write) -> io
                 Err(_) => return Ok(()),
             }
         }
-        for body in receiver.try_iter() {
-            enqueue(body, &mut pending)?;
-        }
+        fill_pending(&receiver, &mut pending)?;
         let Some(message) = pending.pop_front() else {
             continue;
         };
@@ -349,5 +445,44 @@ mod tests {
         let file = SourceFile::new("a", "; \u{1f600}x\nb");
         assert_eq!(position(&file, 6), r#"{"line":0,"character":4}"#);
         assert_eq!(position(&file, 8), r#"{"line":1,"character":0}"#);
+    }
+
+    #[test]
+    fn rejects_invalid_or_oversized_frames() {
+        let headers = [
+            "Content-Length: no\r\n\r\n".to_string(),
+            "Content-Length: 1\r\nContent-Length: 1\r\n\r\n".to_string(),
+            format!("Content-Length: {}\r\n\r\n", MAX_MESSAGE + 1),
+            format!("X: {}\r\n\r\n", "x".repeat(MAX_HEADERS)),
+        ];
+        for header in headers {
+            let error = receive(&mut Cursor::new(header.as_bytes())).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidData, "{header:?}");
+        }
+        let error = receive(&mut Cursor::new(b"Content-Length: 1"))
+            .expect_err("a truncated header block should fail");
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn bounds_pending_messages_during_a_burst() {
+        let (sender, receiver) = mpsc::channel();
+        for id in 0..(MAX_PENDING * 2) {
+            sender.send(Ok(format!(r#"{{"id":{id}}}"#))).unwrap();
+        }
+        let mut pending = VecDeque::new();
+        fill_pending(&receiver, &mut pending).unwrap();
+        assert_eq!(pending.len(), MAX_PENDING);
+        assert_eq!(receiver.try_iter().count(), MAX_PENDING);
+
+        let (sender, receiver) = mpsc::channel();
+        for _ in 0..(MAX_PENDING * 2) {
+            sender.send(Ok("not json".into())).unwrap();
+        }
+        sender.send(Ok(r#"{"id":1}"#.into())).unwrap();
+        let mut pending = VecDeque::new();
+        fill_pending(&receiver, &mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(receiver.try_iter().count(), MAX_PENDING + 1);
     }
 }

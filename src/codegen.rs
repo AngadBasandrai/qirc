@@ -11,7 +11,61 @@ use crate::transpile::{self, GateSet};
 use crate::verify;
 
 pub fn emit_qasm3(program: &Program) -> Result<String, String> {
+    validate_cfg(program)?;
     QasmWriter::new(program)?.emit()
+}
+
+fn validate_cfg(program: &Program) -> Result<(), String> {
+    if program.blocks.is_empty() {
+        return Ok(());
+    }
+
+    if program.entry.index() >= program.blocks.len() {
+        return Err(format!(
+            "entry block {} does not exist (the program has {} blocks)",
+            program.entry.0,
+            program.blocks.len()
+        ));
+    }
+
+    for (index, block) in program.blocks.iter().enumerate() {
+        if block.id.index() != index {
+            return Err(format!(
+                "block `{}` is stored at index {index} but carries id {}",
+                block.label, block.id.0
+            ));
+        }
+
+        for successor in block.term.successors() {
+            if successor.index() >= program.blocks.len() {
+                return Err(format!(
+                    "block `{}` branches to block {} which does not exist",
+                    block.label, successor.0
+                ));
+            }
+        }
+
+        for op in &block.ops {
+            let Op::Assign {
+                expr: Expr::Phi(incoming),
+                ..
+            } = op
+            else {
+                continue;
+            };
+            if let Some((from, _)) = incoming
+                .iter()
+                .find(|(from, _)| from.index() >= program.blocks.len())
+            {
+                return Err(format!(
+                    "phi in block `{}` names block {} which does not exist",
+                    block.label, from.0
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 struct QasmWriter<'a> {
@@ -762,7 +816,8 @@ fn qasm_gate(gate: &Gate, params: &[String]) -> String {
     let wires = qasm_wires(gate);
     if let GateKind::Unitary(m) = gate.kind {
         let (theta, phi, lambda) = zyz_angles(&Matrix2::from_ir(m));
-        return format!("U({theta}, {phi}, {lambda}) {wires};");
+        let controls = "ctrl @ ".repeat(gate.controls.len());
+        return format!("{controls}U({theta}, {phi}, {lambda}) {wires};");
     }
     let name = qasm_name(gate.kind, gate.controls.len());
 
@@ -801,6 +856,7 @@ pub fn zyz_angles(m: &Matrix2) -> (f64, f64, f64) {
 }
 
 pub fn emit_qir(program: &Program) -> Result<String, String> {
+    validate_cfg(program)?;
     QirEmitter::new(program).emit()
 }
 
@@ -1458,7 +1514,8 @@ fn json_op(op: &Op) -> Option<String> {
             let targets: Vec<String> = gate.targets.iter().map(|q| q.0.to_string()).collect();
             let matrix = match gate.kind {
                 GateKind::Unitary(m) => {
-                    let entries = [m.a, m.b, m.c, m.d].map(|(re, im)| format!("{re}, {im}"));
+                    let entries = [m.a, m.b, m.c, m.d]
+                        .map(|(re, im)| format!("{}, {}", json_number(re), json_number(im)));
                     format!(", \"matrix\": [{}]", entries.join(", "))
                 }
                 _ => String::new(),
@@ -1489,19 +1546,31 @@ fn json_op(op: &Op) -> Option<String> {
     }
 }
 
+fn json_number(value: f64) -> String {
+    if value.is_finite() {
+        value.to_string()
+    } else {
+        "null".into()
+    }
+}
+
 fn json_term(program: &Program, term: &Term) -> String {
+    let label = |id: BlockId| {
+        program
+            .blocks
+            .get(id.index())
+            .filter(|block| block.id == id)
+            .map(|block| block.label.clone())
+            .unwrap_or_else(|| format!("<invalid block {}>", id.0))
+    };
     match term {
         Term::Ret(_) => "ret".into(),
         Term::Unreachable => "unreachable".into(),
-        Term::Br(target) => format!("br {}", program.block(*target).label),
+        Term::Br(target) => format!("br {}", label(*target)),
         Term::CondBr {
             if_true, if_false, ..
-        } => format!(
-            "condbr {} {}",
-            program.block(*if_true).label,
-            program.block(*if_false).label
-        ),
-        Term::Switch { default, .. } => format!("switch {}", program.block(*default).label),
+        } => format!("condbr {} {}", label(*if_true), label(*if_false)),
+        Term::Switch { default, .. } => format!("switch {}", label(*default)),
     }
 }
 
@@ -1618,6 +1687,88 @@ fn center(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
 
+    fn cfg_program(term: Term) -> Program {
+        let mut program = Program::new("cfg", Profile::Unrestricted);
+        program.blocks.push(Block {
+            id: BlockId(0),
+            label: "entry".into(),
+            ops: Vec::new(),
+            term,
+            span: crate::diag::Span::DUMMY,
+        });
+        program
+    }
+
+    fn assert_cfg_error(program: &Program, expected: &str) {
+        for result in [emit_qasm3(program), emit_qir(program)] {
+            let error = result.expect_err("a malformed CFG must not be emitted");
+            assert!(error.contains(expected), "{error}");
+        }
+        let emitted = emit_json(program);
+        json::Json::parse(&emitted).unwrap_or_else(|error| {
+            panic!("malformed CFG must still produce valid JSON: {error}\n{emitted}")
+        });
+    }
+
+    #[test]
+    fn emitters_handle_a_dangling_entry() {
+        let mut program = cfg_program(Term::Ret(None));
+        program.entry = BlockId(7);
+        assert_cfg_error(&program, "entry block 7 does not exist");
+    }
+
+    #[test]
+    fn emitters_handle_a_dangling_successor() {
+        let program = cfg_program(Term::Br(BlockId(7)));
+        assert_cfg_error(&program, "branches to block 7 which does not exist");
+        assert!(emit_json(&program).contains("br <invalid block 7>"));
+    }
+
+    #[test]
+    fn emitters_handle_a_misindexed_block() {
+        let mut program = cfg_program(Term::Ret(None));
+        program.blocks[0].id = BlockId(7);
+        assert_cfg_error(&program, "stored at index 0 but carries id 7");
+    }
+
+    #[test]
+    fn emitters_handle_a_dangling_phi_source() {
+        let mut program = cfg_program(Term::Ret(None));
+        program.blocks[0].ops.push(Op::Assign {
+            dest: ValueId(0),
+            ty: Scalar::Int(64),
+            expr: Expr::Phi(vec![(BlockId(7), Operand::Const(Const::Int(0)))]),
+            span: crate::diag::Span::DUMMY,
+        });
+        assert_cfg_error(&program, "phi in block `entry` names block 7");
+    }
+
+    #[test]
+    fn json_replaces_nonfinite_matrix_entries_with_null() {
+        let mut program = cfg_program(Term::Ret(None));
+        program.num_qubits = 1;
+        program.blocks[0].ops.push(Op::Gate(Gate {
+            kind: GateKind::Unitary(crate::ir::Matrix2 {
+                a: (f64::NAN, f64::INFINITY),
+                b: (f64::NEG_INFINITY, 0.0),
+                c: (1.0, 0.0),
+                d: (0.0, 1.0),
+            }),
+            controls: Vec::new(),
+            targets: vec![QubitId(0)],
+            params: Vec::new(),
+            span: crate::diag::Span::DUMMY,
+        }));
+
+        let emitted = emit_json(&program);
+        json::Json::parse(&emitted)
+            .unwrap_or_else(|error| panic!("expected valid JSON: {error}\n{emitted}"));
+        assert!(
+            emitted.contains("\"matrix\": [null, null, null, 0, 1, 0, 0, 1]"),
+            "{emitted}"
+        );
+    }
+
     fn assert_zyz_eq(original: Matrix2) {
         let (theta, phi, lambda) = zyz_angles(&original);
         let reconstructed = Matrix2::rz(phi)
@@ -1659,5 +1810,19 @@ mod tests {
         ] {
             assert_zyz_eq(matrix);
         }
+    }
+
+    #[test]
+    fn qasm_controls_arbitrary_unitaries() {
+        let gate = Gate {
+            kind: GateKind::Unitary(Matrix2::x().to_ir()),
+            controls: vec![QubitId(0)],
+            targets: vec![QubitId(1)],
+            params: Vec::new(),
+            span: crate::diag::Span::DUMMY,
+        };
+        let emitted = qasm_gate(&gate, &[]);
+        assert!(emitted.starts_with("ctrl @ U("), "{emitted}");
+        assert!(emitted.ends_with("q[0], q[1];"), "{emitted}");
     }
 }

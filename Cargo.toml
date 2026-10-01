@@ -11,7 +11,14 @@ documentation = "https://docs.rs/qirc-compiler"
 readme = "README.md"
 keywords = ["quantum", "qir", "compiler", "llvm", "simulator"]
 categories = ["compilers", "science", "simulation"]
-include = ["/src", "/tests", "/examples/repeat_until_success.ll", "/README.md", "/LICENSE"]
+include = [
+    "/src",
+    "/tests",
+    "/examples/line5.cal",
+    "/examples/repeat_until_success.ll",
+    "/README.md",
+    "/LICENSE",
+]
 
 [lib]
 name = "qirc"

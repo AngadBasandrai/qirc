@@ -1,9 +1,13 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use std::env;
 use std::io::{self, BufReader};
 use std::process;
 
 use qirc::{driver, explain, lsp, progress, surface};
 
+#[cfg(windows)]
 fn stop() {
     if progress::interrupt() {
         process::exit(130);
@@ -13,12 +17,14 @@ fn stop() {
 #[cfg(windows)]
 fn listen() {
     #[link(name = "kernel32")]
+    // This declaration matches the Win32 console control API signature.
     unsafe extern "system" {
         fn SetConsoleCtrlHandler(
             handler: Option<unsafe extern "system" fn(u32) -> i32>,
             add: i32,
         ) -> i32;
     }
+    // The operating system invokes this callback with the declared ABI.
     unsafe extern "system" fn handle(event: u32) -> i32 {
         if event > 1 {
             return 0;
@@ -26,6 +32,7 @@ fn listen() {
         stop();
         1
     }
+    // SAFETY: `handle` has static lifetime and the ABI and signature required by Windows.
     unsafe {
         SetConsoleCtrlHandler(Some(handle), 1);
     }
@@ -33,14 +40,24 @@ fn listen() {
 
 #[cfg(unix)]
 fn listen() {
+    const SIGINT: i32 = 2;
+
+    // These declarations match the POSIX signal and process-exit APIs.
     unsafe extern "C" {
         fn signal(signal: i32, handler: extern "C" fn(i32)) -> usize;
+        fn _exit(status: i32);
     }
     extern "C" fn handle(_: i32) {
-        stop();
+        if progress::interrupt() {
+            // SAFETY: `_exit` is async-signal-safe and terminates immediately without running
+            // Rust destructors. This is only used for a second interrupt.
+            unsafe { _exit(130) };
+        }
     }
+    // SAFETY: `SIGINT` is the interrupt signal on supported Unix targets, and `handle` has C ABI,
+    // static lifetime, and performs only an atomic swap or the async-signal-safe `_exit` operation.
     unsafe {
-        signal(2, handle);
+        signal(SIGINT, handle);
     }
 }
 

@@ -38,7 +38,10 @@ pub(crate) fn clifford(gate: &Gate) -> Option<Vec<f64>> {
 
 pub fn supports(gate: &Gate, params: &[f64]) -> bool {
     let turn = || params.first().copied().and_then(quarter_turns).is_some();
-    match (gate.kind, gate.controls.len()) {
+    if params.len() != gate.kind.param_count() {
+        return false;
+    }
+    match (gate.kind, gate.controls.len(), gate.targets.len()) {
         (
             GateKind::I
             | GateKind::X
@@ -48,12 +51,13 @@ pub fn supports(gate: &Gate, params: &[f64]) -> bool {
             | GateKind::S
             | GateKind::SDag
             | GateKind::SX
-            | GateKind::SXDag
-            | GateKind::Swap,
+            | GateKind::SXDag,
             0,
+            1,
         ) => true,
-        (GateKind::Rz | GateKind::R1 | GateKind::Rx | GateKind::Ry, 0) => turn(),
-        (GateKind::X | GateKind::Y | GateKind::Z, 1) => true,
+        (GateKind::Swap, 0, 2) => true,
+        (GateKind::Rz | GateKind::R1 | GateKind::Rx | GateKind::Ry, 0, 1) => turn(),
+        (GateKind::X | GateKind::Y | GateKind::Z, 1, 1) => true,
         _ => false,
     }
 }
@@ -142,6 +146,21 @@ impl Tableau {
     }
 
     pub fn apply(&mut self, gate: &Gate, params: &[f64]) {
+        assert!(
+            supports(gate, params),
+            "gate is not supported by the tableau simulator"
+        );
+        let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
+        assert!(
+            wires.iter().all(|&q| q < self.qubits),
+            "gate qubit is outside the tableau simulator"
+        );
+        for (i, &wire) in wires.iter().enumerate() {
+            assert!(
+                !wires[..i].contains(&wire),
+                "a gate cannot use the same qubit more than once"
+            );
+        }
         let target = gate.targets[0].index();
         let turns = params.first().copied().and_then(quarter_turns).unwrap_or(0);
         match (gate.kind, gate.controls.first().map(|c| c.index())) {
@@ -421,5 +440,18 @@ mod tests {
         t.pauli(1, false, true);
         t.h(1);
         assert!(!t.measure(1, &mut rng));
+    }
+
+    #[test]
+    #[should_panic(expected = "not supported")]
+    fn apply_rejects_malformed_gate() {
+        let gate = Gate {
+            kind: GateKind::H,
+            controls: Vec::new(),
+            targets: Vec::new(),
+            params: Vec::new(),
+            span: Span::DUMMY,
+        };
+        Tableau::new(1).apply(&gate, &[]);
     }
 }

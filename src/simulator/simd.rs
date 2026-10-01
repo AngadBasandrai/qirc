@@ -23,13 +23,41 @@ fn avx2_available() -> bool {
 }
 
 pub fn apply_1q(re: &mut [f64], im: &mut [f64], m: &Matrix2, target: usize, controls: u64) {
-    debug_assert_eq!(re.len(), im.len());
-    debug_assert!((1usize << target) < re.len());
-    debug_assert_eq!(controls & (1u64 << target), 0);
+    assert_eq!(
+        re.len(),
+        im.len(),
+        "real and imaginary state vectors must have equal lengths"
+    );
+    assert!(
+        re.len().is_power_of_two(),
+        "state-vector length must be a nonzero power of two"
+    );
+    assert!(
+        target < usize::BITS as usize && target < u64::BITS as usize,
+        "target qubit is outside the supported index range"
+    );
+    let target_index = 1usize << target;
+    let target_control = 1u64 << target;
+    assert!(
+        target_index < re.len(),
+        "target qubit is outside the state vector"
+    );
+    assert_eq!(
+        controls & target_control,
+        0,
+        "target qubit cannot also be a control"
+    );
+    assert!(
+        controls < re.len() as u64,
+        "control mask addresses a qubit outside the state vector"
+    );
 
     #[cfg(target_arch = "x86_64")]
     {
         if re.len() >= LANES && avx2_available() {
+            // SAFETY: The checks above establish equal, power-of-two state-vector lengths,
+            // an in-bounds target, and an in-bounds control mask. `avx2_available` proves
+            // that the AVX2 and FMA target features required by the implementation exist.
             unsafe { apply_1q_avx2(re, im, m, target, controls) };
             return;
         }
@@ -39,11 +67,40 @@ pub fn apply_1q(re: &mut [f64], im: &mut [f64], m: &Matrix2, target: usize, cont
 }
 
 pub fn apply_swap(re: &mut [f64], im: &mut [f64], a: usize, b: usize, controls: u64) {
+    assert_eq!(
+        re.len(),
+        im.len(),
+        "real and imaginary state vectors must have equal lengths"
+    );
+    assert!(
+        re.len().is_power_of_two(),
+        "state-vector length must be a nonzero power of two"
+    );
+    assert!(
+        a < usize::BITS as usize
+            && b < usize::BITS as usize
+            && a < u64::BITS as usize
+            && b < u64::BITS as usize,
+        "swap qubit is outside the supported index range"
+    );
+    let (mask_a, mask_b) = (1usize << a, 1usize << b);
+    assert!(
+        mask_a < re.len() && mask_b < re.len(),
+        "swap qubit is outside the state vector"
+    );
+    assert_eq!(
+        controls & ((1u64 << a) | (1u64 << b)),
+        0,
+        "a swapped qubit cannot also be a control"
+    );
+    assert!(
+        controls < re.len() as u64,
+        "control mask addresses a qubit outside the state vector"
+    );
+
     if a == b {
         return;
     }
-
-    let (mask_a, mask_b) = (1usize << a, 1usize << b);
 
     for i in 0..re.len() {
         if i & mask_a != 0 && i & mask_b == 0 && (i as u64 & controls) == controls {
@@ -91,6 +148,13 @@ fn lane_active(lane: usize, control_mask: u64) -> f64 {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// Applies a one-qubit matrix using AVX2 lanes.
+///
+/// # Safety
+///
+/// The slices must have the same nonzero power-of-two length of at least [`LANES`].
+/// `target` and every bit in `controls` must address that state, the target bit must not
+/// be present in `controls`, and the CPU must support AVX2 and FMA.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn apply_1q_avx2(re: &mut [f64], im: &mut [f64], m: &Matrix2, target: usize, controls: u64) {
     unsafe {
@@ -324,6 +388,48 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "equal lengths")]
+    fn rejects_mismatched_state_vectors() {
+        apply_1q(&mut [1.0, 0.0], &mut [0.0], &Matrix2::x(), 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn rejects_partial_state_vectors() {
+        apply_1q(
+            &mut [1.0, 0.0, 0.0],
+            &mut [0.0, 0.0, 0.0],
+            &Matrix2::x(),
+            0,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the state vector")]
+    fn rejects_out_of_bounds_target() {
+        apply_1q(&mut [1.0, 0.0], &mut [0.0, 0.0], &Matrix2::x(), 1, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot also be a control")]
+    fn rejects_target_control_overlap() {
+        apply_1q(&mut [1.0, 0.0], &mut [0.0, 0.0], &Matrix2::x(), 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "control mask addresses")]
+    fn rejects_out_of_bounds_control() {
+        apply_1q(
+            &mut [1.0, 0.0, 0.0, 0.0],
+            &mut [0.0, 0.0, 0.0, 0.0],
+            &Matrix2::x(),
+            0,
+            4,
+        );
+    }
+
+    #[test]
     fn swap() {
         let n = 3;
         let (mut re, mut im) = random_state(n, 7);
@@ -338,5 +444,17 @@ mod tests {
             assert_eq!(re[j], before_re[i]);
             assert_eq!(im[j], before_im[i]);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "equal lengths")]
+    fn swap_rejects_mismatched_state_vectors() {
+        apply_swap(&mut [1.0, 0.0], &mut [0.0], 0, 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the state vector")]
+    fn swap_rejects_out_of_bounds_qubit() {
+        apply_swap(&mut [1.0, 0.0], &mut [0.0, 0.0], 0, 1, 0);
     }
 }

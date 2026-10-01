@@ -148,7 +148,7 @@ impl Angle {
     }
 
     fn value(&self, env: &HashMap<String, f64>, integer: bool) -> Result<f64, Diagnostic> {
-        Ok(match self {
+        let value = match self {
             Angle::Number(n) => *n,
             Angle::Name(name, span) => match name.as_str() {
                 "pi" => PI,
@@ -190,7 +190,14 @@ impl Angle {
                     }
                 }
             }
-        })
+        };
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err(Diagnostic::error(
+                "an angle or integer expression must have a finite value",
+            ))
+        }
     }
 }
 
@@ -501,15 +508,28 @@ impl Builder {
             return Err(Diagnostic::error(format!("`{name}` is already declared"))
                 .primary(span, "declared again here"));
         }
+        let current = match kind {
+            Kind::Qubit => self.qubits,
+            Kind::Bit => self.bits,
+        };
+        let next = current
+            .checked_add(size)
+            .filter(|&total| total <= MAX_WIRES as usize)
+            .ok_or_else(|| {
+                Diagnostic::error(format!(
+                    "a program can declare at most {MAX_WIRES} qubits or bits"
+                ))
+                .primary(span, "this declaration exceeds the limit")
+            })?;
         let offset = match kind {
             Kind::Qubit => {
-                self.qubits += size;
-                self.measured.resize(self.qubits, false);
-                self.qubits - size
+                self.qubits = next;
+                self.measured.resize(next, false);
+                current
             }
             Kind::Bit => {
-                self.bits += size;
-                self.bits - size
+                self.bits = next;
+                current
             }
         };
         self.registers.insert(
@@ -1381,4 +1401,40 @@ fn build(
         builder.program.profile = Profile::Adaptive;
     }
     (builder.program, Vec::new(), builder.inputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_finite_expressions() {
+        for expression in ["1 / 0", "sqrt(-1)", "exp(10000)", "1e999"] {
+            let source = format!(
+                "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit q;\nrx({expression}) q;\n"
+            );
+            let (_, errors) = lower(&source);
+            assert!(
+                errors.iter().any(|error| error.message.contains("finite")),
+                "{expression}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounds_declared_wires() {
+        let too_many = u64::from(MAX_WIRES) + 1;
+        for declaration in [
+            format!("qubit[{too_many}] q;"),
+            format!("bit[{too_many}] c;"),
+            format!("qubit[{MAX_WIRES}] a; qubit[1] b;"),
+        ] {
+            let source = format!("OPENQASM 3.0;\n{declaration}\n");
+            let (_, errors) = lower(&source);
+            assert!(
+                errors.iter().any(|error| error.message.contains("at most")),
+                "{declaration}: {errors:?}"
+            );
+        }
+    }
 }

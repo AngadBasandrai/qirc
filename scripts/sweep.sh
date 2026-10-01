@@ -8,7 +8,7 @@ while IFS= read -r options; do
   for file in $files; do
     case "$file $options" in *ghz.ll*--coupling* | *ghz.ll*--calibration*) continue ;; esac
     checked=$((checked + 1))
-    if ! output=$("$qirc" diff "$file" $options 2>&1); then
+    if ! output=$("$qirc" diff "$file" $options </dev/null 2>&1); then
       failed=$((failed + 1))
       echo "FAIL $file $options"
       echo "$output" | tail -3

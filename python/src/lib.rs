@@ -239,12 +239,11 @@ fn expectation(
     let compilation = compiled(py, &file, &options)?;
     let program = compilation.program;
     py.detach(|| match (&options.calibration, zne, options.noisy) {
-        (Some(c), true, _) => {
-            observable::extrapolate(&program, &observable, c, shots, seed)
-                .map(|(_, (zero, _))| zero.clamp(-observable.bound(), observable.bound()))
-        }
+        (Some(c), true, _) => observable::extrapolate(&program, &observable, c, shots, seed)
+            .map(|(_, (zero, _))| zero.clamp(-observable.bound(), observable.bound())),
         (Some(c), false, true) => {
-            observable::noisy_expectation(&program, &observable, c, shots, seed).map(|(value, _)| value)
+            observable::noisy_expectation(&program, &observable, c, shots, seed)
+                .map(|(value, _)| value)
         }
         _ => observable::expectation(&program, &observable),
     })

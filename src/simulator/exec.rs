@@ -181,10 +181,16 @@ impl Sample for Mps {
         let mut measured = vec![None; self.qubits()];
         for (qubit, result) in plan {
             if result.index() < results.len() {
-                measured[qubit.index()] = Some(result.index());
+                measured[qubit.index()] = Some(qubit.index());
             }
         }
-        sampler.draw(&measured, rng, results);
+        let mut outcomes = vec![false; self.qubits()];
+        sampler.draw(&measured, rng, &mut outcomes);
+        for (qubit, result) in plan {
+            if let Some(slot) = results.get_mut(result.index()) {
+                *slot = outcomes[qubit.index()];
+            }
+        }
     }
 }
 
@@ -771,10 +777,21 @@ fn depolarize<S: Backend>(state: &mut S, gate: &Gate, calibration: &Calibration,
         return;
     }
     let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
-    let choices = (1u64 << (2 * wires.len())) - 1;
-    let choice = 1 + rng.next_u64() % choices;
-    for (i, &q) in wires.iter().enumerate() {
-        let pauli = choice >> (2 * i) & 3;
+    if wires.is_empty() {
+        return;
+    }
+    let mut paulis = vec![0u8; wires.len()];
+    loop {
+        let mut nonidentity = false;
+        for pauli in &mut paulis {
+            *pauli = (rng.next_u64() & 3) as u8;
+            nonidentity |= *pauli != 0;
+        }
+        if nonidentity {
+            break;
+        }
+    }
+    for (&q, pauli) in wires.iter().zip(paulis) {
         state.pauli(q, pauli & 1 == 1, pauli & 2 == 2);
     }
 }
@@ -1304,6 +1321,67 @@ mod tests {
             "{}",
             truncated.discarded
         );
+    }
+
+    #[test]
+    fn matrix_product_repeats_measurement_results() {
+        let (program, diagnostics) = qasm::lower(
+            "OPENQASM 2.0;
+include \"qelib1.inc\";
+qreg q[1];
+creg c[2];
+ry(0.7) q[0];
+measure q[0] -> c[0];
+measure q[0] -> c[1];
+",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(!needs_per_shot(&program));
+        let outcome = execute_bonded(
+            &program,
+            ExecConfig {
+                shots: 2_000,
+                seed: 17,
+                keep_state: false,
+            },
+            4,
+        )
+        .unwrap();
+        assert!(
+            outcome
+                .counts
+                .keys()
+                .all(|bits| bits == "00" || bits == "11")
+        );
+        assert!(outcome.counts.contains_key("00"));
+        assert!(outcome.counts.contains_key("11"));
+    }
+
+    #[test]
+    fn wide_depolarization_samples_nonidentity_pauli() {
+        #[derive(Default)]
+        struct Recorded(Vec<(usize, bool, bool)>);
+
+        impl Backend for Recorded {
+            fn gate(&mut self, _: &Gate, _: &[f64]) {}
+
+            fn pauli(&mut self, qubit: usize, x: bool, z: bool) {
+                self.0.push((qubit, x, z));
+            }
+        }
+
+        let gate = Gate {
+            kind: GateKind::X,
+            controls: (0..32).map(QubitId).collect(),
+            targets: vec![QubitId(32)],
+            params: Vec::new(),
+            span: Span::DUMMY,
+        };
+        let calibration = Calibration::parse("cx 0 1 0.999999\n").unwrap();
+        let mut state = Recorded::default();
+        depolarize(&mut state, &gate, &calibration, &mut Rng::new(23));
+        assert_eq!(state.0.len(), 33);
+        assert!(state.0.iter().any(|&(_, x, z)| x || z));
     }
 
     #[test]

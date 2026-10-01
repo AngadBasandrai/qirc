@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt;
 use std::mem;
 
@@ -12,24 +13,87 @@ pub struct Coupling {
     pub edges: Vec<(usize, usize)>,
 }
 
+const MAX_COUPLING_EDGES: usize = MAX_WIRES as usize;
+const MAX_ROUTING_QUBITS: usize = 2048;
+
+#[derive(Clone, Copy)]
+struct QueueEntry {
+    cost: f64,
+    node: usize,
+}
+
+impl PartialEq for QueueEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node && self.cost.to_bits() == other.cost.to_bits()
+    }
+}
+
+impl Eq for QueueEntry {}
+
+impl PartialOrd for QueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueueEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .cost
+            .total_cmp(&self.cost)
+            .then_with(|| other.node.cmp(&self.node))
+    }
+}
+
 impl Coupling {
     pub fn line(qubits: usize) -> Coupling {
-        Coupling {
-            qubits,
-            edges: (0..qubits.saturating_sub(1)).map(|i| (i, i + 1)).collect(),
+        Self::try_line(qubits).expect("a coupling map exceeds the supported size")
+    }
+
+    pub fn try_line(qubits: usize) -> Option<Coupling> {
+        let edges = qubits.saturating_sub(1);
+        if qubits > MAX_ROUTING_QUBITS || edges > MAX_COUPLING_EDGES {
+            return None;
         }
+        Some(Coupling {
+            qubits,
+            edges: (0..edges).map(|i| (i, i + 1)).collect(),
+        })
     }
 
     pub fn ring(qubits: usize) -> Coupling {
-        let mut coupling = Coupling::line(qubits);
+        Self::try_ring(qubits).expect("a coupling map exceeds the supported size")
+    }
+
+    pub fn try_ring(qubits: usize) -> Option<Coupling> {
+        let edge_count = if qubits > 2 {
+            qubits
+        } else {
+            qubits.saturating_sub(1)
+        };
+        if qubits > MAX_ROUTING_QUBITS || edge_count > MAX_COUPLING_EDGES {
+            return None;
+        }
+        let mut coupling = Coupling::try_line(qubits)?;
         if qubits > 2 {
             coupling.edges.push((qubits - 1, 0));
         }
-        coupling
+        Some(coupling)
     }
 
     pub fn grid(rows: usize, columns: usize) -> Coupling {
-        let mut edges = Vec::new();
+        Self::try_grid(rows, columns).expect("a coupling map exceeds the supported size")
+    }
+
+    pub fn try_grid(rows: usize, columns: usize) -> Option<Coupling> {
+        let qubits = rows.checked_mul(columns)?;
+        let horizontal = rows.checked_mul(columns.saturating_sub(1))?;
+        let vertical = columns.checked_mul(rows.saturating_sub(1))?;
+        let edge_count = horizontal.checked_add(vertical)?;
+        if qubits > MAX_ROUTING_QUBITS || edge_count > MAX_COUPLING_EDGES {
+            return None;
+        }
+        let mut edges = Vec::with_capacity(edge_count);
         for row in 0..rows {
             for column in 0..columns {
                 let here = row * columns + column;
@@ -41,35 +105,45 @@ impl Coupling {
                 }
             }
         }
-        Coupling {
-            qubits: rows * columns,
-            edges,
-        }
+        Some(Coupling { qubits, edges })
     }
 
     pub fn full(qubits: usize) -> Coupling {
-        let mut edges = Vec::new();
+        Self::try_full(qubits).expect("a coupling map exceeds the supported size")
+    }
+
+    pub fn try_full(qubits: usize) -> Option<Coupling> {
+        let previous = qubits.saturating_sub(1);
+        let edge_count = if qubits.is_multiple_of(2) {
+            (qubits / 2).checked_mul(previous)?
+        } else {
+            qubits.checked_mul(previous / 2)?
+        };
+        if qubits > MAX_ROUTING_QUBITS || edge_count > MAX_COUPLING_EDGES {
+            return None;
+        }
+        let mut edges = Vec::with_capacity(edge_count);
         for a in 0..qubits {
             for b in (a + 1)..qubits {
                 edges.push((a, b));
             }
         }
-        Coupling { qubits, edges }
+        Some(Coupling { qubits, edges })
     }
 
     pub fn parse(spec: &str) -> Option<Coupling> {
         if let Some(rest) = spec.strip_prefix("line:") {
-            return Some(Coupling::line(rest.parse().ok()?));
+            return Coupling::try_line(rest.parse().ok()?);
         }
         if let Some(rest) = spec.strip_prefix("ring:") {
-            return Some(Coupling::ring(rest.parse().ok()?));
+            return Coupling::try_ring(rest.parse().ok()?);
         }
         if let Some(rest) = spec.strip_prefix("full:") {
-            return Some(Coupling::full(rest.parse().ok()?));
+            return Coupling::try_full(rest.parse().ok()?);
         }
         if let Some(rest) = spec.strip_prefix("grid:") {
             let (rows, columns) = rest.split_once('x')?;
-            return Some(Coupling::grid(rows.parse().ok()?, columns.parse().ok()?));
+            return Coupling::try_grid(rows.parse().ok()?, columns.parse().ok()?);
         }
 
         let mut edges = Vec::new();
@@ -78,8 +152,14 @@ impl Coupling {
             let (a, b) = pair.trim().split_once('-')?;
             let a: usize = a.trim().parse().ok()?;
             let b: usize = b.trim().parse().ok()?;
+            if a == b || a >= MAX_ROUTING_QUBITS || b >= MAX_ROUTING_QUBITS {
+                return None;
+            }
             highest = highest.max(a).max(b);
             edges.push((a, b));
+            if edges.len() > MAX_COUPLING_EDGES {
+                return None;
+            }
         }
 
         if edges.is_empty() {
@@ -87,7 +167,7 @@ impl Coupling {
         }
 
         Some(Coupling {
-            qubits: highest + 1,
+            qubits: highest.checked_add(1)?,
             edges,
         })
     }
@@ -111,14 +191,25 @@ impl Coupling {
     }
 
     pub fn distances(&self) -> Vec<Vec<usize>> {
+        assert!(
+            self.qubits <= MAX_ROUTING_QUBITS,
+            "all-pairs distances support at most {MAX_ROUTING_QUBITS} qubits"
+        );
+        let mut neighbours = vec![Vec::new(); self.qubits];
+        for &(a, b) in &self.edges {
+            if a < self.qubits && b < self.qubits && a != b {
+                neighbours[a].push(b);
+                neighbours[b].push(a);
+            }
+        }
         (0..self.qubits)
             .map(|from| {
                 let mut distance = vec![usize::MAX; self.qubits];
                 distance[from] = 0;
                 let mut queue = VecDeque::from([from]);
                 while let Some(current) = queue.pop_front() {
-                    for next in self.neighbours(current) {
-                        if next < self.qubits && distance[next] == usize::MAX {
+                    for &next in &neighbours[current] {
+                        if distance[next] == usize::MAX {
                             distance[next] = distance[current] + 1;
                             queue.push_back(next);
                         }
@@ -154,6 +245,9 @@ impl Coupling {
     }
 
     pub fn shortest_path(&self, from: usize, to: usize) -> Option<Vec<usize>> {
+        if from >= self.qubits || to >= self.qubits {
+            return None;
+        }
         if from == to {
             return Some(vec![from]);
         }
@@ -650,26 +744,113 @@ fn weights(coupling: &Coupling, calibration: Option<&Calibration>) -> Vec<Vec<f6
     let mean = coupling.edges.iter().map(|&(a, b)| loss(a, b)).sum::<f64>()
         / coupling.edges.len().max(1) as f64;
     let n = coupling.qubits;
-    let mut weight = vec![vec![f64::INFINITY; n]; n];
-    for (q, row) in weight.iter_mut().enumerate() {
-        row[q] = 0.0;
-    }
+    let mut neighbours = vec![Vec::new(); n];
     for &(a, b) in &coupling.edges {
         let w = if mean > 0.0 { loss(a, b) / mean } else { 1.0 };
-        weight[a][b] = weight[a][b].min(w);
-        weight[b][a] = weight[b][a].min(w);
+        neighbours[a].push((b, w));
+        neighbours[b].push((a, w));
     }
-    for k in 0..n {
-        for i in 0..n {
-            for j in 0..n {
-                let through = weight[i][k] + weight[k][j];
-                if through < weight[i][j] {
-                    weight[i][j] = through;
+
+    (0..n)
+        .map(|source| {
+            let mut distance = vec![f64::INFINITY; n];
+            distance[source] = 0.0;
+            let mut queue = BinaryHeap::from([QueueEntry {
+                cost: 0.0,
+                node: source,
+            }]);
+            while let Some(QueueEntry { cost, node }) = queue.pop() {
+                if cost > distance[node] {
+                    continue;
+                }
+                for &(next, edge) in &neighbours[node] {
+                    let candidate = cost + edge;
+                    if candidate < distance[next] {
+                        distance[next] = candidate;
+                        queue.push(QueueEntry {
+                            cost: candidate,
+                            node: next,
+                        });
+                    }
                 }
             }
+            distance
+        })
+        .collect()
+}
+
+fn validate_routing_program(program: &Program) -> Result<(), String> {
+    for op in program.ops() {
+        match op {
+            Op::Gate(gate) => {
+                if gate.targets.len() != gate.kind.arity() {
+                    return Err(format!(
+                        "`{}` has {} targets but takes {}",
+                        gate.kind.name(),
+                        gate.targets.len(),
+                        gate.kind.arity()
+                    ));
+                }
+                if gate.params.len() != gate.kind.param_count() {
+                    return Err(format!(
+                        "`{}` has {} parameters but takes {}",
+                        gate.kind.name(),
+                        gate.params.len(),
+                        gate.kind.param_count()
+                    ));
+                }
+
+                let wires: Vec<QubitId> = gate.wires().collect();
+                if let Some(wire) = wires.iter().find(|wire| wire.0 >= program.num_qubits) {
+                    return Err(format!(
+                        "`{}` uses q{} but the program only has {} qubits",
+                        gate.kind.name(),
+                        wire.0,
+                        program.num_qubits
+                    ));
+                }
+                for (index, wire) in wires.iter().enumerate() {
+                    if wires[..index].contains(wire) {
+                        return Err(format!(
+                            "`{}` uses q{} more than once",
+                            gate.kind.name(),
+                            wire.0
+                        ));
+                    }
+                }
+                if wires.len() > 2 {
+                    return Err(format!(
+                        "`{}{}` acts on {} qubits, the router only handles one and two qubit gates",
+                        "c".repeat(gate.controls.len()),
+                        gate.kind.name(),
+                        wires.len()
+                    ));
+                }
+            }
+            Op::Measure { qubit, result, .. } => {
+                if qubit.0 >= program.num_qubits {
+                    return Err(format!(
+                        "measurement uses q{} but the program only has {} qubits",
+                        qubit.0, program.num_qubits
+                    ));
+                }
+                if result.0 >= program.num_results {
+                    return Err(format!(
+                        "measurement writes r{} but the program only has {} results",
+                        result.0, program.num_results
+                    ));
+                }
+            }
+            Op::Reset { qubit, .. } if qubit.0 >= program.num_qubits => {
+                return Err(format!(
+                    "reset uses q{} but the program only has {} qubits",
+                    qubit.0, program.num_qubits
+                ));
+            }
+            _ => {}
         }
     }
-    weight
+    Ok(())
 }
 
 pub fn route(
@@ -677,23 +858,27 @@ pub fn route(
     coupling: &Coupling,
     calibration: Option<&Calibration>,
 ) -> Result<RouteStats, String> {
+    if coupling.qubits > MAX_ROUTING_QUBITS || coupling.edges.len() > MAX_COUPLING_EDGES {
+        return Err(format!(
+            "routing supports at most {MAX_ROUTING_QUBITS} qubits and {MAX_COUPLING_EDGES} edges"
+        ));
+    }
+    if let Some(&(a, b)) = coupling
+        .edges
+        .iter()
+        .find(|&&(a, b)| a == b || a >= coupling.qubits || b >= coupling.qubits)
+    {
+        return Err(format!(
+            "coupling edge {a}-{b} is not between two distinct in-range qubits"
+        ));
+    }
     if (program.num_qubits as usize) > coupling.qubits {
         return Err(format!(
             "the program needs {} qubits but the coupling map has {}",
             program.num_qubits, coupling.qubits
         ));
     }
-
-    for gate in program.gates() {
-        let wires = gate.wires().count();
-        if wires > 2 {
-            return Err(format!(
-                "`{}{}` acts on {wires} qubits, the router only handles one and two qubit gates",
-                "c".repeat(gate.controls.len()),
-                gate.kind.name()
-            ));
-        }
-    }
+    validate_routing_program(program)?;
 
     let mut router = Router {
         coupling,
@@ -777,12 +962,17 @@ pub fn elide_swaps(program: &mut Program) -> Relabelled {
                 && gate.kind == GateKind::Swap
                 && gate.controls.is_empty()
                 && let [a, b] = gate.targets[..]
+                && gate.has_valid_shape()
+                && a.index() < qubits
+                && b.index() < qubits
             {
                 wire.swap(a.index(), b.index());
                 swaps_removed += 1;
                 continue;
             }
-            block.ops.push(remap(op, |q| wire[q.index()]));
+            block.ops.push(remap(op, |q| {
+                wire.get(q.index()).copied().unwrap_or_else(|| q.index())
+            }));
         }
         if straight {
             final_layout = wire;
@@ -851,6 +1041,10 @@ mod tests {
         assert!(!explicit.connected(1, 2));
 
         assert!(Coupling::parse("nonsense").is_none());
+        assert!(Coupling::parse(&format!("line:{}", u64::from(MAX_WIRES) + 1)).is_none());
+        assert!(Coupling::parse(&format!("0-{}", usize::MAX)).is_none());
+        assert!(Coupling::parse(&format!("grid:{}x2", usize::MAX)).is_none());
+        assert!(Coupling::parse("full:1000").is_none());
     }
 
     #[test]
@@ -858,6 +1052,8 @@ mod tests {
         let line = Coupling::line(5);
         assert_eq!(line.shortest_path(0, 4).unwrap(), vec![0, 1, 2, 3, 4]);
         assert_eq!(line.shortest_path(2, 2).unwrap(), vec![2]);
+        assert_eq!(line.shortest_path(5, 5), None);
+        assert_eq!(line.shortest_path(0, 5), None);
         assert_eq!(
             Coupling::parse("0-1").unwrap().shortest_path(0, 1),
             Some(vec![0, 1])
@@ -930,5 +1126,126 @@ mod tests {
                 .unwrap_err()
                 .contains("needs 4 qubits")
         );
+    }
+
+    #[test]
+    fn malformed_coupling_is_rejected() {
+        let mut program = line_program(&[(0, 1)], 2);
+        let coupling = Coupling {
+            qubits: 2,
+            edges: vec![(0, 2)],
+        };
+        assert!(
+            route(&mut program, &coupling, None)
+                .unwrap_err()
+                .contains("in-range")
+        );
+
+        let mut empty = Program::new("empty", Profile::Base);
+        let oversized = Coupling {
+            qubits: MAX_ROUTING_QUBITS + 1,
+            edges: Vec::new(),
+        };
+        assert!(
+            route(&mut empty, &oversized, None)
+                .unwrap_err()
+                .contains("at most")
+        );
+    }
+
+    #[test]
+    fn malformed_program_is_rejected_before_routing() {
+        let coupling = Coupling::line(2);
+
+        let mut out_of_range = line_program(&[(0, 2)], 2);
+        assert!(
+            route(&mut out_of_range, &coupling, None)
+                .unwrap_err()
+                .contains("only has 2 qubits")
+        );
+
+        let mut duplicate = line_program(&[(0, 0)], 2);
+        assert!(
+            route(&mut duplicate, &coupling, None)
+                .unwrap_err()
+                .contains("more than once")
+        );
+
+        let mut bad_shape = line_program(&[(0, 1)], 2);
+        let Op::Gate(gate) = &mut bad_shape.blocks[0].ops[0] else {
+            unreachable!()
+        };
+        gate.targets.clear();
+        assert!(
+            route(&mut bad_shape, &coupling, None)
+                .unwrap_err()
+                .contains("targets")
+        );
+
+        let mut bad_measure = line_program(&[], 2);
+        bad_measure.num_results = 1;
+        bad_measure.blocks[0].ops.push(Op::Measure {
+            qubit: QubitId(2),
+            result: ResultId(0),
+            span: Span::DUMMY,
+        });
+        assert!(
+            route(&mut bad_measure, &coupling, None)
+                .unwrap_err()
+                .contains("measurement uses q2")
+        );
+
+        let mut bad_result = line_program(&[], 2);
+        bad_result.num_results = 1;
+        bad_result.blocks[0].ops.push(Op::Measure {
+            qubit: QubitId(0),
+            result: ResultId(1),
+            span: Span::DUMMY,
+        });
+        assert!(
+            route(&mut bad_result, &coupling, None)
+                .unwrap_err()
+                .contains("measurement writes r1")
+        );
+
+        let mut bad_reset = line_program(&[], 2);
+        bad_reset.blocks[0].ops.push(Op::Reset {
+            qubit: QubitId(2),
+            span: Span::DUMMY,
+        });
+        assert!(
+            route(&mut bad_reset, &coupling, None)
+                .unwrap_err()
+                .contains("reset uses q2")
+        );
+    }
+
+    #[test]
+    fn elide_swaps_preserves_malformed_wires_without_panicking() {
+        let mut program = line_program(&[], 1);
+        program.blocks[0].ops = vec![
+            Op::Gate(Gate {
+                kind: GateKind::Swap,
+                controls: Vec::new(),
+                targets: vec![QubitId(0), QubitId(2)],
+                params: Vec::new(),
+                span: Span::DUMMY,
+            }),
+            Op::Reset {
+                qubit: QubitId(2),
+                span: Span::DUMMY,
+            },
+        ];
+
+        let relabelled = elide_swaps(&mut program);
+        assert_eq!(relabelled.swaps_removed, 0);
+        assert_eq!(program.blocks[0].ops.len(), 2);
+        assert!(matches!(
+            program.blocks[0].ops[1],
+            Op::Reset {
+                qubit: QubitId(2),
+                ..
+            }
+        ));
     }
 }

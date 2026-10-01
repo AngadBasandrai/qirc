@@ -40,8 +40,6 @@ pub fn lower(module: &ast::Module) -> Lowered {
     }
 }
 
-const MAX_WIRES: u32 = 1 << 16;
-
 const MAX_INLINE_DEPTH: usize = if cfg!(target_arch = "wasm32") {
     32
 } else {
@@ -136,9 +134,196 @@ impl<'a> Lowerer<'a> {
         );
     }
 
-    fn warn(&mut self, message: impl Into<String>, span: Span, label: impl Into<String>) {
-        self.diagnostics
-            .push(Diagnostic::warning(message).primary(span, label));
+    fn scalar(&mut self, ty: &ast::Ty, span: Span) -> Option<Scalar> {
+        let scalar = match ty {
+            ast::Ty::Int(1) => Scalar::Bool,
+            ast::Ty::Int(bits @ 2..=64) => Scalar::Int(*bits),
+            ast::Ty::Float => Scalar::Float,
+            ast::Ty::Double => Scalar::Double,
+            ast::Ty::Int(bits) => {
+                self.error(
+                    format!("integer type i{bits} is not supported"),
+                    span,
+                    "qirc scalar integers must contain between 1 and 64 bits",
+                );
+                return None;
+            }
+            ast::Ty::Half => {
+                self.error(
+                    "half-precision floating point is not supported",
+                    span,
+                    "qirc supports float and double scalar arithmetic",
+                );
+                return None;
+            }
+            ast::Ty::X86Fp80 | ast::Ty::Fp128 => {
+                self.error(
+                    "extended-precision floating point is not supported",
+                    span,
+                    "qirc supports float and double scalar arithmetic",
+                );
+                return None;
+            }
+            _ => {
+                self.error(
+                    "a non-scalar type cannot be used in scalar arithmetic",
+                    span,
+                    "expected an integer, float, or double",
+                );
+                return None;
+            }
+        };
+        Some(scalar)
+    }
+
+    fn cast_scalar(&mut self, ty: &ast::Ty, span: Span) -> Option<Scalar> {
+        match ty {
+            ast::Ty::Ptr(_) => Some(Scalar::Int(64)),
+            _ => self.scalar(ty, span),
+        }
+    }
+
+    fn validate_constant_cast(
+        &mut self,
+        op: ast::CastOp,
+        from: Scalar,
+        to: Scalar,
+        value: Const,
+        span: Span,
+    ) -> Option<()> {
+        if !matches!(op, ast::CastOp::FPToSI | ast::CastOp::FPToUI) {
+            return Some(());
+        }
+        let bits = match to {
+            Scalar::Bool => 1,
+            Scalar::Int(bits) => bits,
+            _ => 0,
+        };
+        let value = from.normalize(value).as_f64();
+        let truncated = value.trunc();
+        let fits = from.is_float()
+            && bits > 0
+            && value.is_finite()
+            && match op {
+                ast::CastOp::FPToSI => {
+                    let limit = 2_f64.powi(bits as i32 - 1);
+                    truncated >= -limit && truncated < limit
+                }
+                ast::CastOp::FPToUI => truncated >= 0.0 && truncated < 2_f64.powi(bits as i32),
+                _ => unreachable!(),
+            };
+        if fits {
+            Some(())
+        } else {
+            self.error(
+                "floating-point to integer conversion is out of range",
+                span,
+                "this conversion is poison in LLVM",
+            );
+            None
+        }
+    }
+
+    fn validate_binary_type(&mut self, op: ast::BinOp, ty: Scalar, span: Span) -> Option<()> {
+        if op.is_float() == ty.is_float() {
+            return Some(());
+        }
+        let (message, label) = if op.is_float() {
+            (
+                "a floating-point binary opcode needs floating-point operands",
+                "this operand type is not floating point",
+            )
+        } else {
+            (
+                "an integer binary opcode needs integer operands",
+                "this operand type is not an integer",
+            )
+        };
+        self.error(message, span, label);
+        None
+    }
+
+    fn validate_cast_type(
+        &mut self,
+        op: ast::CastOp,
+        from_ty: &ast::Ty,
+        to_ty: &ast::Ty,
+        span: Span,
+    ) -> Option<(Scalar, Scalar)> {
+        let from = self.cast_scalar(from_ty, span)?;
+        let to = self.cast_scalar(to_ty, span)?;
+        let from_ptr = matches!(from_ty, ast::Ty::Ptr(_));
+        let to_ptr = matches!(to_ty, ast::Ty::Ptr(_));
+        let from_int = !from_ptr && !from.is_float();
+        let to_int = !to_ptr && !to.is_float();
+
+        let valid = match op {
+            ast::CastOp::Trunc => from_int && to_int && from.bits() > to.bits(),
+            ast::CastOp::ZExt | ast::CastOp::SExt => from_int && to_int && from.bits() < to.bits(),
+            ast::CastOp::FPTrunc => from.is_float() && to.is_float() && from.bits() > to.bits(),
+            ast::CastOp::FPExt => from.is_float() && to.is_float() && from.bits() < to.bits(),
+            ast::CastOp::FPToUI | ast::CastOp::FPToSI => from.is_float() && to_int,
+            ast::CastOp::UIToFP | ast::CastOp::SIToFP => from_int && to.is_float(),
+            ast::CastOp::PtrToInt => from_ptr && to_int,
+            ast::CastOp::IntToPtr => from_int && to_ptr,
+            ast::CastOp::BitCast => {
+                (from_ptr && to_ptr) || (!from_ptr && !to_ptr && from.bits() == to.bits())
+            }
+            ast::CastOp::AddrSpaceCast => from_ptr && to_ptr,
+        };
+        if valid {
+            Some((from, to))
+        } else {
+            self.error(
+                format!("invalid `{}` cast for these operand types", op.keyword()),
+                span,
+                "the source and destination types do not satisfy this cast's LLVM constraints",
+            );
+            None
+        }
+    }
+
+    fn validate_constant_binary(
+        &mut self,
+        op: ast::BinOp,
+        ty: Scalar,
+        left: Option<Const>,
+        right: Option<Const>,
+        span: Span,
+    ) -> Option<()> {
+        if op.is_float() {
+            return Some(());
+        }
+        if matches!(
+            op,
+            ast::BinOp::UDiv | ast::BinOp::SDiv | ast::BinOp::URem | ast::BinOp::SRem
+        ) && right.is_some_and(|value| ty.unsigned(value) == 0)
+        {
+            self.error(
+                "integer division by zero",
+                span,
+                "this expression is poison in LLVM",
+            );
+            return None;
+        }
+        if matches!(op, ast::BinOp::SDiv | ast::BinOp::SRem)
+            && left.is_some_and(|value| ty.signed(value) == signed_min(ty.bits()))
+            && right.is_some_and(|value| ty.signed(value) == -1)
+        {
+            self.error(
+                "signed integer division or remainder overflow",
+                span,
+                "this expression is poison in LLVM",
+            );
+            return None;
+        }
+        if matches!(op, ast::BinOp::Shl | ast::BinOp::LShr | ast::BinOp::AShr)
+            && right.is_some_and(|value| ty.unsigned(value) >= u64::from(ty.bits()))
+        {
+            self.error("oversized shift", span, "this expression is poison in LLVM");
+            return None;
+        }
+        Some(())
     }
 
     fn fresh_value(&mut self) -> ValueId {
@@ -205,7 +390,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn entry(&self) -> Option<(&'a ast::Function, Profile, u32, u32)> {
+    fn entry(&mut self) -> Option<(&'a ast::Function, Profile, u32, u32)> {
         let entry = self.module.entry_point()?;
         let attrs = self.module.attributes_of(&entry.sig);
 
@@ -216,10 +401,16 @@ impl<'a> Lowerer<'a> {
             .map(Profile::from_attribute)
             .unwrap_or(Profile::Unrestricted);
 
-        let declared_qubits =
-            attribute_count(&attrs, &["required_num_qubits", "num_required_qubits"]);
-        let declared_results =
-            attribute_count(&attrs, &["required_num_results", "num_required_results"]);
+        let mut count = |keys: &[&str]| match attribute_count(&attrs, keys) {
+            Ok(value) => value,
+            Err(message) => {
+                self.diagnostics
+                    .push(Diagnostic::error(message).with_code("QIR0202"));
+                0
+            }
+        };
+        let declared_qubits = count(&["required_num_qubits", "num_required_qubits"]);
+        let declared_results = count(&["required_num_results", "num_required_results"]);
 
         Some((entry, profile, declared_qubits, declared_results))
     }
@@ -331,7 +522,16 @@ impl<'a> Lowerer<'a> {
 
             let next_label = match &block.terminator {
                 ast::Terminator::Ret(value) => {
-                    return value.as_ref().and_then(|tv| self.binding_for(&tv.value));
+                    if let Some(tv) = value {
+                        if !matches!(tv.ty, ast::Ty::Ptr(_))
+                            && self.scalar(&tv.ty, tv.span).is_none()
+                        {
+                            self.bailed = true;
+                            return None;
+                        }
+                        return self.binding_for(&tv.value);
+                    }
+                    return None;
                 }
                 ast::Terminator::Unreachable => return None,
                 ast::Terminator::Br { target } => target.clone(),
@@ -340,6 +540,10 @@ impl<'a> Lowerer<'a> {
                     if_true,
                     if_false,
                 } => {
+                    if cond.ty != ast::Ty::Int(1) {
+                        self.bailed = true;
+                        return None;
+                    }
                     let Some(taken) = self.const_of(&cond.value) else {
                         self.bailed = true;
                         return None;
@@ -355,14 +559,37 @@ impl<'a> Lowerer<'a> {
                     default,
                     cases,
                 } => {
+                    if let Some((value, _)) =
+                        cases.iter().find(|(value, _)| value.ty != scrutinee.ty)
+                    {
+                        self.error(
+                            "a switch case has a different type from its scrutinee",
+                            value.span,
+                            "case and scrutinee types must match",
+                        );
+                        self.bailed = true;
+                        return None;
+                    }
+                    let Some(ty) = self.scalar(&scrutinee.ty, scrutinee.span) else {
+                        self.bailed = true;
+                        return None;
+                    };
+                    if ty.is_float() {
+                        self.bailed = true;
+                        return None;
+                    }
                     let Some(value) = self.const_of(&scrutinee.value) else {
                         self.bailed = true;
                         return None;
                     };
-                    let key = value.as_i64();
+                    let key = ty.normalize(value).as_i64();
                     cases
                         .iter()
-                        .find(|(candidate, _)| case_key(&candidate.value) == Some(key))
+                        .find(|(candidate, _)| {
+                            self.const_of(&candidate.value)
+                                .map(|value| ty.normalize(value).as_i64())
+                                == Some(key)
+                        })
                         .map(|(_, label)| label.clone())
                         .unwrap_or_else(|| default.clone())
                 }
@@ -477,7 +704,15 @@ impl<'a> Lowerer<'a> {
     fn lower_terminator(&mut self, term: &ast::Terminator, span: Span) -> Term {
         match term {
             ast::Terminator::Ret(None) => Term::Ret(None),
-            ast::Terminator::Ret(Some(tv)) => Term::Ret(self.operand(&tv.value, tv.span)),
+            ast::Terminator::Ret(Some(tv)) => {
+                let Some(ty) = self.cast_scalar(&tv.ty, tv.span) else {
+                    return Term::Unreachable;
+                };
+                match self.typed(&tv.value, ty, tv.span) {
+                    Some(value) => Term::Ret(Some(value)),
+                    None => Term::Unreachable,
+                }
+            }
             ast::Terminator::Unreachable => Term::Unreachable,
             ast::Terminator::Br { target } => match self.block_ids.get(target) {
                 Some(id) => Term::Br(*id),
@@ -495,9 +730,17 @@ impl<'a> Lowerer<'a> {
                 if_true,
                 if_false,
             } => {
-                let cond_operand = self
-                    .operand(&cond.value, cond.span)
-                    .unwrap_or(Operand::Const(Const::Bool(false)));
+                if cond.ty != ast::Ty::Int(1) {
+                    self.error(
+                        "a conditional branch needs an i1 condition",
+                        cond.span,
+                        "this condition is not a boolean",
+                    );
+                    return Term::Unreachable;
+                }
+                let Some(cond_operand) = self.typed(&cond.value, Scalar::Bool, cond.span) else {
+                    return Term::Unreachable;
+                };
                 let then_id = self.block_ids.get(if_true).copied();
                 let else_id = self.block_ids.get(if_false).copied();
                 match (then_id, else_id) {
@@ -517,9 +760,28 @@ impl<'a> Lowerer<'a> {
                 default,
                 cases,
             } => {
-                let on = self
-                    .operand(&scrutinee.value, scrutinee.span)
-                    .unwrap_or(Operand::Const(Const::Int(0)));
+                if let Some((value, _)) = cases.iter().find(|(value, _)| value.ty != scrutinee.ty) {
+                    self.error(
+                        "a switch case has a different type from its scrutinee",
+                        value.span,
+                        "case and scrutinee types must match",
+                    );
+                    return Term::Unreachable;
+                }
+                let Some(ty) = self.scalar(&scrutinee.ty, scrutinee.span) else {
+                    return Term::Unreachable;
+                };
+                if ty.is_float() {
+                    self.error(
+                        "a switch needs an integer scrutinee",
+                        scrutinee.span,
+                        "floating-point switches are not valid LLVM IR",
+                    );
+                    return Term::Unreachable;
+                }
+                let Some(on) = self.typed(&scrutinee.value, ty, scrutinee.span) else {
+                    return Term::Unreachable;
+                };
                 let Some(default_id) = self.block_ids.get(default).copied() else {
                     self.error(
                         "switch default targets an unknown block",
@@ -538,7 +800,11 @@ impl<'a> Lowerer<'a> {
                         );
                         continue;
                     };
-                    let Some(key) = case_key(&value.value) else {
+                    let Some(key) = self
+                        .typed(&value.value, ty, value.span)
+                        .and_then(Operand::constant)
+                        .map(Const::as_i64)
+                    else {
                         continue;
                     };
                     lowered.push((key, target));
@@ -559,16 +825,42 @@ impl<'a> Lowerer<'a> {
             ast::InstKind::Call(call) => self.lower_call(inst.result.as_deref(), call, span),
 
             ast::InstKind::Binary { op, ty, lhs, rhs } => {
-                let ty = Scalar::of(ty);
-                self.assign_pair(inst, ty, ty, lhs, rhs, |lhs, rhs| Expr::Binary {
-                    op: *op,
-                    lhs,
-                    rhs,
-                })
+                let Some(ty) = self.scalar(ty, span) else {
+                    return;
+                };
+                if self.validate_binary_type(*op, ty, span).is_none() {
+                    return;
+                }
+                let (Some(lhs), Some(rhs)) = (self.typed(lhs, ty, span), self.typed(rhs, ty, span))
+                else {
+                    return;
+                };
+                if self
+                    .validate_constant_binary(*op, ty, lhs.constant(), rhs.constant(), span)
+                    .is_none()
+                {
+                    return;
+                }
+                self.assign(
+                    inst.result.as_deref(),
+                    ty,
+                    Expr::Binary { op: *op, lhs, rhs },
+                    span,
+                )
             }
 
             ast::InstKind::ICmp { pred, ty, lhs, rhs } => {
-                let ty = Scalar::of(ty);
+                let Some(ty) = self.cast_scalar(ty, span) else {
+                    return;
+                };
+                if ty.is_float() {
+                    self.error(
+                        "icmp needs integer or pointer operands",
+                        span,
+                        "this operand type is floating point",
+                    );
+                    return;
+                }
                 self.assign_pair(inst, ty, Scalar::Bool, lhs, rhs, |lhs, rhs| Expr::ICmp {
                     pred: *pred,
                     ty,
@@ -578,7 +870,17 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::InstKind::FCmp { pred, ty, lhs, rhs } => {
-                let ty = Scalar::of(ty);
+                let Some(ty) = self.scalar(ty, span) else {
+                    return;
+                };
+                if !ty.is_float() {
+                    self.error(
+                        "fcmp needs floating-point operands",
+                        span,
+                        "this operand type is not floating point",
+                    );
+                    return;
+                }
                 self.assign_pair(inst, ty, Scalar::Bool, lhs, rhs, |lhs, rhs| Expr::FCmp {
                     pred: *pred,
                     ty,
@@ -592,7 +894,25 @@ impl<'a> Lowerer<'a> {
                 if_true,
                 if_false,
             } => {
-                let ty = Scalar::of(&if_true.ty);
+                if cond.ty != ast::Ty::Int(1) {
+                    self.error(
+                        "select needs an i1 condition",
+                        cond.span,
+                        "this condition is not a boolean",
+                    );
+                    return;
+                }
+                if if_true.ty != if_false.ty {
+                    self.error(
+                        "select needs matching arm types",
+                        span,
+                        "the true and false values have different types",
+                    );
+                    return;
+                }
+                let Some(ty) = self.scalar(&if_true.ty, span) else {
+                    return;
+                };
                 let (Some(c), Some(t), Some(f)) = (
                     self.typed(&cond.value, Scalar::Bool, span),
                     self.typed(&if_true.value, ty, span),
@@ -613,6 +933,10 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::InstKind::Cast { op, operand, to } => {
+                let Some((from, to_scalar)) = self.validate_cast_type(*op, &operand.ty, to, span)
+                else {
+                    return;
+                };
                 if let Some(qubit) = self.static_qubit(&operand.value)
                     && to.pointee_name() == Some("Qubit")
                 {
@@ -652,13 +976,19 @@ impl<'a> Lowerer<'a> {
                     return;
                 }
 
-                let from = Scalar::of(&operand.ty);
                 let Some(value) = self.typed(&operand.value, from, span) else {
                     return;
                 };
+                if let Operand::Const(constant) = value
+                    && self
+                        .validate_constant_cast(*op, from, to_scalar, constant, span)
+                        .is_none()
+                {
+                    return;
+                }
                 self.assign(
                     inst.result.as_deref(),
-                    Scalar::of(to),
+                    to_scalar,
                     Expr::Cast {
                         op: *op,
                         from,
@@ -669,7 +999,6 @@ impl<'a> Lowerer<'a> {
             }
 
             ast::InstKind::Phi { ty, incoming } => {
-                let ty = Scalar::of(ty);
                 if self.flattening() {
                     match self.phi_choice(inst) {
                         Some(binding) => self.bind(inst.result.as_deref(), binding),
@@ -677,6 +1006,9 @@ impl<'a> Lowerer<'a> {
                     }
                     return;
                 }
+                let Some(ty) = self.scalar(ty, span) else {
+                    return;
+                };
 
                 let mut lowered = Vec::new();
                 for (value, label) in incoming {
@@ -747,7 +1079,10 @@ impl<'a> Lowerer<'a> {
                 let Some(slot) = self.resolve_slot(&ptr.value) else {
                     return;
                 };
-                let Some(operand) = self.typed(&value.value, Scalar::of(&value.ty), span) else {
+                let Some(ty) = self.scalar(&value.ty, span) else {
+                    return;
+                };
+                let Some(operand) = self.typed(&value.value, ty, span) else {
                     return;
                 };
                 self.ops.push(Op::Store {
@@ -797,12 +1132,10 @@ impl<'a> Lowerer<'a> {
                 }
 
                 if let Some(slot) = self.resolve_slot(&ptr.value) {
-                    self.assign(
-                        inst.result.as_deref(),
-                        Scalar::of(ty),
-                        Expr::Load(slot),
-                        span,
-                    );
+                    let Some(ty) = self.scalar(ty, span) else {
+                        return;
+                    };
+                    self.assign(inst.result.as_deref(), ty, Expr::Load(slot), span);
                     return;
                 }
                 if let ast::Value::Global(global) = &ptr.value
@@ -831,15 +1164,23 @@ impl<'a> Lowerer<'a> {
                 self.propagate_binding(inst.result.as_deref(), &tv.value);
             }
 
-            ast::InstKind::ExtractValue { .. }
-            | ast::InstKind::InsertValue { .. }
-            | ast::InstKind::Fence => {}
+            ast::InstKind::ExtractValue { .. } | ast::InstKind::InsertValue { .. } => {
+                self.error(
+                    "aggregate value instructions are not supported",
+                    span,
+                    "dropping this value could change what the program computes",
+                );
+            }
+
+            // Fences only constrain host-memory ordering. The lowered quantum IR has no
+            // shared-memory operations to reorder, so a fence has no observable effect.
+            ast::InstKind::Fence => {}
 
             ast::InstKind::Unsupported { opcode } => {
-                self.warn(
-                    format!("ignoring unsupported instruction `{opcode}`"),
+                self.error(
+                    format!("unsupported instruction `{opcode}`"),
                     span,
-                    "this opcode has no quantum meaning",
+                    "dropping it could change what the program computes",
                 );
             }
         }
@@ -880,9 +1221,12 @@ impl<'a> Lowerer<'a> {
     }
 
     fn phi_choice(&mut self, inst: &ast::Instruction) -> Option<Binding> {
-        let ast::InstKind::Phi { incoming, .. } = &inst.kind else {
+        let ast::InstKind::Phi { ty, incoming } = &inst.kind else {
             return None;
         };
+        if !matches!(ty, ast::Ty::Ptr(_)) {
+            self.scalar(ty, inst.span)?;
+        }
         let label = self.previous_label.as_deref()?;
         let (value, _) = incoming.iter().find(|(_, block)| block == label)?;
         self.binding_for(value)
@@ -958,10 +1302,10 @@ impl<'a> Lowerer<'a> {
         }
 
         if self.module.declarations.iter().any(|d| d.name == callee) {
-            self.warn(
-                format!("ignoring call to unknown external function `{callee}`"),
+            self.error(
+                format!("unsupported external function `{callee}`"),
                 span,
-                "not a QIR intrinsic",
+                "dropping this call could change what the program computes",
             );
             return;
         }
@@ -1058,6 +1402,10 @@ impl<'a> Lowerer<'a> {
     fn binding_for(&mut self, value: &ast::Value) -> Option<Binding> {
         if let Some(qubit) = self.static_qubit(value) {
             return Some(Binding::Qubit(qubit));
+        }
+
+        if let Some(text) = self.resolve_label(value) {
+            return Some(Binding::Bytes(text.into_bytes()));
         }
 
         if let ast::Value::Local(name) = value {
@@ -1642,11 +1990,23 @@ impl<'a> Lowerer<'a> {
             ast::Value::Int(i) => Some(Operand::Const(Const::Int(*i as i64))),
             ast::Value::Float(f) => Some(Operand::Const(Const::Float(*f))),
             ast::Value::Bool(b) => Some(Operand::Const(Const::Bool(*b))),
-            ast::Value::Null
-            | ast::Value::ZeroInit
-            | ast::Value::NoneValue
-            | ast::Value::Undef
-            | ast::Value::Poison => Some(Operand::Const(Const::Int(0))),
+            ast::Value::Null | ast::Value::ZeroInit => Some(Operand::Const(Const::Int(0))),
+            ast::Value::Undef | ast::Value::Poison => {
+                self.error(
+                    "an undefined or poison value cannot be lowered safely",
+                    span,
+                    "choosing a concrete value here could change program behavior",
+                );
+                None
+            }
+            ast::Value::NoneValue => {
+                self.error(
+                    "`none` is not a scalar value",
+                    span,
+                    "expected an integer, floating point, or boolean operand",
+                );
+                None
+            }
             ast::Value::Local(name) => match self.env.get(name) {
                 Some(Binding::Value(operand)) => Some(*operand),
                 Some(Binding::ResultConst(b)) => Some(Operand::Const(Const::Bool(*b))),
@@ -1663,8 +2023,60 @@ impl<'a> Lowerer<'a> {
                 }
             },
             ast::Value::ConstExpr(expr) => match expr.as_ref() {
-                ast::ConstExpr::Cast { operand, .. } => self.operand(&operand.value, span),
-                _ => Some(Operand::Const(Const::Int(0))),
+                ast::ConstExpr::Cast { op, operand, to } => {
+                    let (from, to) = self.validate_cast_type(*op, &operand.ty, to, span)?;
+                    let value = self
+                        .operand(&operand.value, span)?
+                        .constant()
+                        .ok_or_else(|| {
+                            self.error(
+                                "a constant expression depends on a runtime value",
+                                span,
+                                "not a compile-time constant",
+                            );
+                        })
+                        .ok()?;
+                    self.validate_constant_cast(*op, from, to, value, span)?;
+                    Some(Operand::Const(op.apply(from, to, value)))
+                }
+                ast::ConstExpr::Binary { op, lhs, rhs } => {
+                    let ty = self.scalar(&lhs.ty, span)?;
+                    if lhs.ty != rhs.ty {
+                        self.error(
+                            "a constant binary expression has mismatched operand types",
+                            span,
+                            "both operands must have the same LLVM type",
+                        );
+                        return None;
+                    }
+                    self.validate_binary_type(*op, ty, span)?;
+                    let left = self
+                        .operand(&lhs.value, span)?
+                        .constant()
+                        .map(|value| ty.normalize(value));
+                    let right = self
+                        .operand(&rhs.value, span)?
+                        .constant()
+                        .map(|value| ty.normalize(value));
+                    let (Some(left), Some(right)) = (left, right) else {
+                        self.error(
+                            "a constant expression depends on a runtime value",
+                            span,
+                            "not a compile-time constant",
+                        );
+                        return None;
+                    };
+                    self.validate_constant_binary(*op, ty, Some(left), Some(right), span)?;
+                    Some(Operand::Const(op.apply(ty, left, right)))
+                }
+                ast::ConstExpr::GetElementPtr { .. } => {
+                    self.error(
+                        "a pointer constant expression cannot be used as a scalar",
+                        span,
+                        "this pointer operation is not supported here",
+                    );
+                    None
+                }
             },
             _ => None,
         }
@@ -1688,16 +2100,16 @@ fn inttoptr(value: &ast::Value) -> Option<(i128, Option<&str>)> {
     }
 }
 
-fn case_key(value: &ast::Value) -> Option<i64> {
-    match value {
-        ast::Value::Int(i) => Some(*i as i64),
-        ast::Value::Bool(b) => Some(i64::from(*b)),
-        _ => None,
-    }
-}
-
 fn wire(index: i128) -> Option<u32> {
     u32::try_from(index).ok().filter(|&i| i < MAX_WIRES)
+}
+
+fn signed_min(bits: u32) -> i64 {
+    if bits >= 64 {
+        i64::MIN
+    } else {
+        -(1_i64 << (bits - 1))
+    }
 }
 
 fn decode_label(bytes: &[u8]) -> String {
@@ -1705,16 +2117,220 @@ fn decode_label(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-fn attribute_count(attrs: &[&ast::Attribute], keys: &[&str]) -> u32 {
+fn attribute_count(attrs: &[&ast::Attribute], keys: &[&str]) -> Result<u32, String> {
     for key in keys {
-        if let Some(value) = attrs
-            .iter()
-            .find(|a| a.key() == *key)
-            .and_then(|a| a.value())
-            && let Ok(parsed) = value.parse::<u32>()
-        {
-            return parsed;
+        if let Some(attribute) = attrs.iter().find(|a| a.key() == *key) {
+            let Some(value) = attribute.value() else {
+                return Err(format!("the `{key}` attribute needs an integer value"));
+            };
+            return value.parse::<u32>().map_err(|_| {
+                format!("the `{key}` attribute value `{value}` does not fit in 32 bits")
+            });
         }
     }
-    0
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lower;
+    use crate::diag::Severity;
+    use crate::parse::parse_module;
+
+    fn rejects_source(source: &str, expected: &str) {
+        let (module, parse_diagnostics) = parse_module(source);
+        assert!(
+            parse_diagnostics.is_empty(),
+            "test source failed to parse: {parse_diagnostics:?}"
+        );
+        let lowered = lower(&module);
+        assert!(
+            lowered
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains(expected)),
+            "missing `{expected}` error: {:?}",
+            lowered
+                .diagnostics
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn rejects(body: &str, expected: &str) {
+        rejects_source(
+            &format!("define void @main() {{\nentry:\n{body}\nret void\n}}"),
+            expected,
+        );
+    }
+
+    #[test]
+    fn rejects_values_that_were_previously_silently_changed() {
+        rejects("%x = add i64 undef, 1", "undefined or poison");
+        rejects(
+            "%x = add i64 udiv (i64 1, i64 0), 3",
+            "integer division by zero",
+        );
+        rejects(
+            "%x = add i8 sdiv (i8 128, i8 -1), 0",
+            "signed integer division or remainder overflow",
+        );
+        rejects(
+            "%x = icmp eq i128 18446744073709551616, 0",
+            "integer type i128 is not supported",
+        );
+        rejects(
+            "%x = fadd half 0xH3C00, 0xH3C00",
+            "half-precision floating point is not supported",
+        );
+        rejects(
+            "%x = fptosi double 0x7FF8000000000000 to i64",
+            "conversion is out of range",
+        );
+        rejects(
+            "%x = fptoui double -1.0 to i8",
+            "conversion is out of range",
+        );
+        rejects(
+            "%x = extractvalue { i64 } { i64 1 }, 0",
+            "aggregate value instructions",
+        );
+        rejects(
+            "%x = atomicrmw add ptr null, i64 1 monotonic",
+            "unsupported instruction",
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_scalar_operations() {
+        rejects("%x = udiv i64 1, 0", "integer division by zero");
+        rejects(
+            "%x = sdiv i8 128, -1",
+            "signed integer division or remainder overflow",
+        );
+        rejects(
+            "%x = srem i8 128, -1",
+            "signed integer division or remainder overflow",
+        );
+        rejects("%x = shl i8 1, 8", "oversized shift");
+        rejects("%x = add double 1.0, 2.0", "integer binary opcode");
+        rejects("%x = fadd i64 1, 2", "floating-point binary opcode");
+        rejects("%x = icmp eq double 1.0, 2.0", "icmp needs");
+        rejects("%x = fcmp oeq i64 1, 2", "fcmp needs");
+        rejects("%x = select i8 1, i64 2, i64 3", "select needs an i1");
+        rejects(
+            "%x = select i1 true, i8 2, i16 3",
+            "select needs matching arm types",
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_cast_families_and_directions() {
+        rejects("%x = trunc double 1.0 to i32", "invalid `trunc` cast");
+        rejects("%x = fpext i32 1 to double", "invalid `fpext` cast");
+        rejects("%x = trunc i8 1 to i16", "invalid `trunc` cast");
+        rejects("%x = bitcast i32 1 to double", "invalid `bitcast` cast");
+    }
+
+    #[test]
+    fn rejects_switch_cases_with_a_different_type() {
+        rejects_source(
+            "define void @main() {\nentry:\nswitch i8 0, label %done [ i16 0, label %done ]\ndone:\nret void\n}",
+            "switch case has a different type",
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_flattened_phi_types() {
+        rejects_source(
+            "define i128 @main() {\nentry:\nbr label %join\njoin:\n%x = phi i128 [ 0, %entry ]\n%keep = add i64 1, 2\nret i128 %x\n}",
+            "integer type i128 is not supported",
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_declared_external_calls() {
+        let source = "declare void @mystery()\ndefine void @main() {\nentry:\ncall void @mystery()\nret void\n}";
+        let (module, parse_diagnostics) = parse_module(source);
+        assert!(parse_diagnostics.is_empty());
+        let lowered = lower(&module);
+        assert!(
+            lowered
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Error
+                    && d.message.contains("unsupported external function"))
+        );
+    }
+
+    #[test]
+    fn evaluates_supported_constant_expressions() {
+        let source =
+            "define void @main() {\nentry:\n%x = add i64 add (i64 1, i64 2), 3\nret void\n}";
+        let (module, parse_diagnostics) = parse_module(source);
+        assert!(parse_diagnostics.is_empty());
+        let lowered = lower(&module);
+        assert!(
+            lowered
+                .diagnostics
+                .iter()
+                .all(|d| d.severity != Severity::Error),
+            "{:?}",
+            lowered
+                .diagnostics
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_declared_wire_counts() {
+        for value in ["4294967296", "many"] {
+            let source = format!(
+                "define void @main() #0 {{\nentry:\nret void\n}}\nattributes #0 = {{ \"entry_point\" \"required_num_qubits\"=\"{value}\" }}"
+            );
+            let (module, parse_diagnostics) = parse_module(&source);
+            assert!(parse_diagnostics.is_empty());
+            let lowered = lower(&module);
+            assert!(
+                lowered
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == Some("QIR0202")),
+                "{value}: {:?}",
+                lowered.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn flattens_static_pointer_phis_before_scalar_validation() {
+        let source = r#"%Qubit = type opaque
+define void @main() #0 {
+entry:
+  %q0 = inttoptr i64 0 to %Qubit*
+  br label %join
+join:
+  %q = phi %Qubit* [ %q0, %entry ]
+  call void @__quantum__qis__h__body(%Qubit* %q)
+  ret void
+}
+declare void @__quantum__qis__h__body(%Qubit*)
+attributes #0 = { "entry_point" "required_num_qubits"="1" }
+"#;
+        let (module, parse_diagnostics) = parse_module(source);
+        assert!(parse_diagnostics.is_empty(), "{parse_diagnostics:?}");
+        let lowered = lower(&module);
+        assert!(
+            lowered
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Severity::Error),
+            "{:?}",
+            lowered.diagnostics
+        );
+        assert_eq!(lowered.program.gate_count(), 1);
+    }
 }

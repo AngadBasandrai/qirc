@@ -184,9 +184,16 @@ impl State {
     }
 
     pub fn apply(&mut self, matrix: &Matrix2, target: usize, controls: u64) {
-        if target >= self.n {
-            return;
-        }
+        assert!(target < self.n, "target qubit is outside the state vector");
+        assert_eq!(
+            controls & (1u64 << target),
+            0,
+            "target qubit cannot also be a control"
+        );
+        assert!(
+            controls < self.re.len() as u64,
+            "control mask addresses a qubit outside the state vector"
+        );
         let workers = if cfg!(target_arch = "wasm32") || self.n < PARALLEL_ABOVE {
             1
         } else {
@@ -209,9 +216,10 @@ impl State {
     }
 
     pub fn swap(&mut self, a: usize, b: usize, controls: u64) {
-        if a >= self.n || b >= self.n {
-            return;
-        }
+        assert!(
+            a < self.n && b < self.n,
+            "swap qubit is outside the state vector"
+        );
         simd::apply_swap(&mut self.re, &mut self.im, a, b, controls);
     }
 
@@ -477,5 +485,23 @@ mod tests {
         state.swap(0, 1, 1 << 2);
         assert!(state.qubit_probability(0) < 1e-12);
         assert!((state.qubit_probability(1) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the state vector")]
+    fn rejects_invalid_target() {
+        State::new(1).apply(&Matrix2::x(), 1, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "control mask addresses")]
+    fn parallel_state_rejects_invalid_control() {
+        State::new(PARALLEL_ABOVE).apply(&Matrix2::x(), 0, 1 << PARALLEL_ABOVE);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the state vector")]
+    fn rejects_invalid_swap() {
+        State::new(1).swap(0, 1, 0);
     }
 }

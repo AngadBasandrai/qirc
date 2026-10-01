@@ -18,6 +18,8 @@ const MAX_BYTES: u64 = if cfg!(target_arch = "wasm32") {
 const MAX_WORK: f64 = 2e10;
 const MAX_MEASURED: usize = 20;
 const MIN_PIECE: usize = 8;
+const MAX_SPLIT_MOVES: usize = 10_000;
+const MAX_SPLIT_WORK: usize = 20_000_000;
 
 enum Step {
     Gate(Gate, Vec<f64>),
@@ -75,16 +77,20 @@ impl Tree<'_> {
     }
 }
 
-fn crossing(weight: &[Vec<usize>], side: &[bool]) -> usize {
-    let mut total = 0;
-    for a in 0..side.len() {
-        for b in a + 1..side.len() {
-            if side[a] != side[b] {
-                total += weight[a][b];
-            }
+type EdgeWeights = HashMap<(usize, usize), usize>;
+
+fn edge(a: usize, b: usize) -> (usize, usize) {
+    if a < b { (a, b) } else { (b, a) }
+}
+
+fn crossing(weight: &EdgeWeights, side: &[bool]) -> usize {
+    weight.iter().fold(0usize, |total, (&(a, b), &w)| {
+        if side[a] != side[b] {
+            total.saturating_add(w)
+        } else {
+            total
         }
-    }
-    total
+    })
 }
 
 fn split(qubits: usize, pairs: &[(usize, usize)], low: usize, high: usize) -> Option<Vec<bool>> {
@@ -92,42 +98,89 @@ fn split(qubits: usize, pairs: &[(usize, usize)], low: usize, high: usize) -> Op
     if low > high {
         return None;
     }
-    let mut weight = vec![vec![0; qubits]; qubits];
+    let mut weight = EdgeWeights::new();
     for &(a, b) in pairs {
-        weight[a][b] += 1;
-        weight[b][a] += 1;
+        if a >= qubits || b >= qubits || a == b {
+            continue;
+        }
+        let count = weight.entry(edge(a, b)).or_default();
+        *count = count.saturating_add(1);
     }
     let fits = |side: &[bool]| (low..=high).contains(&side.iter().filter(|&&s| s).count());
     let mut side = (low..=high)
         .map(|at| (0..qubits).map(|q| q >= qubits - at).collect::<Vec<bool>>())
         .filter(|side| fits(side))
         .min_by_key(|side| crossing(&weight, side))?;
-    let mut current = crossing(&weight, &side);
-    loop {
-        let mut moves: Vec<Vec<usize>> = (0..qubits).map(|q| vec![q]).collect();
-        for a in 0..qubits {
-            for b in a + 1..qubits {
-                if side[a] != side[b] {
-                    moves.push(vec![a, b]);
-                }
+    let work_per_move = qubits.saturating_add(weight.len().saturating_mul(2)).max(1);
+    let max_moves = MAX_SPLIT_MOVES.min(MAX_SPLIT_WORK / work_per_move).max(1);
+    for _ in 0..max_moves {
+        let mut delta = vec![0i128; qubits];
+        for (&(a, b), &w) in &weight {
+            let w = w as i128;
+            if side[a] == side[b] {
+                delta[a] = delta[a].saturating_add(w);
+                delta[b] = delta[b].saturating_add(w);
+            } else {
+                delta[a] = delta[a].saturating_sub(w);
+                delta[b] = delta[b].saturating_sub(w);
             }
         }
-        let better = moves.into_iter().find_map(|flips| {
-            let mut trial = side.clone();
-            for q in flips {
-                trial[q] = !trial[q];
+
+        enum Move {
+            Flip(usize),
+            Swap(usize, usize),
+        }
+        let count = side.iter().filter(|&&value| value).count();
+        let mut best: Option<(i128, Move)> = None;
+        let mut consider = |change: i128, movement: Move| {
+            if change < 0 && best.as_ref().is_none_or(|(found, _)| change < *found) {
+                best = Some((change, movement));
             }
-            let cost = crossing(&weight, &trial);
-            (fits(&trial) && cost < current).then_some((trial, cost))
-        });
-        match better {
-            Some((trial, cost)) => {
-                side = trial;
-                current = cost;
+        };
+
+        for q in 0..qubits {
+            let next = if side[q] { count - 1 } else { count + 1 };
+            if (low..=high).contains(&next) {
+                consider(delta[q], Move::Flip(q));
+            }
+        }
+        let mut yes: Vec<usize> = (0..qubits).filter(|&q| side[q]).collect();
+        let mut no: Vec<usize> = (0..qubits).filter(|&q| !side[q]).collect();
+        yes.sort_by_key(|&q| (delta[q], q));
+        no.sort_by_key(|&q| (delta[q], q));
+
+        // For each vertex, only the lowest-delta non-neighbour can be the best
+        // zero-correction swap. Every skipped candidate is an actual sparse edge.
+        for &a in &yes {
+            if let Some(&b) = no.iter().find(|&&b| !weight.contains_key(&edge(a, b))) {
+                consider(delta[a].saturating_add(delta[b]), Move::Swap(a, b));
+            }
+        }
+        let mut crossing_edges: Vec<((usize, usize), usize)> = weight
+            .iter()
+            .filter(|&(&(a, b), _)| side[a] != side[b])
+            .map(|(&pair, &value)| (pair, value))
+            .collect();
+        crossing_edges.sort_unstable_by_key(|&((a, b), _)| (a, b));
+        for ((a, b), value) in crossing_edges {
+            let (a, b) = if side[a] { (a, b) } else { (b, a) };
+            let correction = 2i128.saturating_mul(value as i128);
+            consider(
+                delta[a].saturating_add(delta[b]).saturating_add(correction),
+                Move::Swap(a, b),
+            );
+        }
+
+        match best {
+            Some((_, Move::Flip(q))) => side[q] = !side[q],
+            Some((_, Move::Swap(a, b))) => {
+                side[a] = false;
+                side[b] = true;
             }
             None => return Some(side),
         }
     }
+    None
 }
 
 fn partition(
@@ -661,15 +714,35 @@ mod tests {
             .collect();
         let side = split(40, &pairs, 10, 30).unwrap();
         let weight = {
-            let mut weight = vec![vec![0; 40]; 40];
+            let mut weight = EdgeWeights::new();
             for &(a, b) in &pairs {
-                weight[a][b] += 1;
-                weight[b][a] += 1;
+                *weight.entry(edge(a, b)).or_default() += 1;
             }
             weight
         };
         assert_eq!(crossing(&weight, &side), 2, "{side:?}");
         assert!(split(70, &pairs, 40, 30).is_none());
+    }
+
+    #[test]
+    fn splits_sparse_wide_graph_without_a_dense_matrix() {
+        let side = split(10_000, &[], 1, 30).unwrap();
+        assert!((1..=30).contains(&side.iter().filter(|&&value| value).count()));
+        let balanced = split(20_000, &[], 10_000, 10_000).unwrap();
+        assert_eq!(balanced.iter().filter(|&&value| value).count(), 10_000);
+    }
+
+    #[test]
+    fn split_search_does_not_return_a_partially_improved_cut() {
+        let pairs: Vec<(usize, usize)> = (0..300).map(|q| (q, q + 300)).collect();
+        let side = split(600, &pairs, 300, 300).unwrap();
+        let weight = pairs
+            .iter()
+            .fold(EdgeWeights::new(), |mut weights, &(a, b)| {
+                *weights.entry(edge(a, b)).or_default() += 1;
+                weights
+            });
+        assert_eq!(crossing(&weight, &side), 0);
     }
     fn chained(rng: &mut Rng) -> String {
         let mut text = "OPENQASM 2.0;

@@ -28,7 +28,7 @@ fn keyword_type(text: &str) -> Option<Ty> {
         && !rest.is_empty()
         && rest.bytes().all(|b| b.is_ascii_digit())
     {
-        return Some(Ty::Int(rest.parse().unwrap_or(32)));
+        return rest.parse().ok().map(Ty::Int);
     }
     Some(match text {
         "void" => Ty::Void,
@@ -182,6 +182,63 @@ impl<'a> Parser<'a> {
                 .with_code("QIR0100")
                 .primary(span, label),
         );
+    }
+
+    fn u64_literal(&mut self, token: Token, description: &str) -> Option<u64> {
+        match self.text(token).parse() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                self.error(
+                    format!("{description} is too large"),
+                    token.span,
+                    "does not fit in an unsigned 64-bit integer",
+                );
+                None
+            }
+        }
+    }
+
+    fn i128_literal(&mut self, token: Token) -> Option<i128> {
+        match self.text(token).parse() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                self.error(
+                    "integer literal is too large",
+                    token.span,
+                    "does not fit in a signed 128-bit integer",
+                );
+                None
+            }
+        }
+    }
+
+    fn float_literal(&mut self, token: Token) -> Option<f64> {
+        let literal = self.text(token);
+        match lex::parse_float(literal) {
+            // LLVM hexadecimal floating-point constants are explicit IEEE bit
+            // patterns and may legitimately encode infinities or NaNs.
+            Some(value)
+                if value.is_finite() || literal.starts_with("0x") || literal.starts_with("0X") =>
+            {
+                Some(value)
+            }
+            None => {
+                self.error(
+                    "invalid floating point literal",
+                    token.span,
+                    "cannot represent this literal",
+                );
+                None
+            }
+            Some(_) => {
+                self.error(
+                    "floating point literal is not finite",
+                    token.span,
+                    "infinity and NaN are not supported",
+                );
+                None
+            }
+        }
     }
 
     fn starts_new_line(&self, index: usize) -> bool {
@@ -1049,7 +1106,7 @@ impl<'a> Parser<'a> {
                 let mut indices = Vec::new();
                 while self.eat(TokenKind::Comma) {
                     let token = self.expect(TokenKind::IntLit)?;
-                    indices.push(self.text(token).parse::<u64>().unwrap_or(0));
+                    indices.push(self.u64_literal(token, "aggregate index")?);
                 }
                 Some(InstKind::ExtractValue { aggregate, indices })
             }
@@ -1061,7 +1118,7 @@ impl<'a> Parser<'a> {
                 let mut indices = Vec::new();
                 while self.eat(TokenKind::Comma) {
                     let token = self.expect(TokenKind::IntLit)?;
-                    indices.push(self.text(token).parse::<u64>().unwrap_or(0));
+                    indices.push(self.u64_literal(token, "aggregate index")?);
                 }
                 Some(InstKind::InsertValue {
                     aggregate,
@@ -1183,7 +1240,7 @@ impl<'a> Parser<'a> {
             TokenKind::LBracket => {
                 self.bump();
                 let len_token = self.expect(TokenKind::IntLit)?;
-                let len = self.text(len_token).parse::<u64>().unwrap_or(0);
+                let len = self.u64_literal(len_token, "array length")?;
                 self.eat_keyword("x");
                 let elem = self.parse_type()?;
                 self.expect(TokenKind::RBracket)?;
@@ -1213,7 +1270,7 @@ impl<'a> Parser<'a> {
                         self.eat_keyword("x");
                     }
                     let len_token = self.expect(TokenKind::IntLit)?;
-                    let len = self.text(len_token).parse::<u64>().unwrap_or(0);
+                    let len = self.u64_literal(len_token, "vector length")?;
                     self.eat_keyword("x");
                     let elem = self.parse_type()?;
                     self.expect(TokenKind::Greater)?;
@@ -1322,13 +1379,11 @@ impl<'a> Parser<'a> {
             }
             TokenKind::IntLit => {
                 self.bump();
-                Some(Value::Int(self.text(token).parse::<i128>().unwrap_or(0)))
+                Some(Value::Int(self.i128_literal(token)?))
             }
             TokenKind::FloatLit => {
                 self.bump();
-                Some(Value::Float(
-                    lex::parse_float(self.text(token)).unwrap_or(0.0),
-                ))
+                Some(Value::Float(self.float_literal(token)?))
             }
             TokenKind::CStringLit => {
                 self.bump();
@@ -1457,5 +1512,36 @@ impl<'a> Parser<'a> {
         }
         self.expect(close)?;
         Some(items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_module;
+
+    fn rejects(source: &str) {
+        let (_, diagnostics) = parse_module(source);
+        assert!(
+            !diagnostics.is_empty(),
+            "source unexpectedly parsed: {source}"
+        );
+    }
+
+    #[test]
+    fn rejects_numeric_overflow_instead_of_defaulting_to_zero() {
+        rejects("define void @main(i999999999999999999999 %x) { ret void }");
+        rejects("@x = global [18446744073709551616 x i8] zeroinitializer");
+        rejects(
+            "define void @main() {\n%x = extractvalue { i1 } { i1 true }, 18446744073709551616\nret void\n}",
+        );
+        rejects(
+            "define void @main() {\n%x = add i128 340282366920938463463374607431768211456, 1\nret void\n}",
+        );
+        rejects("define void @main() {\n%x = fadd double 0xFFFFFFFFFFFFFFFFF, 0.0\nret void\n}");
+        rejects("define void @main() {\n%x = fadd double 1.0e999, 0.0\nret void\n}");
+        let (_, diagnostics) = parse_module(
+            "define void @main() {\n%x = fadd double 0x7FF8000000000000, 0.0\nret void\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 }

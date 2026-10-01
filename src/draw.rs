@@ -84,12 +84,15 @@ fn columns(program: &Program, latex: bool) -> Vec<Column> {
         let mut frontier = vec![0usize; n];
         let mut local: Vec<Column> = Vec::new();
         for op in &block.ops {
-            let wires: Vec<usize> = op
-                .qubits()
-                .iter()
-                .map(|q| q.index())
-                .filter(|&q| q < n)
-                .collect();
+            let wires: Vec<usize> = op.qubits().iter().map(|q| q.index()).collect();
+            let valid_shape = match op {
+                Op::Gate(gate) => gate.has_valid_shape(),
+                Op::Measure { result, .. } => result.0 < program.num_results,
+                _ => true,
+            };
+            if !valid_shape || wires.is_empty() || wires.iter().any(|&q| q >= n) {
+                continue;
+            }
             let (Some(&lo), Some(&hi)) = (wires.iter().min(), wires.iter().max()) else {
                 continue;
             };
@@ -334,4 +337,73 @@ text {{ font: 12px ui-monospace, Menlo, Consolas, monospace; fill: #14202b; }}
     out.push_str(&body);
     out.push_str("</svg>\n");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diag::Span;
+
+    #[test]
+    fn drawings_skip_malformed_operations() {
+        let mut program = Program::new("malformed", Profile::Unrestricted);
+        program.num_qubits = 1;
+        program.num_results = 1;
+        program.blocks.push(Block {
+            id: BlockId(0),
+            label: "entry".into(),
+            ops: vec![
+                Op::Gate(Gate {
+                    kind: GateKind::X,
+                    controls: vec![QubitId(2)],
+                    targets: vec![QubitId(0)],
+                    params: Vec::new(),
+                    span: Span::DUMMY,
+                }),
+                Op::Gate(Gate {
+                    kind: GateKind::X,
+                    controls: vec![QubitId(0)],
+                    targets: Vec::new(),
+                    params: Vec::new(),
+                    span: Span::DUMMY,
+                }),
+                Op::Gate(Gate {
+                    kind: GateKind::X,
+                    controls: vec![QubitId(0)],
+                    targets: vec![QubitId(0)],
+                    params: Vec::new(),
+                    span: Span::DUMMY,
+                }),
+                Op::Measure {
+                    qubit: QubitId(2),
+                    result: ResultId(0),
+                    span: Span::DUMMY,
+                },
+                Op::Measure {
+                    qubit: QubitId(0),
+                    result: ResultId(2),
+                    span: Span::DUMMY,
+                },
+                Op::Reset {
+                    qubit: QubitId(2),
+                    span: Span::DUMMY,
+                },
+                Op::Gate(Gate {
+                    kind: GateKind::H,
+                    controls: Vec::new(),
+                    targets: vec![QubitId(0)],
+                    params: Vec::new(),
+                    span: Span::DUMMY,
+                }),
+            ],
+            term: Term::Ret(None),
+            span: Span::DUMMY,
+        });
+
+        let latex = quantikz(&program);
+        let image = svg(&program);
+        assert!(latex.contains("\\gate{H}"), "{latex}");
+        assert!(image.contains(">H</text>"), "{image}");
+        assert!(!image.contains("M r2"), "{image}");
+    }
 }

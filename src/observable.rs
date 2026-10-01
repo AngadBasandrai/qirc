@@ -3,7 +3,7 @@ use std::fmt;
 use crate::calibration::Calibration;
 use crate::cut;
 use crate::equiv;
-use crate::ir::{Expr, Op, Program, QubitId, ResultId, Term, keep_marked};
+use crate::ir::{Expr, MAX_WIRES, Op, Program, QubitId, ResultId, Term, keep_marked};
 use crate::pauli;
 use crate::route::remap;
 use crate::simulator::bits::{self, Bits};
@@ -139,22 +139,20 @@ impl Observable {
     pub fn parse(text: &str) -> Result<Observable, String> {
         let mut terms = Vec::new();
         let mut qubits = 0;
-        for chunk in text.replace('-', "+-").split('+') {
-            let chunk = chunk.trim();
-            if chunk.is_empty() {
-                continue;
-            }
-            let (negative, body) = match chunk.strip_prefix('-') {
-                Some(rest) => (true, rest),
-                None => (false, chunk),
-            };
+        for (negative, body) in signed_terms(text)? {
             let mut term = Product {
                 weight: if negative { -1.0 } else { 1.0 },
                 paulis: Vec::new(),
             };
             for word in body.replace('*', " ").split_whitespace() {
                 if let Ok(value) = word.parse::<f64>() {
+                    if !value.is_finite() {
+                        return Err(format!("coefficient `{word}` must be finite"));
+                    }
                     term.weight *= value;
+                    if !term.weight.is_finite() {
+                        return Err("the observable coefficient is too large".into());
+                    }
                     continue;
                 }
                 let mut chars = word.chars().peekable();
@@ -166,6 +164,12 @@ impl Observable {
                     let qubit: usize = digits.parse().map_err(|_| {
                         format!("`{word}` needs a qubit number after each Pauli letter")
                     })?;
+                    if qubit >= MAX_WIRES as usize {
+                        return Err(format!(
+                            "qubit {qubit} is above the maximum id {}",
+                            MAX_WIRES - 1
+                        ));
+                    }
                     if term.paulis.iter().any(|&(q, _)| q == qubit) {
                         return Err(format!("qubit {qubit} appears twice in one term"));
                     }
@@ -179,7 +183,10 @@ impl Observable {
                         }
                     };
                     term.paulis.push((qubit, pauli));
-                    qubits = qubits.max(qubit + 1);
+                    let count = qubit
+                        .checked_add(1)
+                        .ok_or_else(|| format!("qubit number `{qubit}` is too large"))?;
+                    qubits = qubits.max(count);
                 }
             }
             term.paulis.sort_by_key(|&(q, _)| q);
@@ -211,6 +218,39 @@ impl Observable {
             })
             .sum()
     }
+}
+
+fn signed_terms(text: &str) -> Result<Vec<(bool, &str)>, String> {
+    let bytes = text.as_bytes();
+    let mut terms = Vec::new();
+    let mut start = 0;
+    let mut negative = false;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if !matches!(byte, b'+' | b'-') || index > 0 && matches!(bytes[index - 1], b'e' | b'E') {
+            continue;
+        }
+        let chunk = text[start..index].trim();
+        if chunk.is_empty() {
+            if terms.is_empty() && text[..index].trim().is_empty() {
+                negative = byte == b'-';
+                start = index + 1;
+                continue;
+            }
+            return Err("the observable contains an empty term".into());
+        }
+        terms.push((negative, chunk));
+        negative = byte == b'-';
+        start = index + 1;
+    }
+    let chunk = text[start..].trim();
+    if chunk.is_empty() {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err("the observable contains an empty term".into());
+    }
+    terms.push((negative, chunk));
+    Ok(terms)
 }
 
 impl fmt::Display for Observable {
@@ -345,6 +385,9 @@ pub fn noisy_expectation(
     shots: u64,
     seed: u64,
 ) -> Result<Sampled, String> {
+    if shots == 0 {
+        return Err("a noisy expectation needs at least one shot".into());
+    }
     check(program, observable)?;
     let config = ExecConfig {
         shots,
@@ -364,9 +407,13 @@ pub fn extrapolate(
     shots: u64,
     seed: u64,
 ) -> Result<([Sampled; 3], Sampled), String> {
+    if shots == 0 {
+        return Err("zero-noise extrapolation needs at least one shot".into());
+    }
     let mut values = [(0.0, 0.0); 3];
     for (value, scale) in values.iter_mut().zip([1.0, 2.0, 3.0]) {
-        *value = noisy_expectation(program, observable, &calibration.scaled(scale), shots, seed)?;
+        let scaled = calibration.try_scaled(scale)?;
+        *value = noisy_expectation(program, observable, &scaled, shots, seed)?;
     }
     let [(one, a), (two, b), (three, c)] = values;
     let spread = (9.0 * a * a + 9.0 * b * b + c * c).sqrt();
@@ -447,9 +494,30 @@ mod tests {
         assert_eq!(o.to_string(), "Z0 Z1 + 0.5 X2 - 2 Y3 - 1 + Z150");
         assert_eq!(o.qubits, 151);
         assert_eq!(Observable::parse("-Z0").unwrap().to_string(), "-Z0");
-        for bad in ["", "Z", "Q0", "Z0 Z0"] {
+        let scientific = Observable::parse("1e-3 Z0 - 2e+2 X1").unwrap();
+        assert_eq!(scientific.terms[0].weight, 1e-3);
+        assert_eq!(scientific.terms[1].weight, -2e2);
+        for bad in ["", "Z", "Q0", "Z0 Z0", "1e999 Z0", "Z0 +"] {
             assert!(Observable::parse(bad).is_err(), "{bad}");
         }
+        assert!(Observable::parse(&format!("Z{}", usize::MAX)).is_err());
+    }
+
+    #[test]
+    fn sampled_expectations_need_shots() {
+        let program = Program::new("empty", crate::ir::Profile::Base);
+        let observable = Observable::parse("1").unwrap();
+        let calibration = Calibration::default();
+        assert!(
+            noisy_expectation(&program, &observable, &calibration, 0, 1)
+                .unwrap_err()
+                .contains("at least one")
+        );
+        assert!(
+            extrapolate(&program, &observable, &calibration, 0, 1)
+                .unwrap_err()
+                .contains("at least one")
+        );
     }
 
     fn random_terms(

@@ -26,8 +26,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check --manifest-path python/Cargo.toml
+      - run: cargo clippy --all-targets --manifest-path python/Cargo.toml -- -D warnings
 
   playground:
     runs-on: ubuntu-latest
@@ -53,15 +58,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ./python pytest
-      - run: pytest -q python/tests
+      - run: python -m pip install ./python pytest
+      - run: python -m pytest -q python/tests
+
+  qiskit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "./python[qiskit]" pytest
+      - run: python -m pytest -q python/tests/test_qirc.py -k qiskit_plugin
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --locked
+      - run: cargo test --manifest-path target/package/qirc-compiler-*/Cargo.toml
 
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: cargo check --all-targets
+      - run: cargo check --all-targets --manifest-path python/Cargo.toml
+      - run: cargo check --target wasm32-unknown-unknown --manifest-path web/Cargo.toml
 
   emitted-qir:
     runs-on: ubuntu-latest

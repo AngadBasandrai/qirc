@@ -1,5 +1,6 @@
 use super::matrix::{C64, Matrix2, matrix_for};
 use super::state::Rng;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::iter;
 
@@ -34,21 +35,23 @@ pub struct Mps {
     pub discarded: f64,
 }
 
-fn spread(weight: &[Vec<usize>], position: &[usize]) -> usize {
-    let mut total = 0;
+type Interactions = Vec<HashMap<usize, usize>>;
+
+fn spread(weight: &Interactions, position: &[usize]) -> usize {
+    let mut total = 0usize;
     for (a, row) in weight.iter().enumerate() {
-        for (b, &w) in row.iter().enumerate().skip(a + 1) {
-            total += w * position[a].abs_diff(position[b]);
+        for (&b, &w) in row.iter().filter(|(b, _)| **b > a) {
+            total = total.saturating_add(w.saturating_mul(position[a].abs_diff(position[b])));
         }
     }
     total
 }
 
-fn degree(weight: &[Vec<usize>], q: usize) -> usize {
-    weight[q].iter().filter(|&&w| w > 0).count()
+fn degree(weight: &Interactions, q: usize) -> usize {
+    weight[q].len()
 }
 
-fn cuthill_mckee(weight: &[Vec<usize>], start: usize) -> Vec<usize> {
+fn cuthill_mckee(weight: &Interactions, start: usize) -> Vec<usize> {
     let n = weight.len();
     let mut placed = vec![false; n];
     let mut order = Vec::with_capacity(n);
@@ -64,7 +67,7 @@ fn cuthill_mckee(weight: &[Vec<usize>], start: usize) -> Vec<usize> {
         }
         while let Some(q) = queue.pop_front() {
             order.push(q);
-            let mut next: Vec<usize> = (0..n).filter(|&r| !placed[r] && weight[q][r] > 0).collect();
+            let mut next: Vec<usize> = weight[q].keys().copied().filter(|&r| !placed[r]).collect();
             next.sort_by_key(|&r| (degree(weight, r), r));
             for r in next {
                 placed[r] = true;
@@ -82,12 +85,17 @@ fn cuthill_mckee(weight: &[Vec<usize>], start: usize) -> Vec<usize> {
 
 pub(crate) fn arrangement(program: &Program) -> Option<Vec<usize>> {
     let n = program.num_qubits as usize;
-    let mut weight = vec![vec![0; n]; n];
+    let mut weight: Interactions = (0..n).map(|_| HashMap::new()).collect();
     for gate in program.gates() {
         let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
         if let [a, b] = wires[..] {
-            weight[a][b] += 1;
-            weight[b][a] += 1;
+            if a >= n || b >= n || a == b {
+                return None;
+            }
+            let ab = weight[a].entry(b).or_default();
+            *ab = ab.saturating_add(1);
+            let ba = weight[b].entry(a).or_default();
+            *ba = ba.saturating_add(1);
         }
     }
     let identity: Vec<usize> = (0..n).collect();
@@ -484,13 +492,30 @@ impl Mps {
     }
 
     pub fn apply(&mut self, gate: &Gate, params: &[f64]) {
+        assert!(supports(gate), "gate is not supported by the MPS simulator");
+        assert_eq!(
+            params.len(),
+            gate.kind.param_count(),
+            "gate has the wrong number of parameters"
+        );
+        let wires: Vec<usize> = gate.wires().map(|q| q.index()).collect();
+        assert!(
+            wires.iter().all(|&q| q < self.site_of.len()),
+            "gate qubit is outside the MPS simulator"
+        );
+        for (i, &wire) in wires.iter().enumerate() {
+            assert!(
+                !wires[..i].contains(&wire),
+                "a gate cannot use the same qubit more than once"
+            );
+        }
         match (gate.kind, &gate.controls[..], &gate.targets[..]) {
             (GateKind::Swap, [], [a, b]) => self.two(a.index(), b.index(), &swap_matrix()),
             (kind, [], [t]) => self.one(t.index(), &matrix_for(kind, params)),
             (kind, [c], [t]) => {
                 self.two(c.index(), t.index(), &controlled(&matrix_for(kind, params)))
             }
-            _ => {}
+            _ => unreachable!("supported gate shape was checked above"),
         }
     }
 
@@ -668,5 +693,32 @@ impl Mps {
                 .collect();
         }
         vector[0]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Mps, arrangement};
+    use crate::diag::Span;
+    use crate::ir::{Gate, GateKind, Profile, Program, QubitId};
+
+    #[test]
+    fn sparse_arrangement_does_not_allocate_a_dense_matrix() {
+        let mut program = Program::new("wide", Profile::Unrestricted);
+        program.num_qubits = 1 << 16;
+        assert_eq!(arrangement(&program), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "not supported")]
+    fn apply_rejects_unsupported_gate() {
+        let gate = Gate {
+            kind: GateKind::Swap,
+            controls: Vec::new(),
+            targets: vec![QubitId(0)],
+            params: Vec::new(),
+            span: Span::DUMMY,
+        };
+        Mps::new(1, 2).apply(&gate, &[]);
     }
 }

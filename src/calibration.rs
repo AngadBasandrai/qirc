@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::f64::consts::PI;
 use std::hash::Hash;
 
-use crate::ir::{Gate, GateKind, Op, Program};
+use crate::ir::{Gate, GateKind, MAX_WIRES, Op, Program};
 use crate::phase;
 use crate::route::Coupling;
 
@@ -102,7 +102,20 @@ impl Calibration {
                     "line {number}: `{word}` must be a time of at least 0"
                 )),
             };
-            let qubit = |word: &str| word.parse::<usize>().map_err(|_| shape());
+            let coherence = |word: &str| match word.parse::<f64>() {
+                Ok(v) if v.is_finite() && v > 0.0 && v <= f64::MAX / 1000.0 => Ok(v * 1000.0),
+                _ => Err(format!(
+                    "line {number}: `{word}` must be a coherence time above 0"
+                )),
+            };
+            let qubit = |word: &str| {
+                word.parse::<usize>()
+                    .ok()
+                    .filter(|&q| q < MAX_WIRES as usize)
+                    .ok_or_else(|| {
+                        format!("line {number}: qubit `{word}` must be below {MAX_WIRES}")
+                    })
+            };
             let number_in = |word: &str, low: f64, high: f64| match word.parse::<f64>() {
                 Ok(v) if v.is_finite() && v > low && v <= high => Ok(v),
                 _ => Err(format!(
@@ -153,12 +166,12 @@ impl Calibration {
                 }
                 ["t1", q, t] => {
                     let q = qubit(q)?;
-                    calibration.t1.insert(q, length(t)? * 1000.0);
+                    calibration.t1.insert(q, coherence(t)?);
                     q
                 }
                 ["t2", q, t] => {
                     let q = qubit(q)?;
-                    calibration.t2.insert(q, length(t)? * 1000.0);
+                    calibration.t2.insert(q, coherence(t)?);
                     q
                 }
                 ["frequency", q, ghz] => {
@@ -208,7 +221,10 @@ impl Calibration {
                 }
                 _ => return Err(shape()),
             };
-            calibration.qubits = calibration.qubits.max(highest + 1);
+            let count = highest
+                .checked_add(1)
+                .ok_or_else(|| format!("line {number}: qubit number is too large"))?;
+            calibration.qubits = calibration.qubits.max(count);
         }
         if calibration.cx.is_empty() {
             return Err("the calibration lists no cx edges".into());
@@ -226,6 +242,23 @@ impl Calibration {
         scaled.t2.values_mut().for_each(|t| *t /= factor);
         scaled.detuning.values_mut().for_each(|d| *d *= factor);
         scaled
+    }
+
+    pub fn try_scaled(&self, factor: f64) -> Result<Calibration, String> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err("a calibration noise scale must be finite and above 0".into());
+        }
+        let scaled = self.scaled(factor);
+        if scaled
+            .t1
+            .values()
+            .chain(scaled.t2.values())
+            .any(|value| !value.is_finite() || *value <= 0.0)
+            || scaled.detuning.values().any(|value| !value.is_finite())
+        {
+            return Err("the calibration noise scale produces an invalid value".into());
+        }
+        Ok(scaled)
     }
 
     pub fn coupling(&self) -> Coupling {
@@ -475,9 +508,25 @@ mod tests {
             ("cx 0 0 0.1", "two different"),
             ("readout 0", "expected"),
             ("single 0 0.1", "no cx"),
+            ("cx 0 1 0.1\nt1 0 0", "above 0"),
+            ("cx 0 1 0.1\nt2 0 0", "above 0"),
+            ("cx 0 1 0.1\nt1 0 1e308", "above 0"),
         ] {
             let error = Calibration::parse(text).unwrap_err();
             assert!(error.contains(message), "{error}");
         }
+        let huge = format!("cx 0 {} 0.1", usize::MAX);
+        assert!(Calibration::parse(&huge).unwrap_err().contains("below"));
+    }
+
+    #[test]
+    fn validates_noise_scaling() {
+        let calibration = Calibration::parse("cx 0 1 0.01\nt1 0 20\n").unwrap();
+        assert!(calibration.try_scaled(2.0).is_ok());
+        for factor in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            assert!(calibration.try_scaled(factor).is_err(), "{factor}");
+        }
+        let tiny = Calibration::parse("cx 0 1 0.01\nt1 0 5e-324\n").unwrap();
+        assert!(tiny.try_scaled(f64::MAX).is_err());
     }
 }

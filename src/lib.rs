@@ -1,4 +1,5 @@
 #![cfg_attr(docsrs, doc = include_str!("../README.md"))]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod ast;
 pub mod calibration;
@@ -7,6 +8,7 @@ pub mod cost;
 mod cut;
 pub mod diag;
 pub mod draw;
+#[deny(clippy::undocumented_unsafe_blocks)]
 pub mod driver;
 pub mod equiv;
 pub mod explain;

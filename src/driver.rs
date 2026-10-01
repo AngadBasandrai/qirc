@@ -42,6 +42,8 @@ use crate::transpile::{self, GateSet, TranspileStats};
 use crate::verify;
 
 const DIFF_QUBITS: usize = 20;
+// Recursive lowering supports programs thousands of calls deep; keep the stack large enough for
+// that documented limit. The compiler thread is joined before `compile` returns.
 const COMPILER_STACK: usize = 256 << 20;
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_DRAWN: usize = 200_000;
@@ -151,9 +153,11 @@ impl Color {
 }
 
 #[cfg(windows)]
+#[deny(clippy::undocumented_unsafe_blocks)]
 fn enable_ansi() -> bool {
     use std::os::windows::io::AsRawHandle;
 
+    // These declarations match the Win32 console API signatures.
     unsafe extern "system" {
         fn GetConsoleMode(handle: *mut std::ffi::c_void, mode: *mut u32) -> i32;
         fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
@@ -163,6 +167,8 @@ fn enable_ansi() -> bool {
     let handle = io::stderr().as_raw_handle();
     let mut mode = 0u32;
 
+    // SAFETY: `handle` is borrowed from the live stderr stream, `mode` is a valid out-pointer,
+    // and both calls leave ownership of the handle with the standard library.
     unsafe {
         GetConsoleMode(handle, &mut mode) != 0
             && SetConsoleMode(handle, mode | VIRTUAL_TERMINAL_PROCESSING) != 0

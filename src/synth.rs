@@ -51,6 +51,14 @@ impl Unitary {
     }
 
     pub fn of(gates: &[Gate], wires: &[QubitId]) -> Option<Unitary> {
+        if wires.len() > 3
+            || wires
+                .iter()
+                .enumerate()
+                .any(|(index, wire)| wires[..index].contains(wire))
+        {
+            return None;
+        }
         gates
             .iter()
             .try_fold(Unitary::identity(wires.len()), |product, gate| {
@@ -59,6 +67,9 @@ impl Unitary {
     }
 
     fn gate(gate: &Gate, wires: &[QubitId]) -> Option<Unitary> {
+        if !gate.has_valid_shape() {
+            return None;
+        }
         let bit = |q: &QubitId| wires.iter().position(|w| w == q);
         let controls = gate
             .controls
@@ -71,9 +82,15 @@ impl Unitary {
             .iter()
             .map(|p| p.constant().map(Const::as_f64))
             .collect::<Option<Vec<_>>>()?;
+        if params.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
 
         let dim = 1 << wires.len();
         let matrix = matrix_for(gate.kind, &params);
+        if !matrix.multiply(matrix.adjoint()).is_identity(EPSILON) {
+            return None;
+        }
         let mut cells = vec![ZERO; dim * dim];
 
         for column in 0..dim {
@@ -1103,5 +1120,65 @@ pub fn commute(a: &Gate, b: &Gate) -> bool {
     match (Unitary::gate(a, &wires), Unitary::gate(b, &wires)) {
         (Some(x), Some(y)) => x.after(&y).equals(&y.after(&x)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unitary_rejects_unsupported_wire_sets() {
+        let gate = Gate {
+            kind: GateKind::X,
+            controls: Vec::new(),
+            targets: vec![QubitId(0)],
+            params: Vec::new(),
+            span: Span::DUMMY,
+        };
+        let too_wide = [QubitId(0), QubitId(1), QubitId(2), QubitId(3)];
+        assert!(Unitary::of(std::slice::from_ref(&gate), &too_wide).is_none());
+        assert!(Unitary::of(std::slice::from_ref(&gate), &[QubitId(0), QubitId(0)]).is_none());
+        assert!(Unitary::of(&[gate], &too_wide[..3]).is_some());
+    }
+
+    #[test]
+    fn unitary_rejects_malformed_gates() {
+        let wires = [QubitId(0), QubitId(1), QubitId(2)];
+        let gate = |kind, controls, targets, params| Gate {
+            kind,
+            controls,
+            targets,
+            params,
+            span: Span::DUMMY,
+        };
+        let malformed = [
+            gate(GateKind::X, vec![], vec![], vec![]),
+            gate(GateKind::X, vec![], vec![QubitId(0), QubitId(1)], vec![]),
+            gate(
+                GateKind::X,
+                vec![],
+                vec![QubitId(0)],
+                vec![Operand::Const(Const::Float(0.5))],
+            ),
+            gate(GateKind::Rx, vec![], vec![QubitId(0)], vec![]),
+            gate(
+                GateKind::Rx,
+                vec![],
+                vec![QubitId(0)],
+                vec![Operand::Const(Const::Float(f64::NAN))],
+            ),
+            gate(
+                GateKind::X,
+                vec![QubitId(0), QubitId(0)],
+                vec![QubitId(1)],
+                vec![],
+            ),
+            gate(GateKind::X, vec![QubitId(0)], vec![QubitId(0)], vec![]),
+            gate(GateKind::Swap, vec![], vec![QubitId(0), QubitId(0)], vec![]),
+        ];
+        for gate in malformed {
+            assert!(Unitary::of(&[gate], &wires).is_none());
+        }
     }
 }
