@@ -189,6 +189,30 @@ input[type="number"] { width: 8ch; }
   white-space: nowrap;
 }
 .ghost:hover { color: var(--ink); }
+.tour {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+.tour[hidden] { display: none; }
+.tour { position: sticky; top: 8px; z-index: 5; box-shadow: 0 6px 18px rgb(0 0 0 / 0.08); }
+.tour-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.tour-badge { font: 600 12px/1 var(--mono); background: var(--accent); color: var(--accent-ink); padding: 5px 8px; border-radius: 5px; }
+.tour-count { font: 500 13px var(--mono); color: var(--muted); }
+.tour-title { font: 600 20px/1.2 var(--sans); flex: 1; }
+.tour-clock { font: 500 13px var(--mono); color: var(--muted); }
+.tour-clock.late { color: var(--warn); }
+.tour-pace { display: flex; gap: 3px; height: 4px; }
+.tour-pace span { background: var(--line); border-radius: 2px; }
+.tour-pace span.done { background: var(--accent); opacity: 0.45; }
+.tour-pace span.now { background: var(--accent); }
+.tour-body { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.tour-caption { color: var(--muted); font-size: 14px; max-width: 110ch; }
+.tour-step { font: 500 12px var(--mono); color: var(--muted); }
 .stats {
   display: flex;
   flex-wrap: wrap;
@@ -406,8 +430,28 @@ footer a { color: var(--accent); }
       <button type="button" class="ghost" id="open">Open file</button>
       <input type="file" id="file" accept=".ll,.qasm,.txt,text/plain" hidden>
       <button type="button" class="ghost" id="share" hidden>Copy link</button>
+      <button type="button" class="ghost" id="tour-start" title="Step through the live demo">Showcase</button>
     </div>
   </header>
+
+  <div class="tour" id="tour" hidden>
+    <div class="tour-head">
+      <span class="tour-badge">Showcase</span>
+      <span class="tour-count" id="tour-count"></span>
+      <span class="tour-title" id="tour-title"></span>
+      <span class="tour-clock" id="tour-clock"></span>
+    </div>
+    <div class="tour-pace" id="tour-pace"></div>
+    <div class="tour-body">
+      <span class="tour-caption" id="tour-caption"></span>
+      <div class="group">
+        <span class="tour-step" id="tour-step"></span>
+        <button type="button" class="ghost" id="tour-back">← Back</button>
+        <button type="button" class="run" id="tour-next">Next →</button>
+        <button type="button" class="ghost" id="tour-exit">Exit</button>
+      </div>
+    </div>
+  </div>
 
   <div class="controls">
     <div class="field">Emit
@@ -1500,6 +1544,329 @@ attributes #1 = { "irreversible" }
 !3 = !{i32 1, !"dynamic_result_management", i1 false}
 </script>
 
+<script type="text/plain" id="qsloop" data-example="A loop and a helper, as Q# emits them" data-file="qsharp_loop.ll" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
+; ModuleID = 'GhzLoop'
+source_filename = "GhzLoop"
+
+%Qubit = type opaque
+%Result = type opaque
+
+@qubits = internal constant [4 x %Qubit*] [%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*), %Qubit* inttoptr (i64 3 to %Qubit*)]
+
+define internal void @Entangle(%Qubit* %control, %Qubit* %target) {
+entry:
+  %same = icmp eq %Qubit* %control, %target
+  br i1 %same, label %skip, label %apply
+
+apply:
+  call void @__quantum__qis__cx__body(%Qubit* %control, %Qubit* %target)
+  br label %skip
+
+skip:
+  ret void
+}
+
+define void @main() #0 {
+entry:
+  %head = getelementptr [4 x %Qubit*], [4 x %Qubit*]* @qubits, i64 0, i64 0
+  %q0 = load %Qubit*, %Qubit** %head, align 8
+  call void @__quantum__qis__h__body(%Qubit* %q0)
+  br label %header
+
+header:
+  %i = phi i64 [ 0, %entry ], [ %next, %body ]
+  %more = icmp slt i64 %i, 3
+  br i1 %more, label %body, label %measure
+
+body:
+  %ctrl.ptr = getelementptr [4 x %Qubit*], [4 x %Qubit*]* @qubits, i64 0, i64 %i
+  %ctrl = load %Qubit*, %Qubit** %ctrl.ptr, align 8
+  %next = add nuw nsw i64 %i, 1
+  %tgt.ptr = getelementptr [4 x %Qubit*], [4 x %Qubit*]* @qubits, i64 0, i64 %next
+  %tgt = load %Qubit*, %Qubit** %tgt.ptr, align 8
+  call void @Entangle(%Qubit* %ctrl, %Qubit* %tgt)
+  br label %header
+
+measure:
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 2 to %Qubit*), %Result* inttoptr (i64 2 to %Result*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 3 to %Qubit*), %Result* inttoptr (i64 3 to %Result*))
+  ret void
+}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+
+declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
+
+declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly)
+
+attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="base_profile" "required_num_qubits"="4" "required_num_results"="4" }
+
+!llvm.module.flags = !{!0, !1}
+
+!0 = !{i32 1, !"qir_major_version", i32 1}
+!1 = !{i32 7, !"qir_minor_version", i32 0}
+</script>
+
+<script type="text/plain" id="pyqirsimple" data-example="PyQIR sample with redundant gates" data-file="pyqir_simple.ll" data-settings='{"emit": "circuit", "observable": "", "vary": "", "bind": "", "gates": "rz-sx-cx", "epsilon": "", "coupling": "", "device": ""}'>
+; ModuleID = 'grover'
+source_filename = "grover"
+
+%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* null)
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__ccx__body(%Qubit* null, %Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__s__body(%Qubit* null)
+  call void @__quantum__qis__t__adj(%Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__rz__body(double 0x400921FB54442D18, %Qubit* null)
+  call void @__quantum__qis__swap__body(%Qubit* null, %Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* null, %Result* null)
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  ret void
+}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__x__body(%Qubit*)
+declare void @__quantum__qis__s__body(%Qubit*)
+declare void @__quantum__qis__t__adj(%Qubit*)
+declare void @__quantum__qis__rz__body(double, %Qubit*)
+declare void @__quantum__qis__ccx__body(%Qubit*, %Qubit*, %Qubit*)
+declare void @__quantum__qis__swap__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
+
+attributes #0 = { "entry_point" "num_required_qubits"="3" "num_required_results"="2" "output_labeling_schema" "qir_profiles"="base_profile" }
+
+!llvm.module.flags = !{!0, !1, !2, !3}
+
+!0 = !{i32 1, !"qir_major_version", i32 1}
+!1 = !{i32 7, !"qir_minor_version", i32 0}
+!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
+!3 = !{i32 1, !"dynamic_result_management", i1 false}
+</script>
+
+<script type="text/plain" id="mod54" data-example="mod5_4, T count reduction" data-file="mod5_4.qasm" data-settings='{"emit": "cost", "observable": "", "vary": "", "bind": "", "gates": "h,s,t,cx", "epsilon": "", "coupling": "", "device": ""}'>
+// mod5_4 from the RevLib benchmarks, a standard test for T count reduction.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[5];
+x q[4];
+h q[4];
+cx q[3], q[4];
+tdg q[4];
+cx q[0], q[4];
+t q[4];
+cx q[3], q[4];
+tdg q[4];
+cx q[0], q[4];
+t q[3];
+t q[4];
+cx q[0], q[3];
+t q[0];
+tdg q[3];
+cx q[0], q[3];
+cx q[3], q[4];
+tdg q[4];
+cx q[2], q[4];
+t q[4];
+cx q[3], q[4];
+tdg q[4];
+cx q[2], q[4];
+t q[3];
+t q[4];
+cx q[2], q[3];
+t q[2];
+tdg q[3];
+cx q[2], q[3];
+h q[4];
+cx q[3], q[4];
+h q[4];
+cx q[2], q[4];
+tdg q[4];
+cx q[1], q[4];
+t q[4];
+cx q[2], q[4];
+tdg q[4];
+cx q[1], q[4];
+t q[2];
+t q[4];
+cx q[1], q[2];
+t q[1];
+tdg q[2];
+cx q[1], q[2];
+h q[4];
+cx q[2], q[4];
+h q[4];
+cx q[1], q[4];
+tdg q[4];
+cx q[0], q[4];
+t q[4];
+cx q[1], q[4];
+tdg q[4];
+cx q[0], q[4];
+t q[1];
+t q[4];
+cx q[0], q[1];
+t q[0];
+tdg q[1];
+cx q[0], q[1];
+h q[4];
+cx q[1], q[4];
+cx q[0], q[4];
+</script>
+
+<script type="text/plain" id="badprofile" data-example="A Base Profile program that branches" data-file="bad_profile.ll" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
+; ModuleID = 'bad_profile'
+source_filename = "bad_profile"
+
+%Qubit = type opaque
+%Result = type opaque
+
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* null)
+  call void @__quantum__qis__mz__body(%Qubit* null, %Result* null)
+  %bit = call i1 @__quantum__qis__read_result__body(%Result* null)
+  br i1 %bit, label %flip, label %done
+
+flip:
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+  br label %done
+
+done:
+  ret void
+}
+
+declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__x__body(%Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly)
+declare i1 @__quantum__qis__read_result__body(%Result*)
+
+attributes #0 = { "entry_point" "qir_profiles"="base_profile" "required_num_qubits"="2" "required_num_results"="1" }
+</script>
+
+<script type="text/plain" id="star" data-example="Star circuit for a line of qubits" data-file="star.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "rz-sx-cx", "epsilon": "", "coupling": "line:4", "device": ""}'>
+// Qubit 0 talks to every other qubit, but on a line of four only
+// neighbours can interact, so the router has to bring them together.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[4];
+creg c[4];
+ry(1.1) q[0];
+ry(0.6) q[2];
+cx q[0], q[1];
+cx q[0], q[2];
+cx q[0], q[3];
+cx q[2], q[1];
+measure q -> c;
+</script>
+
+<script type="text/plain" id="wide" data-example="Rotation chain on the state vector" data-file="wide.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
+// A rotation spread along a chain of qubits by CNOTs. Not Clifford, so it
+// runs on the state vector: 2^n amplitudes, updated with AVX2 on every core.
+OPENQASM 3.0;
+include "stdgates.inc";
+const int n = 20;
+qubit[n] q;
+bit[2] c;
+ry(0.9) q[0];
+for int i in [0:n - 2] {
+  cx q[i], q[i + 1];
+}
+c[0] = measure q[0];
+c[1] = measure q[n - 1];
+</script>
+
+<script type="text/plain" id="cliffordt" data-example="40 qubits with 3 T gates, stabilizer rank" data-file="clifford_t40.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
+// A 40 qubit GHZ chain with three T gates. Clifford circuits with a few
+// T gates run as a sum of stabilizer states, exactly, at any width.
+OPENQASM 3.0;
+include "stdgates.inc";
+qubit[40] q;
+bit[3] c;
+h q[0];
+for int i in [0:38] {
+  cx q[i], q[i + 1];
+}
+t q[5];
+t q[20];
+t q[35];
+h q[5];
+h q[20];
+h q[35];
+c[0] = measure q[5];
+c[1] = measure q[20];
+c[2] = measure q[35];
+</script>
+
+<script type="text/plain" id="chain60" data-example="60 qubit chain, matrix product state" data-file="chain60.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
+// Three layers of rotations and CNOTs along 60 qubits: far past any state
+// vector. qirc cuts it into pieces that fit, or with --bond 32 runs it as a
+// matrix product state that reports how much it had to truncate.
+OPENQASM 3.0;
+include "stdgates.inc";
+qubit[60] q;
+bit[4] c;
+for int layer in [0:2] {
+  for int i in [0:59] {
+    ry(0.2 + 0.05 * i + 0.4 * layer) q[i];
+  }
+  for int i in [0:58] {
+    cx q[i], q[i + 1];
+  }
+}
+c[0] = measure q[0];
+c[1] = measure q[20];
+c[2] = measure q[40];
+c[3] = measure q[59];
+</script>
+
+<script type="text/plain" id="ghz5m" data-example="Measured GHZ on a noisy device" data-file="ghz5_measured.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": "noisy"}'>
+// A five qubit GHZ state, measured. On a perfect device every shot reads
+// 00000 or 11111; on a noisy one, some shots read anything else.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[5];
+creg c[5];
+h q[0];
+cx q[0], q[1];
+cx q[1], q[2];
+cx q[2], q[3];
+cx q[3], q[4];
+measure q -> c;
+</script>
+
+<script type="text/plain" data-calibration="readout.cal">
+# perfect gates, but readout errors from 5% on qubit 0 to 15% on qubit 4
+cx 0 1 0
+cx 1 2 0
+cx 2 3 0
+cx 3 4 0
+readout 0 0.05
+readout 1 0.075
+readout 2 0.1
+readout 3 0.125
+readout 4 0.15
+</script>
+
+<script type="text/plain" data-calibration="pair.cal">
+# a two qubit device with a 3% CNOT error
+cx 0 1 0.03
+single 0 0.005
+single 1 0.005
+readout 0 0.02
+readout 1 0.02
+</script>
+
 <script>
 const WORKER = `
 let wasm = null;
@@ -1528,6 +1895,13 @@ onmessage = async (event) => {
     try {
       const { instance } = await WebAssembly.instantiate(event.data.bytes, {});
       wasm = instance.exports;
+      for (const [name, text] of event.data.files || []) {
+        const [nameAt, nameLen] = put(name);
+        const [textAt, textLen] = put(text);
+        wasm.define(nameAt, nameLen, textAt, textLen);
+        wasm.release(nameAt, nameLen);
+        wasm.release(textAt, textLen);
+      }
       postMessage({ ready: true });
     } catch (error) {
       postMessage({ failed: String(error) });
@@ -1578,6 +1952,11 @@ const examples = [...document.querySelectorAll("script[data-example]")].map((nod
   settings: JSON.parse(node.dataset.settings || "{}"),
   text: node.textContent.replace(/^\n/, ""),
 }));
+
+const CALIBRATIONS = [...document.querySelectorAll("script[data-calibration]")].map((node) => [
+  node.dataset.calibration,
+  node.textContent.replace(/^\n/, ""),
+]);
 
 let emit = "run";
 let view = "text";
@@ -1841,7 +2220,7 @@ function startWorker() {
       }
     };
   });
-  worker.postMessage({ bytes: bytes.slice(0) });
+  worker.postMessage({ bytes: bytes.slice(0), files: CALIBRATIONS });
   return ready;
 }
 
@@ -1878,7 +2257,8 @@ async function run() {
   running = true;
   queued = false;
   const tokens = words(command.value);
-  const main = tokens.includes("--color") ? tokens.join(" ") : [...tokens, "--color", "always"].join(" ");
+  const plain = tokens.includes("--color") || tokens[0] === "surface" || tokens[0] === "explain";
+  const main = plain ? tokens.join(" ") : [...tokens, "--color", "always"].join(" ");
   const file = tokens.find((t) => /\.(ll|qasm)$/.test(t));
   const jobs = [main];
   if (file) jobs.push(jsonJob(tokens), [file, "-O0", "--emit", "json", "--color", "never"].join(" "));
@@ -1950,6 +2330,7 @@ function show(reply, tokens) {
   showZoom();
   if (stepping) showStep(stepping.ops.length);
   $("view-results").innerHTML = drawResults(tokens[0] === "diff" ? "" : result.stdout);
+  tourScroll();
 }
 
 function summarize(program) {
@@ -2594,6 +2975,208 @@ if (!framed) {
   });
 }
 
+// The showcase: eight demos for a talk, each a few runs of the playground itself.
+const STAR = "--gates rz-sx-cx --coupling line:4";
+const ENERGY = "--observable Z0*Z1*+*0.5*X0*+*0.5*X1 --minimize";
+const TOUR = [
+  {
+    title: "From a quantum program to results",
+    caption: "A loop over an array of qubits and a helper function, as Q# emits them. qirc runs the classical half at compile time, leaves four gates and simulates them.",
+    seconds: 30,
+    steps: [
+      ["qsharp_loop.ll", "qsharp_loop.ll -O1 --shots 1000 --seed 7", "text"],
+      ["qsharp_loop.ll", "qsharp_loop.ll -O1 --emit circuit", "circuit"],
+      ["qsharp_loop.ll", "qsharp_loop.ll -O1 --emit qasm3", "text"],
+    ],
+  },
+  {
+    title: "The optimiser, and proof it changed nothing",
+    caption: "13 gates become 2, mod5_4 goes from 28 T gates to 8, and qirc diff proves the optimised program equivalent to the original.",
+    seconds: 30,
+    steps: [
+      ["redundant.ll", "redundant.ll -O3 --emit ir", "text"],
+      ["mod5_4.qasm", "mod5_4.qasm -O0 --gates h,s,t,cx --emit cost", "text"],
+      ["mod5_4.qasm", "mod5_4.qasm -O2 --gates h,s,t,cx --emit cost", "text"],
+      ["mod5_4.qasm", "diff mod5_4.qasm -O2 --gates h,s,t,cx", "text"],
+    ],
+  },
+  {
+    title: "Mistakes are reported at the source",
+    caption: "A program that claims the Base Profile but branches on a measurement: an error code, the exact line, and a longer explanation.",
+    seconds: 15,
+    steps: [
+      ["bad_profile.ll", "bad_profile.ll", "text"],
+      ["bad_profile.ll", "explain QIR0300", "text"],
+    ],
+  },
+  {
+    title: "Ready for real hardware",
+    caption: "Qubit 0 talks to every other qubit, but on a line of four only neighbours interact and the chip only has rz, sx and cx. qirc rebuilds and routes it, and the answer does not change.",
+    seconds: 25,
+    steps: [
+      ["star.qasm", "star.qasm -O2 --emit circuit", "circuit"],
+      ["star.qasm", "star.qasm -O2 --emit circuit " + STAR, "circuit"],
+      ["star.qasm", "star.qasm -O2 --shots 100000 --seed 7 --no-state " + STAR, "results"],
+      ["star.qasm", "diff star.qasm -O2 " + STAR, "text"],
+    ],
+  },
+  {
+    title: "Past 30 qubits",
+    caption: "A state vector doubles with every qubit, so qirc looks at the program first and picks a simulator that fits it: a tableau, a bit vector, cutting or a matrix product state.",
+    seconds: 25,
+    steps: [
+      ["ghz1000.ll", "ghz1000.ll -O1 --observable X0*X1*Y2*+*Z0*Z999 --shots 1000 --seed 7", "text", "measurement over"],
+      ["adder.qasm", "adder.qasm -O1 --shots 100 --seed 7 --no-state", "text", "measurement over"],
+      ["halves.qasm", "halves.qasm -O1 --shots 1000 --seed 7 --no-state", "results"],
+      ["chain60.qasm", "chain60.qasm -O1 --bond 32 --shots 1000 --seed 7 --no-state", "text", "measurement over"],
+    ],
+  },
+  {
+    title: "Real devices are noisy",
+    caption: "A five qubit GHZ state should read 00000 or 11111. With readout errors it often does not, until qirc mitigates them. Then zero noise extrapolation, and echo pulses for a drifting qubit.",
+    seconds: 30,
+    steps: [
+      ["ghz5_measured.qasm", "ghz5_measured.qasm -O1 --shots 4000 --seed 7 --no-state --calibration readout.cal --noisy", "results"],
+      ["ghz5_measured.qasm", "ghz5_measured.qasm -O1 --shots 4000 --seed 7 --no-state --calibration readout.cal --noisy --mitigate", "text", "mitigated measurement"],
+      ["ghz5.qasm", "ghz5.qasm -O1 --calibration line5.cal --noisy --observable Z0*Z4 --zne --shots 4000 --seed 2 --no-state", "text", "expectation of"],
+      ["idle.qasm", "idle.qasm -O1 --calibration detuned.cal --noisy --shots 4000 --seed 7 --no-state", "results"],
+      ["idle.qasm", "idle.qasm -O1 --calibration detuned.cal --noisy --dd --shots 4000 --seed 7 --no-state", "results"],
+    ],
+  },
+  {
+    title: "Planning for error corrected machines",
+    caption: "Code distance, magic state factories, physical qubits and runtime from the compiled program, then the surface code itself, simulated and decoded, against the model the estimate assumes.",
+    seconds: 25,
+    steps: [
+      ["mod5_4.qasm", "mod5_4.qasm -O2 --emit resources", "text"],
+      ["mod5_4.qasm", "surface --error 0.001 --shots 200000", "text"],
+    ],
+  },
+  {
+    title: "Variational circuits",
+    caption: "OpenQASM 3 inputs become parameters. qirc finds the ground energy of Z0 Z1 + 0.5 X0 + 0.5 X1, minus root two, exactly and again the way a noisy device would see it.",
+    seconds: 20,
+    steps: [
+      ["ansatz.qasm", "ansatz.qasm -O1 " + ENERGY, "text"],
+      ["ansatz.qasm", "ansatz.qasm -O1 " + ENERGY + " --noisy --calibration pair.cal --seed 5", "text"],
+    ],
+  },
+];
+const TOUR_STEPS = TOUR.flatMap((demo, d) =>
+  demo.steps.map((step, i) => ({ demo: d, index: i, file: step[0], command: step[1], view: step[2], find: step[3] || "" })),
+);
+const TOUR_TOTAL = TOUR.reduce((sum, demo) => sum + demo.seconds, 0);
+let touring = -1;
+let tourStart = 0;
+let tourFind = "";
+
+// Shows a step's options in the controls, without rebuilding the command from them.
+function tourControls(text) {
+  const tokens = words(text);
+  const value = (flag) => (tokens.includes(flag) ? tokens[tokens.indexOf(flag) + 1] : "");
+  const set = (id, v) => {
+    const control = $(id);
+    if (control.tagName !== "SELECT" || [...control.options].some((o) => o.value === v)) control.value = v;
+  };
+  emit = tokens[0] === "diff" ? "diff" : value("--emit") || "run";
+  if (!EMITS.includes(emit)) emit = "run";
+  showEmit();
+  const level = tokens.find((t) => /^-O[0-3]$/.test(t));
+  if (level) set("opt", level.slice(2));
+  set("gates", value("--gates"));
+  set("coupling", value("--coupling"));
+  const calibration = value("--calibration");
+  const device = !calibration ? "" : calibration === "line5.cal" ? (tokens.includes("--noisy") ? "noisy" : "cal") : calibration === "detuned.cal" ? (tokens.includes("--dd") ? "decoupled" : "detuned") : "";
+  set("device", device);
+  set("observable", value("--observable").replace(/\*/g, " "));
+  if (value("--shots")) set("shots", value("--shots"));
+  if (value("--seed")) set("seed", value("--seed"));
+}
+
+// After a step runs, scroll the output to the line worth reading.
+function tourScroll() {
+  if (!tourFind) return;
+  const at = stdout.textContent.indexOf(tourFind);
+  tourFind = "";
+  if (at < 0) return;
+  const line = stdout.textContent.slice(0, at).split("\n").length - 1;
+  const height = parseFloat(getComputedStyle(stdout).lineHeight) || 20;
+  const box = $("view-text");
+  if (box.scrollHeight > box.clientHeight + 4) {
+    const top = stdout.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop;
+    box.scrollTop = Math.max(0, top + line * height - 12);
+  } else {
+    const top = stdout.getBoundingClientRect().top + window.scrollY + line * height;
+    window.scrollTo({ top: Math.max(0, top - $("tour").offsetHeight - 40) });
+  }
+}
+
+function clockText(seconds) {
+  const s = Math.max(0, Math.floor(seconds));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+function tourClock() {
+  if (touring < 0) return;
+  const elapsed = (Date.now() - tourStart) / 1000;
+  const step = TOUR_STEPS[touring];
+  const budget = TOUR.slice(0, step.demo + 1).reduce((sum, demo) => sum + demo.seconds, 0);
+  $("tour-clock").textContent = clockText(elapsed) + " of " + clockText(TOUR_TOTAL);
+  $("tour-clock").classList.toggle("late", elapsed > budget + 5);
+}
+setInterval(tourClock, 500);
+
+function tourShow(at) {
+  touring = Math.max(0, Math.min(TOUR_STEPS.length - 1, at));
+  const step = TOUR_STEPS[touring];
+  const demo = TOUR[step.demo];
+  $("tour").hidden = false;
+  $("tour-count").textContent = step.demo + 1 + "/" + TOUR.length;
+  $("tour-title").textContent = demo.title;
+  $("tour-caption").textContent = demo.caption;
+  $("tour-step").textContent = "run " + (step.index + 1) + " of " + demo.steps.length;
+  $("tour-pace").innerHTML = TOUR.map(
+    (d, i) => `<span class="${i < step.demo ? "done" : i === step.demo ? "now" : ""}" style="flex:${d.seconds}"></span>`,
+  ).join("");
+  $("tour-back").disabled = touring === 0;
+  $("tour-next").textContent = touring === TOUR_STEPS.length - 1 ? "Finish" : "Next →";
+  const example = examples.find((e) => e.file === step.file);
+  if (example && example !== current) load(example);
+  tourControls(step.command);
+  command.value = step.command;
+  tourFind = step.find;
+  $("view-text").scrollTop = 0;
+  window.scrollTo({ top: 0 });
+  view = step.view;
+  showView();
+  tourClock();
+  schedule(0);
+}
+
+function tourStop() {
+  touring = -1;
+  $("tour").hidden = true;
+  if (location.hash === "#showcase") history.replaceState(null, "", location.pathname + location.search);
+}
+
+$("tour-start").addEventListener("click", () => {
+  tourStart = Date.now();
+  tourShow(0);
+});
+$("tour-next").addEventListener("click", () => (touring === TOUR_STEPS.length - 1 ? tourStop() : tourShow(touring + 1)));
+$("tour-back").addEventListener("click", () => tourShow(touring - 1));
+$("tour-exit").addEventListener("click", tourStop);
+document.addEventListener("keydown", (event) => {
+  if (touring < 0 || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.target.closest("textarea, input, select")) return;
+  if (["ArrowRight", "PageDown", " "].includes(event.key)) tourShow(touring + 1);
+  else if (["ArrowLeft", "PageUp"].includes(event.key)) tourShow(touring - 1);
+  else if (event.key === "Escape") tourStop();
+  else if (/^[1-8]$/.test(event.key)) tourShow(TOUR_STEPS.findIndex((s) => s.demo === Number(event.key) - 1));
+  else return;
+  event.preventDefault();
+});
+
 start()
   .then(() => fetch("qirc.wasm"))
   .then((response) => {
@@ -2604,7 +3187,12 @@ start()
     bytes = buffer;
     return startWorker();
   })
-  .then(() => run())
+  .then(() => {
+    if (location.hash === "#showcase") {
+      tourStart = Date.now();
+      tourShow(0);
+    } else run();
+  })
   .catch((error) => {
     setStatus("bad", "not loaded");
     stderr.hidden = false;

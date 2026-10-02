@@ -1,12 +1,20 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::{ptr, slice};
 
 use qirc::diag::SourceFile;
 use qirc::driver::{self, Output};
+use qirc::{explain, surface};
 
 const LINE5: &str = include_str!("../../examples/line5.cal");
+
+thread_local! {
+    /// Calibration files the host has defined by name with [`define`], beside the built in ones.
+    static FILES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
 
 /// Allocates `len` bytes in WebAssembly linear memory for the host.
 ///
@@ -29,6 +37,22 @@ unsafe extern "C" fn release(ptr: *mut u8, len: usize) {
     // SAFETY: The caller guarantees that this is the original pointer and length from
     // `Box::into_raw`, with unique ownership returned to Rust exactly once.
     drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(ptr, len)) });
+}
+
+/// Defines a calibration file that later runs can name with `--calibration`.
+///
+/// # Safety
+///
+/// Both pointers must be non-null, aligned, and valid to read for their lengths for the duration
+/// of this call. This function copies both buffers and does not release either.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn define(name: *const u8, name_len: usize, text: *const u8, text_len: usize) {
+    let read = |ptr, len| {
+        // SAFETY: The caller guarantees that both regions are readable for their given lengths.
+        String::from_utf8_lossy(unsafe { slice::from_raw_parts(ptr, len) }).into_owned()
+    };
+    let (name, text) = (read(name, name_len), read(text, text_len));
+    FILES.with(|files| files.borrow_mut().insert(name, text));
 }
 
 /// Runs the compiler on UTF-8 source and command-line argument buffers owned by the host.
@@ -77,9 +101,41 @@ unsafe extern "C" fn run(
 
 fn execute(source: &str, args: &str, output: &mut Output) -> i32 {
     let words: Vec<String> = args.split_whitespace().map(String::from).collect();
-    let device = |path: &str| match path {
-        "line5.cal" => Ok(LINE5.to_string()),
-        "detuned.cal" => Ok((0..5).fold(LINE5.to_string(), |text, q| {
+    match words.first().map(String::as_str) {
+        Some("surface") => {
+            return match surface::command(&words[1..]) {
+                Ok(text) => {
+                    output.stdout.push_str(&text);
+                    0
+                }
+                Err(message) => {
+                    output.stderr.push_str(&format!("error: {message}\n"));
+                    2
+                }
+            };
+        }
+        Some("explain") if words.len() == 2 => {
+            return match explain::explain(&words[1]) {
+                Some(text) => {
+                    output.stdout.push_str(text);
+                    output.stdout.push('\n');
+                    0
+                }
+                None => {
+                    output
+                        .stderr
+                        .push_str(&format!("error: no error code `{}`\n", words[1]));
+                    2
+                }
+            };
+        }
+        _ => {}
+    }
+    let defined = |path: &str| FILES.with(|files| files.borrow().get(path).cloned());
+    let device = |path: &str| match (defined(path), path) {
+        (Some(text), _) => Ok(text),
+        (None, "line5.cal") => Ok(LINE5.to_string()),
+        (None, "detuned.cal") => Ok((0..5).fold(LINE5.to_string(), |text, q| {
             text + &format!("detuning {q} 300\n")
         })),
         _ => Err(format!(

@@ -368,7 +368,17 @@ python -m http.server --directory web
 
 Every push to `main` rebuilds the module and publishes the page with GitHub Pages.
 
-The module exports `allocate`, `release` and `run`, which takes the source and the arguments as UTF-8 and returns the exit code, standard output and standard error. The playground simulates at most 20 qubits.
+The module exports `allocate`, `release`, `define` and `run`. `define` names a calibration file for later runs, and `run` takes the source and the arguments as UTF-8 and returns the exit code, standard output and standard error. The playground simulates at most 20 qubits.
+
+## Showcase
+
+The playground's Showcase button, or <https://angadbasandrai.github.io/qirc/#showcase>, steps through eight demos sized for about three and a half minutes of a talk: compiling a Q# style loop, the optimiser with `qirc diff` proving each result, diagnostics, routing onto a line of qubits, the simulator chosen for programs past 30 qubits, noise and its mitigation, fault tolerant resources against a simulated surface code, and a variational search. Each demo is a few runs of the playground itself, with the program in the editor and the command on the command line, and a clock shows the time against the target. The arrow keys or a presenter remote move between runs, `1` to `8` jump to a demo and Escape leaves.
+
+`scripts/showcase.ps1` is the same tour in a terminal, reading the same programs from `web/index.html`. It builds qirc, computes every screen up front, then steps through them on a key press:
+
+```text
+pwsh scripts/showcase.ps1
+```
 
 ## Circuit diagrams
 

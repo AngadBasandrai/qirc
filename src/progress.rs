@@ -18,35 +18,35 @@ pub fn stopped() -> bool {
 pub(crate) struct Progress {
     label: &'static str,
     total: u64,
-    start: Instant,
-    last: Instant,
+    clock: Option<(Instant, Instant)>,
     shown: bool,
-    enabled: bool,
 }
 
 impl Progress {
     pub(crate) fn new(label: &'static str, total: u64) -> Progress {
-        let now = Instant::now();
+        // The clock is only read when progress can be shown: WebAssembly has no clock to read.
+        let enabled = !cfg!(target_arch = "wasm32") && total > 1 && io::stderr().is_terminal();
         Progress {
             label,
             total,
-            start: now,
-            last: now,
+            clock: enabled.then(|| (Instant::now(), Instant::now())),
             shown: false,
-            enabled: !cfg!(target_arch = "wasm32") && total > 1 && io::stderr().is_terminal(),
         }
     }
 
     pub(crate) fn tick(&mut self, done: u64) {
-        if !self.enabled || done == 0 {
+        let Some((start, last)) = &mut self.clock else {
+            return;
+        };
+        if done == 0 {
             return;
         }
         let now = Instant::now();
-        let elapsed = now - self.start;
-        if elapsed < QUIET || now - self.last < REDRAW {
+        let elapsed = now - *start;
+        if elapsed < QUIET || now - *last < REDRAW {
             return;
         }
-        self.last = now;
+        *last = now;
         self.shown = true;
         let left = elapsed.as_secs_f64() * (self.total.saturating_sub(done)) as f64 / done as f64;
         let mut error = io::stderr().lock();
