@@ -189,30 +189,6 @@ input[type="number"] { width: 8ch; }
   white-space: nowrap;
 }
 .ghost:hover { color: var(--ink); }
-.tour {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  background: var(--panel);
-  border: 1px solid var(--accent);
-  border-radius: 10px;
-  padding: 10px 14px;
-}
-.tour[hidden] { display: none; }
-.tour { position: sticky; top: 8px; z-index: 5; box-shadow: 0 6px 18px rgb(0 0 0 / 0.08); }
-.tour-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
-.tour-badge { font: 600 12px/1 var(--mono); background: var(--accent); color: var(--accent-ink); padding: 5px 8px; border-radius: 5px; }
-.tour-count { font: 500 13px var(--mono); color: var(--muted); }
-.tour-title { font: 600 20px/1.2 var(--sans); flex: 1; }
-.tour-clock { font: 500 13px var(--mono); color: var(--muted); }
-.tour-clock.late { color: var(--warn); }
-.tour-pace { display: flex; gap: 3px; height: 4px; }
-.tour-pace span { background: var(--line); border-radius: 2px; }
-.tour-pace span.done { background: var(--accent); opacity: 0.45; }
-.tour-pace span.now { background: var(--accent); }
-.tour-body { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-.tour-caption { color: var(--muted); font-size: 14px; max-width: 110ch; }
-.tour-step { font: 500 12px var(--mono); color: var(--muted); }
 .stats {
   display: flex;
   flex-wrap: wrap;
@@ -430,28 +406,8 @@ footer a { color: var(--accent); }
       <button type="button" class="ghost" id="open">Open file</button>
       <input type="file" id="file" accept=".ll,.qasm,.txt,text/plain" hidden>
       <button type="button" class="ghost" id="share" hidden>Copy link</button>
-      <button type="button" class="ghost" id="tour-start" title="Step through the live demo">Showcase</button>
     </div>
   </header>
-
-  <div class="tour" id="tour" hidden>
-    <div class="tour-head">
-      <span class="tour-badge">Showcase</span>
-      <span class="tour-count" id="tour-count"></span>
-      <span class="tour-title" id="tour-title"></span>
-      <span class="tour-clock" id="tour-clock"></span>
-    </div>
-    <div class="tour-pace" id="tour-pace"></div>
-    <div class="tour-body">
-      <span class="tour-caption" id="tour-caption"></span>
-      <div class="group">
-        <span class="tour-step" id="tour-step"></span>
-        <button type="button" class="ghost" id="tour-back">← Back</button>
-        <button type="button" class="run" id="tour-next">Next →</button>
-        <button type="button" class="ghost" id="tour-exit">Exit</button>
-      </div>
-    </div>
-  </div>
 
   <div class="controls">
     <div class="field">Emit
@@ -545,6 +501,9 @@ footer a { color: var(--accent); }
         <option value="zne">noisy, zero noise</option>
         <option value="detuned">detuned.cal, noisy</option>
         <option value="decoupled">detuned, echo pulses</option>
+        <option value="readout">readout.cal, noisy</option>
+        <option value="readoutfix">readout.cal, mitigated</option>
+        <option value="pair">pair.cal, noisy</option>
       </select>
     </label>
     <label class="field" for="bind" id="bind-field">Inputs
@@ -623,169 +582,72 @@ footer a { color: var(--accent); }
   <footer>Reads Base Profile, Adaptive Profile, Q# and PyQIR output and OpenQASM 2 and 3. <code>diff</code> checks the compiled program against the original at <code>-O0</code>, branch by branch. The state vector is limited to 20 qubits here. Wider programs still run: Clifford programs on a stabilizer tableau up to 5,000 qubits, permutation and phase gates such as adders on a bit vector at any width, Clifford circuits with a few T gates as a sum of stabilizer states, circuits whose halves are joined by a few gates by circuit cutting, and anything else as a matrix product state that reports any truncation. <code>line5.cal</code> is a five qubit device with gate, readout and T1 and T2 errors, and <code>detuned.cal</code> adds 300 kHz of detuning to every qubit. Precision approximates rotations in a finite gate set, Inputs binds OpenQASM 3 <code>input</code> values, and Vary differentiates or minimises the observable over them. Drop a <code>.ll</code> or <code>.qasm</code> file on the editor to open it. <a href="book/">Guide</a> and <a href="https://github.com/AngadBasandrai/qirc">source on GitHub</a>.</footer>
 </div>
 
-<script type="text/plain" id="bell" data-example="Bell pair, Base Profile" data-file="bell.ll">
-; ModuleID = 'BellPair'
-source_filename = "BellPair"
+<script type="text/plain" id="qsloop" data-example="A Q# loop and a helper function" data-file="qsharp_loop.ll" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "1000", "seed": "7"}'>
+; ModuleID = 'GhzLoop'
+source_filename = "GhzLoop"
 
-%Result = type opaque
 %Qubit = type opaque
+%Result = type opaque
 
-define void @main() #0 {
-block_0:
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
-  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*)) #1
-  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*)) #1
-  call void @__quantum__rt__tuple_record_output(i64 2, i8* null)
-  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 0 to %Result*), i8* null)
-  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 1 to %Result*), i8* null)
+@qubits = internal constant [4 x %Qubit*] [%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*), %Qubit* inttoptr (i64 3 to %Qubit*)]
+
+define internal void @Entangle(%Qubit* %control, %Qubit* %target) {
+entry:
+  %same = icmp eq %Qubit* %control, %target
+  br i1 %same, label %skip, label %apply
+
+apply:
+  call void @__quantum__qis__cx__body(%Qubit* %control, %Qubit* %target)
+  br label %skip
+
+skip:
   ret void
 }
 
-declare void @__quantum__qis__h__body(%Qubit*)
-
-declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
-
-declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly) #1
-
-declare void @__quantum__rt__tuple_record_output(i64, i8*)
-
-declare void @__quantum__rt__result_record_output(%Result*, i8*)
-
-attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="base_profile" "required_num_qubits"="2" "required_num_results"="2" }
-attributes #1 = { "irreversible" }
-
-!llvm.module.flags = !{!0, !1, !2, !3}
-
-!0 = !{i32 1, !"qir_major_version", i32 1}
-!1 = !{i32 7, !"qir_minor_version", i32 0}
-!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
-!3 = !{i32 1, !"dynamic_result_management", i1 false}
-</script>
-<script type="text/plain" id="teleport" data-example="Teleportation, Adaptive Profile" data-file="teleport.ll">
-; ModuleID = 'Teleport'
-source_filename = "Teleport"
-
-%Result = type opaque
-%Qubit = type opaque
-
-@0 = internal constant [3 x i8] c"r0\00"
-@1 = internal constant [3 x i8] c"r1\00"
-
 define void @main() #0 {
 entry:
-  call void @__quantum__rt__initialize(i8* null)
-  call void @__quantum__qis__ry__body(double 0.78539816339744828, %Qubit* inttoptr (i64 0 to %Qubit*))
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
-  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*)) #1
-  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*)) #1
-  %0 = call i1 @__quantum__qis__read_result__body(%Result* inttoptr (i64 1 to %Result*))
-  br i1 %0, label %then_x, label %join_x
+  %head = getelementptr [4 x %Qubit*], [4 x %Qubit*]* @qubits, i64 0, i64 0
+  %q0 = load %Qubit*, %Qubit** %head, align 8
+  call void @__quantum__qis__h__body(%Qubit* %q0)
+  br label %header
 
-then_x:                                           ; preds = %entry
-  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  br label %join_x
+header:
+  %i = phi i64 [ 0, %entry ], [ %next, %body ]
+  %more = icmp slt i64 %i, 3
+  br i1 %more, label %body, label %measure
 
-join_x:                                           ; preds = %then_x, %entry
-  %1 = call i1 @__quantum__qis__read_result__body(%Result* inttoptr (i64 0 to %Result*))
-  br i1 %1, label %then_z, label %join_z
+body:
+  %ctrl.ptr = getelementptr [4 x %Qubit*], [4 x %Qubit*]* @qubits, i64 0, i64 %i
+  %ctrl = load %Qubit*, %Qubit** %ctrl.ptr, align 8
+  %next = add nuw nsw i64 %i, 1
+  %tgt.ptr = getelementptr [4 x %Qubit*], [4 x %Qubit*]* @qubits, i64 0, i64 %next
+  %tgt = load %Qubit*, %Qubit** %tgt.ptr, align 8
+  call void @Entangle(%Qubit* %ctrl, %Qubit* %tgt)
+  br label %header
 
-then_z:                                           ; preds = %join_x
-  call void @__quantum__qis__z__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  br label %join_z
-
-join_z:                                           ; preds = %then_z, %join_x
-  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 2 to %Qubit*), %Result* inttoptr (i64 2 to %Result*)) #1
-  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 2 to %Result*), i8* getelementptr inbounds ([3 x i8], [3 x i8]* @0, i32 0, i32 0))
-  ret void
-}
-
-declare void @__quantum__rt__initialize(i8*)
-
-declare void @__quantum__qis__h__body(%Qubit*)
-
-declare void @__quantum__qis__x__body(%Qubit*)
-
-declare void @__quantum__qis__z__body(%Qubit*)
-
-declare void @__quantum__qis__ry__body(double, %Qubit*)
-
-declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
-
-declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly) #1
-
-declare i1 @__quantum__qis__read_result__body(%Result*)
-
-declare void @__quantum__rt__result_record_output(%Result*, i8*)
-
-attributes #0 = { "entry_point" "output_labeling_schema"="schema_id" "qir_profiles"="adaptive_profile" "required_num_qubits"="3" "required_num_results"="3" }
-attributes #1 = { "irreversible" }
-
-!llvm.module.flags = !{!0, !1, !2, !3}
-
-!0 = !{i32 1, !"qir_major_version", i32 1}
-!1 = !{i32 7, !"qir_minor_version", i32 0}
-!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
-!3 = !{i32 1, !"dynamic_result_management", i1 false}
-</script>
-<script type="text/plain" id="qasm" data-example="Teleportation in OpenQASM 3" data-file="teleport.qasm">
-OPENQASM 3.0;
-include "stdgates.inc";
-
-qubit[3] q;
-bit[3] c;
-
-ry(pi / 4) q[0];
-h q[1];
-cx q[1], q[2];
-cx q[0], q[1];
-h q[0];
-c[0] = measure q[0];
-c[1] = measure q[1];
-if (c[1]) x q[2];
-if (c[0]) z q[2];
-c[2] = measure q[2];
-</script>
-<script type="text/plain" id="rus" data-example="Repeat until success, a loop" data-file="repeat.ll">
-; ModuleID = 'repeat_until_success'
-source_filename = "repeat_until_success"
-
-%Qubit = type opaque
-%Result = type opaque
-
-define void @main() #0 {
-entry:
-  br label %attempt
-
-attempt:
-  %tries = phi i64 [ 0, %entry ], [ %next, %attempt ]
-  call void @__quantum__qis__reset__body(%Qubit* null)
-  call void @__quantum__qis__ry__body(double 5.000000e-01, %Qubit* null)
-  call void @__quantum__qis__mz__body(%Qubit* null, %Result* null)
-  %hit = call i1 @__quantum__qis__read_result__body(%Result* null)
-  %next = add i64 %tries, 1
-  %limit = icmp sge i64 %next, 50
-  %stop = or i1 %hit, %limit
-  br i1 %stop, label %done, label %attempt
-
-done:
-  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+measure:
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
   call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 2 to %Qubit*), %Result* inttoptr (i64 2 to %Result*))
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 3 to %Qubit*), %Result* inttoptr (i64 3 to %Result*))
   ret void
 }
 
-declare void @__quantum__qis__reset__body(%Qubit*)
-declare void @__quantum__qis__ry__body(double, %Qubit*)
-declare void @__quantum__qis__x__body(%Qubit*)
-declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly)
-declare i1 @__quantum__qis__read_result__body(%Result*)
+declare void @__quantum__qis__h__body(%Qubit*)
 
-attributes #0 = { "entry_point" "qir_profiles"="adaptive_profile" "required_num_qubits"="2" "required_num_results"="2" }
+declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
+
+declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly)
+
+attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="base_profile" "required_num_qubits"="4" "required_num_results"="4" }
+
+!llvm.module.flags = !{!0, !1}
+
+!0 = !{i32 1, !"qir_major_version", i32 1}
+!1 = !{i32 7, !"qir_minor_version", i32 0}
 </script>
-<script type="text/plain" id="redundant" data-example="Redundant gates for the optimiser" data-file="redundant.ll">
+
+<script type="text/plain" id="redundant" data-example="Redundant gates for the optimiser" data-file="redundant.ll" data-settings='{"emit": "ir", "opt": "3", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "1000", "seed": "7"}'>
 ; ModuleID = 'redundant'
 source_filename = "redundant"
 
@@ -821,53 +683,43 @@ declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly)
 
 attributes #0 = { "entry_point" "qir_profiles"="base_profile" "required_num_qubits"="4" "required_num_results"="1" }
 </script>
-<script type="text/plain" id="ising" data-example="Ising model from the Q# compiler" data-file="ising.ll">
-%Result = type opaque
+
+<script type="text/plain" id="pyqirsimple" data-example="A PyQIR sample on IBM gates" data-file="pyqir_simple.ll" data-settings='{"emit": "circuit", "opt": "3", "gates": "rz-sx-cx", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "1000", "seed": "7"}'>
+; ModuleID = 'grover'
+source_filename = "grover"
+
 %Qubit = type opaque
+%Result = type opaque
 
-@0 = internal constant [4 x i8] c"0_a\00"
-@1 = internal constant [6 x i8] c"1_a0r\00"
-@2 = internal constant [6 x i8] c"2_a1r\00"
-@3 = internal constant [6 x i8] c"3_a2r\00"
-
-define i64 @ENTRYPOINT__main() #0 {
-block_0:
-  call void @__quantum__rt__initialize(i8* null)
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* null)
   call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__rzz__body(double 0.8, %Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__rxx__body(double 0.3, %Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__ryy__body(double 0.5, %Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
-  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
-  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
-  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 2 to %Qubit*), %Result* inttoptr (i64 2 to %Result*))
-  call void @__quantum__rt__array_record_output(i64 3, i8* getelementptr inbounds ([4 x i8], [4 x i8]* @0, i64 0, i64 0))
-  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 0 to %Result*), i8* getelementptr inbounds ([6 x i8], [6 x i8]* @1, i64 0, i64 0))
-  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 1 to %Result*), i8* getelementptr inbounds ([6 x i8], [6 x i8]* @2, i64 0, i64 0))
-  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 2 to %Result*), i8* getelementptr inbounds ([6 x i8], [6 x i8]* @3, i64 0, i64 0))
-  ret i64 0
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__ccx__body(%Qubit* null, %Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 2 to %Qubit*))
+  call void @__quantum__qis__s__body(%Qubit* null)
+  call void @__quantum__qis__t__adj(%Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__rz__body(double 0x400921FB54442D18, %Qubit* null)
+  call void @__quantum__qis__swap__body(%Qubit* null, %Qubit* inttoptr (i64 1 to %Qubit*))
+  call void @__quantum__qis__mz__body(%Qubit* null, %Result* null)
+  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
+  ret void
 }
 
-declare void @__quantum__rt__initialize(i8*)
-
 declare void @__quantum__qis__h__body(%Qubit*)
+declare void @__quantum__qis__x__body(%Qubit*)
+declare void @__quantum__qis__s__body(%Qubit*)
+declare void @__quantum__qis__t__adj(%Qubit*)
+declare void @__quantum__qis__rz__body(double, %Qubit*)
+declare void @__quantum__qis__ccx__body(%Qubit*, %Qubit*, %Qubit*)
+declare void @__quantum__qis__swap__body(%Qubit*, %Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
 
-declare void @__quantum__qis__rzz__body(double, %Qubit*, %Qubit*)
-
-declare void @__quantum__qis__rxx__body(double, %Qubit*, %Qubit*)
-
-declare void @__quantum__qis__ryy__body(double, %Qubit*, %Qubit*)
-
-declare void @__quantum__rt__array_record_output(i64, i8*)
-
-declare void @__quantum__rt__result_record_output(%Result*, i8*)
-
-declare void @__quantum__qis__m__body(%Qubit*, %Result*) #1
-
-attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="base_profile" "required_num_qubits"="3" "required_num_results"="3" }
-attributes #1 = { "irreversible" }
-
+attributes #0 = { "entry_point" "num_required_qubits"="3" "num_required_results"="2" "output_labeling_schema" "qir_profiles"="base_profile" }
 
 !llvm.module.flags = !{!0, !1, !2, !3}
 
@@ -876,151 +728,167 @@ attributes #1 = { "irreversible" }
 !2 = !{i32 1, !"dynamic_qubit_management", i1 false}
 !3 = !{i32 1, !"dynamic_result_management", i1 false}
 </script>
-<script type="text/plain" id="qsteleport" data-example="Teleportation from the Q# compiler" data-file="qsharp_teleport.ll">
-%Result = type opaque
+
+<script type="text/plain" id="mod54" data-example="mod5_4, T gates cut by the optimiser" data-file="mod5_4.qasm" data-settings='{"emit": "cost", "opt": "2", "gates": "h,s,t,cx", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "1000", "seed": "7"}'>
+// mod5_4 from the RevLib benchmarks, a standard test for T count reduction.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[5];
+x q[4];
+h q[4];
+cx q[3], q[4];
+tdg q[4];
+cx q[0], q[4];
+t q[4];
+cx q[3], q[4];
+tdg q[4];
+cx q[0], q[4];
+t q[3];
+t q[4];
+cx q[0], q[3];
+t q[0];
+tdg q[3];
+cx q[0], q[3];
+cx q[3], q[4];
+tdg q[4];
+cx q[2], q[4];
+t q[4];
+cx q[3], q[4];
+tdg q[4];
+cx q[2], q[4];
+t q[3];
+t q[4];
+cx q[2], q[3];
+t q[2];
+tdg q[3];
+cx q[2], q[3];
+h q[4];
+cx q[3], q[4];
+h q[4];
+cx q[2], q[4];
+tdg q[4];
+cx q[1], q[4];
+t q[4];
+cx q[2], q[4];
+tdg q[4];
+cx q[1], q[4];
+t q[2];
+t q[4];
+cx q[1], q[2];
+t q[1];
+tdg q[2];
+cx q[1], q[2];
+h q[4];
+cx q[2], q[4];
+h q[4];
+cx q[1], q[4];
+tdg q[4];
+cx q[0], q[4];
+t q[4];
+cx q[1], q[4];
+tdg q[4];
+cx q[0], q[4];
+t q[1];
+t q[4];
+cx q[0], q[1];
+t q[0];
+tdg q[1];
+cx q[0], q[1];
+h q[4];
+cx q[1], q[4];
+cx q[0], q[4];
+</script>
+
+<script type="text/plain" id="ladder" data-example="Toffoli ladder, relative phase Toffolis" data-file="ladder.qasm" data-settings='{"emit": "cost", "opt": "2", "gates": "h,s,t,cx", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "1000", "seed": "7"}'>
+// A six control X gate built from a ladder of Toffolis on four ancillas.
+// Lowered to h s t cx, each Toffoli that the ladder later undoes becomes
+// a relative phase Toffoli, and the cost view counts 39 T gates and 30 CNOTs
+// where a plain decomposition needs 63 and 54.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg c[6];
+qreg a[4];
+qreg t[1];
+h c[0];
+h c[1];
+h c[2];
+h c[3];
+h c[4];
+h c[5];
+ccx c[0], c[1], a[0];
+ccx c[2], a[0], a[1];
+ccx c[3], a[1], a[2];
+ccx c[4], a[2], a[3];
+ccx c[5], a[3], t[0];
+ccx c[4], a[2], a[3];
+ccx c[3], a[1], a[2];
+ccx c[2], a[0], a[1];
+ccx c[0], c[1], a[0];
+</script>
+
+<script type="text/plain" id="badprofile" data-example="A Base Profile program that branches" data-file="bad_profile.ll" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "1000", "seed": "7"}'>
+; ModuleID = 'bad_profile'
+source_filename = "bad_profile"
+
 %Qubit = type opaque
+%Result = type opaque
 
-@0 = internal constant [4 x i8] c"0_r\00"
+define void @main() #0 {
+entry:
+  call void @__quantum__qis__h__body(%Qubit* null)
+  call void @__quantum__qis__mz__body(%Qubit* null, %Result* null)
+  %bit = call i1 @__quantum__qis__read_result__body(%Result* null)
+  br i1 %bit, label %flip, label %done
 
-define i64 @ENTRYPOINT__main() #0 {
-block_0:
-  call void @__quantum__rt__initialize(i8* null)
-  call void @__quantum__qis__ry__body(double 0.7853981633974483, %Qubit* inttoptr (i64 0 to %Qubit*))
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__cx__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
-  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
-  %var_0 = call i1 @__quantum__rt__read_result(%Result* inttoptr (i64 0 to %Result*))
-  br i1 %var_0, label %block_1, label %block_2
-block_1:
-  call void @__quantum__qis__z__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  br label %block_2
-block_2:
-  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
-  %var_3 = call i1 @__quantum__rt__read_result(%Result* inttoptr (i64 1 to %Result*))
-  br i1 %var_3, label %block_3, label %block_4
-block_3:
-  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  br label %block_4
-block_4:
-  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 2 to %Qubit*), %Result* inttoptr (i64 2 to %Result*))
-  call void @__quantum__qis__reset__body(%Qubit* inttoptr (i64 0 to %Qubit*))
-  call void @__quantum__qis__reset__body(%Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__reset__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__rt__result_record_output(%Result* inttoptr (i64 2 to %Result*), i8* getelementptr inbounds ([4 x i8], [4 x i8]* @0, i64 0, i64 0))
-  ret i64 0
+flip:
+  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 1 to %Qubit*))
+  br label %done
+
+done:
+  ret void
 }
 
-declare void @__quantum__rt__initialize(i8*)
-
-declare void @__quantum__qis__ry__body(double, %Qubit*)
-
 declare void @__quantum__qis__h__body(%Qubit*)
-
-declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
-
-declare void @__quantum__qis__m__body(%Qubit*, %Result*) #1
-
-declare i1 @__quantum__rt__read_result(%Result*)
-
-declare void @__quantum__qis__z__body(%Qubit*)
-
 declare void @__quantum__qis__x__body(%Qubit*)
+declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly)
+declare i1 @__quantum__qis__read_result__body(%Result*)
 
-declare void @__quantum__qis__reset__body(%Qubit*) #1
-
-declare void @__quantum__rt__result_record_output(%Result*, i8*)
-
-attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="adaptive_profile" "required_num_qubits"="3" "required_num_results"="3" }
-attributes #1 = { "irreversible" }
-
-
-!llvm.module.flags = !{!0, !1, !2, !3, !4}
-
-!0 = !{i32 1, !"qir_major_version", i32 1}
-!1 = !{i32 7, !"qir_minor_version", i32 0}
-!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
-!3 = !{i32 1, !"dynamic_result_management", i1 false}
-!4 = !{i32 5, !"int_computations", !{!"i64"}}
+attributes #0 = { "entry_point" "qir_profiles"="base_profile" "required_num_qubits"="2" "required_num_results"="1" }
 </script>
-<script type="text/plain" id="qscount" data-example="Counting ones from the Q# compiler" data-file="qsharp_count.ll" data-settings='{"emit": "qasm3", "gates": "", "coupling": "", "device": ""}'>
-%Result = type opaque
-%Qubit = type opaque
 
-@0 = internal constant [4 x i8] c"0_i\00"
+<script type="text/plain" id="star" data-example="Star circuit routed onto a line of 4" data-file="star.qasm" data-settings='{"emit": "run", "opt": "2", "gates": "rz-sx-cx", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "line:4", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "100000", "seed": "7"}'>
+// Qubit 0 talks to every other qubit, but on a line of four only
+// neighbours can interact, so the router has to bring them together.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[4];
+creg c[4];
+ry(1.1) q[0];
+ry(0.6) q[2];
+cx q[0], q[1];
+cx q[0], q[2];
+cx q[0], q[3];
+cx q[2], q[1];
+measure q -> c;
+</script>
 
-define i64 @ENTRYPOINT__main() #0 {
-block_0:
-  call void @__quantum__rt__initialize(i8* null)
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 0 to %Qubit*))
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 3 to %Qubit*))
-  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
-  %var_5 = call i1 @__quantum__rt__read_result(%Result* inttoptr (i64 0 to %Result*))
-  br i1 %var_5, label %block_1, label %block_2
-block_1:
-  br label %block_2
-block_2:
-  %var_18 = phi i64 [0, %block_0], [1, %block_1]
-  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
-  %var_7 = call i1 @__quantum__rt__read_result(%Result* inttoptr (i64 1 to %Result*))
-  br i1 %var_7, label %block_3, label %block_4
-block_3:
-  %var_9 = add i64 %var_18, 1
-  br label %block_4
-block_4:
-  %var_19 = phi i64 [%var_18, %block_2], [%var_9, %block_3]
-  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 2 to %Qubit*), %Result* inttoptr (i64 2 to %Result*))
-  %var_10 = call i1 @__quantum__rt__read_result(%Result* inttoptr (i64 2 to %Result*))
-  br i1 %var_10, label %block_5, label %block_6
-block_5:
-  %var_12 = add i64 %var_19, 1
-  br label %block_6
-block_6:
-  %var_20 = phi i64 [%var_19, %block_4], [%var_12, %block_5]
-  call void @__quantum__qis__m__body(%Qubit* inttoptr (i64 3 to %Qubit*), %Result* inttoptr (i64 3 to %Result*))
-  %var_13 = call i1 @__quantum__rt__read_result(%Result* inttoptr (i64 3 to %Result*))
-  br i1 %var_13, label %block_7, label %block_8
-block_7:
-  %var_15 = add i64 %var_20, 1
-  br label %block_8
-block_8:
-  %var_21 = phi i64 [%var_20, %block_6], [%var_15, %block_7]
-  call void @__quantum__qis__reset__body(%Qubit* inttoptr (i64 0 to %Qubit*))
-  call void @__quantum__qis__reset__body(%Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__reset__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__reset__body(%Qubit* inttoptr (i64 3 to %Qubit*))
-  call void @__quantum__rt__int_record_output(i64 %var_21, i8* getelementptr inbounds ([4 x i8], [4 x i8]* @0, i64 0, i64 0))
-  ret i64 0
+<script type="text/plain" id="wide" data-example="20 qubit rotation chain, state vector" data-file="wide.qasm" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "1000", "seed": "7"}'>
+// A rotation spread along a chain of qubits by CNOTs. Not Clifford, so it
+// runs on the state vector: 2^n amplitudes, updated with AVX2 on every core.
+OPENQASM 3.0;
+include "stdgates.inc";
+const int n = 20;
+qubit[n] q;
+bit[2] c;
+ry(0.9) q[0];
+for int i in [0:n - 2] {
+  cx q[i], q[i + 1];
 }
-
-declare void @__quantum__rt__initialize(i8*)
-
-declare void @__quantum__qis__h__body(%Qubit*)
-
-declare void @__quantum__qis__m__body(%Qubit*, %Result*) #1
-
-declare i1 @__quantum__rt__read_result(%Result*)
-
-declare void @__quantum__qis__reset__body(%Qubit*) #1
-
-declare void @__quantum__rt__int_record_output(i64, i8*)
-
-attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="adaptive_profile" "required_num_qubits"="4" "required_num_results"="4" }
-attributes #1 = { "irreversible" }
-
-
-!llvm.module.flags = !{!0, !1, !2, !3, !4}
-
-!0 = !{i32 1, !"qir_major_version", i32 1}
-!1 = !{i32 7, !"qir_minor_version", i32 0}
-!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
-!3 = !{i32 1, !"dynamic_result_management", i1 false}
-!4 = !{i32 5, !"int_computations", !{!"i64"}}
+c[0] = measure q[0];
+c[1] = measure q[n - 1];
 </script>
-<script type="text/plain" id="ghz1000" data-example="GHZ on 1000 qubits, stabilizer tableau" data-file="ghz1000.ll" data-settings='{"emit": "run", "observable": "X0 X1 Y2 + Z0 Z999", "device": "", "coupling": "", "gates": ""}'>
+
+<script type="text/plain" id="ghz1000" data-example="GHZ on 1000 qubits, stabilizer tableau" data-file="ghz1000.ll" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "X0 X1 Y2 + Z0 Z999", "shots": "1000", "seed": "7"}'>
 ; A 1000 qubit GHZ state built by a loop that qirc unrolls at compile time.
 ; Every gate is Clifford, so it runs on the stabilizer tableau.
 ; Try the observable X0*X1*Y2 or Z0*Z999, or switch to stim.
@@ -1055,7 +923,7 @@ declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
 attributes #0 = { "entry_point" "qir_profiles"="adaptive_profile" "required_num_qubits"="1000" "required_num_results"="2" }
 </script>
 
-<script type="text/plain" id="adder" data-example="32 bit adder on a bit vector" data-file="adder.qasm" data-settings='{"emit": "run", "observable": "", "device": "", "coupling": "", "gates": ""}'>
+<script type="text/plain" id="adder" data-example="32 bit adder on a bit vector" data-file="adder.qasm" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "100", "seed": "7"}'>
 // A 32 bit ripple carry adder on 66 qubits, 3141592653 + 2718281828.
 // Every gate only permutes basis states, so qirc runs it on a bit vector
 // whatever its width. The result register reads the sum, lowest bit first.
@@ -1318,165 +1186,29 @@ measure q[64] -> sum[31];
 measure q[65] -> sum[32];
 </script>
 
-<script type="text/plain" id="ladder" data-example="Toffoli ladder, relative phase Toffolis" data-file="ladder.qasm" data-settings='{"emit": "cost", "gates": "h,s,t,cx", "coupling": "", "device": ""}'>
-// A six control X gate built from a ladder of Toffolis on four ancillas.
-// Lowered to h s t cx, each Toffoli that the ladder later undoes becomes
-// a relative phase Toffoli, and the cost view counts 39 T gates and 30 CNOTs
-// where a plain decomposition needs 63 and 54.
-OPENQASM 2.0;
-include "qelib1.inc";
-qreg c[6];
-qreg a[4];
-qreg t[1];
-h c[0];
-h c[1];
-h c[2];
-h c[3];
-h c[4];
-h c[5];
-ccx c[0], c[1], a[0];
-ccx c[2], a[0], a[1];
-ccx c[3], a[1], a[2];
-ccx c[4], a[2], a[3];
-ccx c[5], a[3], t[0];
-ccx c[4], a[2], a[3];
-ccx c[3], a[1], a[2];
-ccx c[2], a[0], a[1];
-ccx c[0], c[1], a[0];
-</script>
-
-<script type="text/plain" id="stim" data-example="Clifford teleportation to Stim" data-file="teleport_clifford.qasm" data-settings='{"emit": "stim", "gates": "", "coupling": "", "device": ""}'>
-// Teleportation with only Clifford gates, which qirc can write as a Stim
-// circuit: the corrections become feedback on measurement records. Stim
-// cannot make noise depend on a measurement, so for a noisy Stim circuit
-// pick the GHZ example with zero noise, the noisy device and emit stim.
-OPENQASM 2.0;
-include "qelib1.inc";
-qreg q[3];
-creg m0[1];
-creg m1[1];
-creg out[1];
-h q[0];
-s q[0];
-h q[1];
-cx q[1], q[2];
-cx q[0], q[1];
-h q[0];
-measure q[0] -> m0[0];
-measure q[1] -> m1[0];
-if(m1==1) x q[2];
-if(m0==1) z q[2];
-sdg q[2];
-h q[2];
-measure q[2] -> out[0];
-</script>
-
-<script type="text/plain" id="zne" data-example="Noisy GHZ with zero noise extrapolation" data-file="ghz5.qasm" data-settings='{"emit": "run", "observable": "Z0 Z4", "device": "zne", "gates": "", "coupling": ""}'>
-// A five qubit GHZ state on the line5.cal device. The observable Z0 Z4 is 1
-// on an ideal device. With noise it drops, and zero noise extrapolation runs
-// the circuit at one, two and three times the noise and extends to zero.
-OPENQASM 2.0;
-include "qelib1.inc";
-qreg q[5];
-h q[0];
-cx q[0], q[1];
-cx q[1], q[2];
-cx q[2], q[3];
-cx q[3], q[4];
-</script>
-
-<script type="text/plain" id="qftloop" data-example="QFT with OpenQASM 3 loops" data-file="qft.qasm" data-settings='{"emit": "run", "gates": "", "coupling": "", "device": ""}'>
-// A quantum Fourier transform written with OpenQASM 3 loops, which qirc
-// unrolls at compile time. Try emit pulse or schedule with the line5.cal
-// device to see the gates as timed pulses on a five qubit line.
+<script type="text/plain" id="cliffordt" data-example="40 qubits with 3 T gates, stabilizer rank" data-file="clifford_t40.qasm" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "1000", "seed": "7"}'>
+// A 40 qubit GHZ chain with three T gates. Clifford circuits with a few
+// T gates run as a sum of stabilizer states, exactly, at any width.
 OPENQASM 3.0;
 include "stdgates.inc";
-const int n = 5;
-qubit[n] q;
-bit[n] c;
-x q[0];
-for int i in [0:n - 1] {
-  h q[i];
-  for int j in [i + 1:n - 1] {
-    cp(pi / 2 ** (j - i)) q[j], q[i];
-  }
+qubit[40] q;
+bit[3] c;
+h q[0];
+for int i in [0:38] {
+  cx q[i], q[i + 1];
 }
-for uint k in {0, 1} swap q[k], q[n - 1 - k];
-c = measure q;
+t q[5];
+t q[20];
+t q[35];
+h q[5];
+h q[20];
+h q[35];
+c[0] = measure q[5];
+c[1] = measure q[20];
+c[2] = measure q[35];
 </script>
 
-<script type="text/plain" id="gridsynth" data-example="Rotations as Clifford+T gates" data-file="rotations.qasm" data-settings='{"emit": "qasm3", "gates": "h,s,t,cx", "epsilon": "1e-3", "coupling": "", "device": ""}'>
-// A rotation by an angle that is not a multiple of pi / 4 has no exact form
-// in H, S and T. With a precision chosen, qirc approximates it, and the
-// T count grows as about 3 log2(1 / precision).
-OPENQASM 3.0;
-include "stdgates.inc";
-qubit[2] q;
-h q[0];
-rz(0.3) q[0];
-crz(0.45) q[0], q[1];
-</script>
-<script type="text/plain" id="resources" data-example="Fault tolerant resources" data-file="grover.qasm" data-settings='{"emit": "resources", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
-// Two rounds of Grover search for 111 on three qubits, with a phase kick.
-// The resource estimate counts T gates and rotations and sizes a surface
-// code and its magic state factories for the result.
-OPENQASM 3.0;
-include "stdgates.inc";
-qubit[4] q;
-h q[0];
-h q[1];
-h q[2];
-for int round in [0:1] {
-  h q[2];
-  ccx q[0], q[1], q[2];
-  h q[2];
-  h q[0];
-  h q[1];
-  h q[2];
-  x q[0];
-  x q[1];
-  x q[2];
-  h q[2];
-  ccx q[0], q[1], q[2];
-  h q[2];
-  x q[0];
-  x q[1];
-  x q[2];
-  h q[0];
-  h q[1];
-  h q[2];
-}
-rz(0.3) q[3];
-cx q[0], q[3];
-</script>
-<script type="text/plain" id="vqe" data-example="Variational ground state" data-file="ansatz.qasm" data-settings='{"emit": "run", "observable": "Z0 Z1 + 0.5 X0 + 0.5 X1", "vary": "minimize", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
-// Each input is a parameter of the circuit. Vary: minimise runs gradient
-// descent on the observable; the ground energy of this one is -sqrt(2).
-OPENQASM 3.0;
-include "stdgates.inc";
-input float theta;
-input float phi;
-qubit[2] q;
-ry(theta) q[0];
-ry(phi) q[1];
-cx q[0], q[1];
-</script>
-<script type="text/plain" id="echo" data-example="Echo pulses on a detuned device" data-file="idle.qasm" data-settings='{"emit": "run", "device": "decoupled", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": ""}'>
-// Qubit 0 waits through three CNOTs while its frequency is off by 300 kHz.
-// Switch Device between "detuned" and "echo pulses" to see the phase undone.
-OPENQASM 2.0;
-include "qelib1.inc";
-qreg q[4];
-creg c[1];
-h q[0];
-cx q[1], q[2];
-cx q[2], q[3];
-cx q[1], q[2];
-cz q[1], q[0];
-h q[0];
-measure q[0] -> c[0];
-</script>
-<script type="text/plain" id="cutting" data-example="40 qubits by circuit cutting" data-file="halves.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
+<script type="text/plain" id="cutting" data-example="40 qubits by circuit cutting" data-file="halves.qasm" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "1000", "seed": "7"}'>
 // Two 20 qubit blocks joined by two CNOTs. Neither fits a 20 qubit state
 // vector together, but each half does, so qirc cuts the two CNOTs and
 // recombines the halves into the exact distribution of the measured bits.
@@ -1507,308 +1239,8 @@ c[3] = measure q[20];
 c[4] = measure q[33];
 c[5] = measure q[39];
 </script>
-<script type="text/plain" id="pyqir" data-example="Circuit from PyQIR" data-file="pyqir.ll">
-; ModuleID = 'bell'
-source_filename = "bell"
 
-define void @main() #0 {
-entry:
-  call void @__quantum__qis__h__body(ptr null)
-  call void @__quantum__qis__cnot__body(ptr null, ptr inttoptr (i64 1 to ptr))
-  call void @__quantum__qis__rz__body(double 5.000000e-01, ptr inttoptr (i64 2 to ptr))
-  call void @__quantum__qis__t__body(ptr inttoptr (i64 2 to ptr))
-  call void @__quantum__qis__mz__body(ptr null, ptr null)
-  call void @__quantum__qis__mz__body(ptr inttoptr (i64 1 to ptr), ptr inttoptr (i64 1 to ptr))
-  call void @__quantum__qis__mz__body(ptr inttoptr (i64 2 to ptr), ptr inttoptr (i64 2 to ptr))
-  ret void
-}
-
-declare void @__quantum__qis__h__body(ptr)
-
-declare void @__quantum__qis__cnot__body(ptr, ptr)
-
-declare void @__quantum__qis__rz__body(double, ptr)
-
-declare void @__quantum__qis__t__body(ptr)
-
-declare void @__quantum__qis__mz__body(ptr, ptr writeonly) #1
-
-attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="custom" "required_num_qubits"="3" "required_num_results"="3" }
-attributes #1 = { "irreversible" }
-
-!llvm.module.flags = !{!0, !1, !2, !3}
-
-!0 = !{i32 1, !"qir_major_version", i32 2}
-!1 = !{i32 7, !"qir_minor_version", i32 0}
-!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
-!3 = !{i32 1, !"dynamic_result_management", i1 false}
-</script>
-
-<script type="text/plain" id="qsloop" data-example="A loop and a helper, as Q# emits them" data-file="qsharp_loop.ll" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
-; ModuleID = 'GhzLoop'
-source_filename = "GhzLoop"
-
-%Qubit = type opaque
-%Result = type opaque
-
-@qubits = internal constant [4 x %Qubit*] [%Qubit* inttoptr (i64 0 to %Qubit*), %Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*), %Qubit* inttoptr (i64 3 to %Qubit*)]
-
-define internal void @Entangle(%Qubit* %control, %Qubit* %target) {
-entry:
-  %same = icmp eq %Qubit* %control, %target
-  br i1 %same, label %skip, label %apply
-
-apply:
-  call void @__quantum__qis__cx__body(%Qubit* %control, %Qubit* %target)
-  br label %skip
-
-skip:
-  ret void
-}
-
-define void @main() #0 {
-entry:
-  %head = getelementptr [4 x %Qubit*], [4 x %Qubit*]* @qubits, i64 0, i64 0
-  %q0 = load %Qubit*, %Qubit** %head, align 8
-  call void @__quantum__qis__h__body(%Qubit* %q0)
-  br label %header
-
-header:
-  %i = phi i64 [ 0, %entry ], [ %next, %body ]
-  %more = icmp slt i64 %i, 3
-  br i1 %more, label %body, label %measure
-
-body:
-  %ctrl.ptr = getelementptr [4 x %Qubit*], [4 x %Qubit*]* @qubits, i64 0, i64 %i
-  %ctrl = load %Qubit*, %Qubit** %ctrl.ptr, align 8
-  %next = add nuw nsw i64 %i, 1
-  %tgt.ptr = getelementptr [4 x %Qubit*], [4 x %Qubit*]* @qubits, i64 0, i64 %next
-  %tgt = load %Qubit*, %Qubit** %tgt.ptr, align 8
-  call void @Entangle(%Qubit* %ctrl, %Qubit* %tgt)
-  br label %header
-
-measure:
-  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 0 to %Qubit*), %Result* inttoptr (i64 0 to %Result*))
-  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
-  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 2 to %Qubit*), %Result* inttoptr (i64 2 to %Result*))
-  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 3 to %Qubit*), %Result* inttoptr (i64 3 to %Result*))
-  ret void
-}
-
-declare void @__quantum__qis__h__body(%Qubit*)
-
-declare void @__quantum__qis__cx__body(%Qubit*, %Qubit*)
-
-declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly)
-
-attributes #0 = { "entry_point" "output_labeling_schema" "qir_profiles"="base_profile" "required_num_qubits"="4" "required_num_results"="4" }
-
-!llvm.module.flags = !{!0, !1}
-
-!0 = !{i32 1, !"qir_major_version", i32 1}
-!1 = !{i32 7, !"qir_minor_version", i32 0}
-</script>
-
-<script type="text/plain" id="pyqirsimple" data-example="PyQIR sample with redundant gates" data-file="pyqir_simple.ll" data-settings='{"emit": "circuit", "observable": "", "vary": "", "bind": "", "gates": "rz-sx-cx", "epsilon": "", "coupling": "", "device": ""}'>
-; ModuleID = 'grover'
-source_filename = "grover"
-
-%Qubit = type opaque
-%Result = type opaque
-
-define void @main() #0 {
-entry:
-  call void @__quantum__qis__h__body(%Qubit* null)
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__ccx__body(%Qubit* null, %Qubit* inttoptr (i64 1 to %Qubit*), %Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__h__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 2 to %Qubit*))
-  call void @__quantum__qis__s__body(%Qubit* null)
-  call void @__quantum__qis__t__adj(%Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__rz__body(double 0x400921FB54442D18, %Qubit* null)
-  call void @__quantum__qis__swap__body(%Qubit* null, %Qubit* inttoptr (i64 1 to %Qubit*))
-  call void @__quantum__qis__mz__body(%Qubit* null, %Result* null)
-  call void @__quantum__qis__mz__body(%Qubit* inttoptr (i64 1 to %Qubit*), %Result* inttoptr (i64 1 to %Result*))
-  ret void
-}
-
-declare void @__quantum__qis__h__body(%Qubit*)
-declare void @__quantum__qis__x__body(%Qubit*)
-declare void @__quantum__qis__s__body(%Qubit*)
-declare void @__quantum__qis__t__adj(%Qubit*)
-declare void @__quantum__qis__rz__body(double, %Qubit*)
-declare void @__quantum__qis__ccx__body(%Qubit*, %Qubit*, %Qubit*)
-declare void @__quantum__qis__swap__body(%Qubit*, %Qubit*)
-declare void @__quantum__qis__mz__body(%Qubit*, %Result*)
-
-attributes #0 = { "entry_point" "num_required_qubits"="3" "num_required_results"="2" "output_labeling_schema" "qir_profiles"="base_profile" }
-
-!llvm.module.flags = !{!0, !1, !2, !3}
-
-!0 = !{i32 1, !"qir_major_version", i32 1}
-!1 = !{i32 7, !"qir_minor_version", i32 0}
-!2 = !{i32 1, !"dynamic_qubit_management", i1 false}
-!3 = !{i32 1, !"dynamic_result_management", i1 false}
-</script>
-
-<script type="text/plain" id="mod54" data-example="mod5_4, T count reduction" data-file="mod5_4.qasm" data-settings='{"emit": "cost", "observable": "", "vary": "", "bind": "", "gates": "h,s,t,cx", "epsilon": "", "coupling": "", "device": ""}'>
-// mod5_4 from the RevLib benchmarks, a standard test for T count reduction.
-OPENQASM 2.0;
-include "qelib1.inc";
-qreg q[5];
-x q[4];
-h q[4];
-cx q[3], q[4];
-tdg q[4];
-cx q[0], q[4];
-t q[4];
-cx q[3], q[4];
-tdg q[4];
-cx q[0], q[4];
-t q[3];
-t q[4];
-cx q[0], q[3];
-t q[0];
-tdg q[3];
-cx q[0], q[3];
-cx q[3], q[4];
-tdg q[4];
-cx q[2], q[4];
-t q[4];
-cx q[3], q[4];
-tdg q[4];
-cx q[2], q[4];
-t q[3];
-t q[4];
-cx q[2], q[3];
-t q[2];
-tdg q[3];
-cx q[2], q[3];
-h q[4];
-cx q[3], q[4];
-h q[4];
-cx q[2], q[4];
-tdg q[4];
-cx q[1], q[4];
-t q[4];
-cx q[2], q[4];
-tdg q[4];
-cx q[1], q[4];
-t q[2];
-t q[4];
-cx q[1], q[2];
-t q[1];
-tdg q[2];
-cx q[1], q[2];
-h q[4];
-cx q[2], q[4];
-h q[4];
-cx q[1], q[4];
-tdg q[4];
-cx q[0], q[4];
-t q[4];
-cx q[1], q[4];
-tdg q[4];
-cx q[0], q[4];
-t q[1];
-t q[4];
-cx q[0], q[1];
-t q[0];
-tdg q[1];
-cx q[0], q[1];
-h q[4];
-cx q[1], q[4];
-cx q[0], q[4];
-</script>
-
-<script type="text/plain" id="badprofile" data-example="A Base Profile program that branches" data-file="bad_profile.ll" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
-; ModuleID = 'bad_profile'
-source_filename = "bad_profile"
-
-%Qubit = type opaque
-%Result = type opaque
-
-define void @main() #0 {
-entry:
-  call void @__quantum__qis__h__body(%Qubit* null)
-  call void @__quantum__qis__mz__body(%Qubit* null, %Result* null)
-  %bit = call i1 @__quantum__qis__read_result__body(%Result* null)
-  br i1 %bit, label %flip, label %done
-
-flip:
-  call void @__quantum__qis__x__body(%Qubit* inttoptr (i64 1 to %Qubit*))
-  br label %done
-
-done:
-  ret void
-}
-
-declare void @__quantum__qis__h__body(%Qubit*)
-declare void @__quantum__qis__x__body(%Qubit*)
-declare void @__quantum__qis__mz__body(%Qubit*, %Result* writeonly)
-declare i1 @__quantum__qis__read_result__body(%Result*)
-
-attributes #0 = { "entry_point" "qir_profiles"="base_profile" "required_num_qubits"="2" "required_num_results"="1" }
-</script>
-
-<script type="text/plain" id="star" data-example="Star circuit for a line of qubits" data-file="star.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "rz-sx-cx", "epsilon": "", "coupling": "line:4", "device": ""}'>
-// Qubit 0 talks to every other qubit, but on a line of four only
-// neighbours can interact, so the router has to bring them together.
-OPENQASM 2.0;
-include "qelib1.inc";
-qreg q[4];
-creg c[4];
-ry(1.1) q[0];
-ry(0.6) q[2];
-cx q[0], q[1];
-cx q[0], q[2];
-cx q[0], q[3];
-cx q[2], q[1];
-measure q -> c;
-</script>
-
-<script type="text/plain" id="wide" data-example="Rotation chain on the state vector" data-file="wide.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
-// A rotation spread along a chain of qubits by CNOTs. Not Clifford, so it
-// runs on the state vector: 2^n amplitudes, updated with AVX2 on every core.
-OPENQASM 3.0;
-include "stdgates.inc";
-const int n = 20;
-qubit[n] q;
-bit[2] c;
-ry(0.9) q[0];
-for int i in [0:n - 2] {
-  cx q[i], q[i + 1];
-}
-c[0] = measure q[0];
-c[1] = measure q[n - 1];
-</script>
-
-<script type="text/plain" id="cliffordt" data-example="40 qubits with 3 T gates, stabilizer rank" data-file="clifford_t40.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
-// A 40 qubit GHZ chain with three T gates. Clifford circuits with a few
-// T gates run as a sum of stabilizer states, exactly, at any width.
-OPENQASM 3.0;
-include "stdgates.inc";
-qubit[40] q;
-bit[3] c;
-h q[0];
-for int i in [0:38] {
-  cx q[i], q[i + 1];
-}
-t q[5];
-t q[20];
-t q[35];
-h q[5];
-h q[20];
-h q[35];
-c[0] = measure q[5];
-c[1] = measure q[20];
-c[2] = measure q[35];
-</script>
-
-<script type="text/plain" id="chain60" data-example="60 qubit chain, matrix product state" data-file="chain60.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": ""}'>
+<script type="text/plain" id="chain60" data-example="60 qubit rotation chain" data-file="chain60.qasm" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "", "observable": "", "shots": "1000", "seed": "7"}'>
 // Three layers of rotations and CNOTs along 60 qubits: far past any state
 // vector. qirc cuts it into pieces that fit, or with --bond 32 runs it as a
 // matrix product state that reports how much it had to truncate.
@@ -1830,7 +1262,7 @@ c[2] = measure q[40];
 c[3] = measure q[59];
 </script>
 
-<script type="text/plain" id="ghz5m" data-example="Measured GHZ on a noisy device" data-file="ghz5_measured.qasm" data-settings='{"emit": "run", "observable": "", "vary": "", "bind": "", "gates": "", "epsilon": "", "coupling": "", "device": "noisy"}'>
+<script type="text/plain" id="ghz5m" data-example="GHZ with readout errors, mitigated" data-file="ghz5_measured.qasm" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "readoutfix", "bind": "", "vary": "", "observable": "", "shots": "4000", "seed": "7"}'>
 // A five qubit GHZ state, measured. On a perfect device every shot reads
 // 00000 or 11111; on a noisy one, some shots read anything else.
 OPENQASM 2.0;
@@ -1843,6 +1275,49 @@ cx q[1], q[2];
 cx q[2], q[3];
 cx q[3], q[4];
 measure q -> c;
+</script>
+
+<script type="text/plain" id="zne" data-example="GHZ with zero noise extrapolation" data-file="ghz5.qasm" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "zne", "bind": "", "vary": "", "observable": "Z0 Z4", "shots": "4000", "seed": "2"}'>
+// A five qubit GHZ state on the line5.cal device. The observable Z0 Z4 is 1
+// on an ideal device. With noise it drops, and zero noise extrapolation runs
+// the circuit at one, two and three times the noise and extends to zero.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[5];
+h q[0];
+cx q[0], q[1];
+cx q[1], q[2];
+cx q[2], q[3];
+cx q[3], q[4];
+</script>
+
+<script type="text/plain" id="echo" data-example="Echo pulses on a detuned qubit" data-file="idle.qasm" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "decoupled", "bind": "", "vary": "", "observable": "", "shots": "4000", "seed": "7"}'>
+// Qubit 0 waits through three CNOTs while its frequency is off by 300 kHz.
+// Switch Device between "detuned" and "echo pulses" to see the phase undone.
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[4];
+creg c[1];
+h q[0];
+cx q[1], q[2];
+cx q[2], q[3];
+cx q[1], q[2];
+cz q[1], q[0];
+h q[0];
+measure q[0] -> c[0];
+</script>
+
+<script type="text/plain" id="vqe" data-example="Variational ground state" data-file="ansatz.qasm" data-settings='{"emit": "run", "opt": "1", "gates": "", "epsilon": "", "resynth": "", "cost": "gates", "coupling": "", "relabel": "", "reuse": "", "device": "", "bind": "", "vary": "minimize", "observable": "Z0 Z1 + 0.5 X0 + 0.5 X1", "shots": "1000", "seed": "7"}'>
+// Each input is a parameter of the circuit. Vary: minimise runs gradient
+// descent on the observable; the ground energy of this one is -sqrt(2).
+OPENQASM 3.0;
+include "stdgates.inc";
+input float theta;
+input float phi;
+qubit[2] q;
+ry(theta) q[0];
+ry(phi) q[1];
+cx q[0], q[1];
 </script>
 
 <script type="text/plain" data-calibration="readout.cal">
@@ -2130,9 +1605,10 @@ function commandFromControls() {
   if ($("reuse").value) parts.push("--reuse");
   const device = $("device").value;
   const detuned = device === "detuned" || device === "decoupled";
-  if (device) parts.push("--calibration", detuned ? "detuned.cal" : "line5.cal");
+  const file = detuned ? "detuned.cal" : device.startsWith("readout") ? "readout.cal" : device === "pair" ? "pair.cal" : "line5.cal";
+  if (device) parts.push("--calibration", file);
   if (device && device !== "cal") parts.push("--noisy");
-  if (device === "mitigate") parts.push("--mitigate");
+  if (device === "mitigate" || device === "readoutfix") parts.push("--mitigate");
   if (device === "decoupled") parts.push("--dd");
   const bind = $("bind").value.replace(/\s+/g, "");
   if (bind) parts.push("--bind", bind);
@@ -2330,7 +1806,6 @@ function show(reply, tokens) {
   showZoom();
   if (stepping) showStep(stepping.ops.length);
   $("view-results").innerHTML = drawResults(tokens[0] === "diff" ? "" : result.stdout);
-  tourScroll();
 }
 
 function summarize(program) {
@@ -2975,208 +2450,6 @@ if (!framed) {
   });
 }
 
-// The showcase: eight demos for a talk, each a few runs of the playground itself.
-const STAR = "--gates rz-sx-cx --coupling line:4";
-const ENERGY = "--observable Z0*Z1*+*0.5*X0*+*0.5*X1 --minimize";
-const TOUR = [
-  {
-    title: "From a quantum program to results",
-    caption: "A loop over an array of qubits and a helper function, as Q# emits them. qirc runs the classical half at compile time, leaves four gates and simulates them.",
-    seconds: 30,
-    steps: [
-      ["qsharp_loop.ll", "qsharp_loop.ll -O1 --shots 1000 --seed 7", "text"],
-      ["qsharp_loop.ll", "qsharp_loop.ll -O1 --emit circuit", "circuit"],
-      ["qsharp_loop.ll", "qsharp_loop.ll -O1 --emit qasm3", "text"],
-    ],
-  },
-  {
-    title: "The optimiser, and proof it changed nothing",
-    caption: "13 gates become 2, mod5_4 goes from 28 T gates to 8, and qirc diff proves the optimised program equivalent to the original.",
-    seconds: 30,
-    steps: [
-      ["redundant.ll", "redundant.ll -O3 --emit ir", "text"],
-      ["mod5_4.qasm", "mod5_4.qasm -O0 --gates h,s,t,cx --emit cost", "text"],
-      ["mod5_4.qasm", "mod5_4.qasm -O2 --gates h,s,t,cx --emit cost", "text"],
-      ["mod5_4.qasm", "diff mod5_4.qasm -O2 --gates h,s,t,cx", "text"],
-    ],
-  },
-  {
-    title: "Mistakes are reported at the source",
-    caption: "A program that claims the Base Profile but branches on a measurement: an error code, the exact line, and a longer explanation.",
-    seconds: 15,
-    steps: [
-      ["bad_profile.ll", "bad_profile.ll", "text"],
-      ["bad_profile.ll", "explain QIR0300", "text"],
-    ],
-  },
-  {
-    title: "Ready for real hardware",
-    caption: "Qubit 0 talks to every other qubit, but on a line of four only neighbours interact and the chip only has rz, sx and cx. qirc rebuilds and routes it, and the answer does not change.",
-    seconds: 25,
-    steps: [
-      ["star.qasm", "star.qasm -O2 --emit circuit", "circuit"],
-      ["star.qasm", "star.qasm -O2 --emit circuit " + STAR, "circuit"],
-      ["star.qasm", "star.qasm -O2 --shots 100000 --seed 7 --no-state " + STAR, "results"],
-      ["star.qasm", "diff star.qasm -O2 " + STAR, "text"],
-    ],
-  },
-  {
-    title: "Past 30 qubits",
-    caption: "A state vector doubles with every qubit, so qirc looks at the program first and picks a simulator that fits it: a tableau, a bit vector, cutting or a matrix product state.",
-    seconds: 25,
-    steps: [
-      ["ghz1000.ll", "ghz1000.ll -O1 --observable X0*X1*Y2*+*Z0*Z999 --shots 1000 --seed 7", "text", "measurement over"],
-      ["adder.qasm", "adder.qasm -O1 --shots 100 --seed 7 --no-state", "text", "measurement over"],
-      ["halves.qasm", "halves.qasm -O1 --shots 1000 --seed 7 --no-state", "results"],
-      ["chain60.qasm", "chain60.qasm -O1 --bond 32 --shots 1000 --seed 7 --no-state", "text", "measurement over"],
-    ],
-  },
-  {
-    title: "Real devices are noisy",
-    caption: "A five qubit GHZ state should read 00000 or 11111. With readout errors it often does not, until qirc mitigates them. Then zero noise extrapolation, and echo pulses for a drifting qubit.",
-    seconds: 30,
-    steps: [
-      ["ghz5_measured.qasm", "ghz5_measured.qasm -O1 --shots 4000 --seed 7 --no-state --calibration readout.cal --noisy", "results"],
-      ["ghz5_measured.qasm", "ghz5_measured.qasm -O1 --shots 4000 --seed 7 --no-state --calibration readout.cal --noisy --mitigate", "text", "mitigated measurement"],
-      ["ghz5.qasm", "ghz5.qasm -O1 --calibration line5.cal --noisy --observable Z0*Z4 --zne --shots 4000 --seed 2 --no-state", "text", "expectation of"],
-      ["idle.qasm", "idle.qasm -O1 --calibration detuned.cal --noisy --shots 4000 --seed 7 --no-state", "results"],
-      ["idle.qasm", "idle.qasm -O1 --calibration detuned.cal --noisy --dd --shots 4000 --seed 7 --no-state", "results"],
-    ],
-  },
-  {
-    title: "Planning for error corrected machines",
-    caption: "Code distance, magic state factories, physical qubits and runtime from the compiled program, then the surface code itself, simulated and decoded, against the model the estimate assumes.",
-    seconds: 25,
-    steps: [
-      ["mod5_4.qasm", "mod5_4.qasm -O2 --emit resources", "text"],
-      ["mod5_4.qasm", "surface --error 0.001 --shots 200000", "text"],
-    ],
-  },
-  {
-    title: "Variational circuits",
-    caption: "OpenQASM 3 inputs become parameters. qirc finds the ground energy of Z0 Z1 + 0.5 X0 + 0.5 X1, minus root two, exactly and again the way a noisy device would see it.",
-    seconds: 20,
-    steps: [
-      ["ansatz.qasm", "ansatz.qasm -O1 " + ENERGY, "text"],
-      ["ansatz.qasm", "ansatz.qasm -O1 " + ENERGY + " --noisy --calibration pair.cal --seed 5", "text"],
-    ],
-  },
-];
-const TOUR_STEPS = TOUR.flatMap((demo, d) =>
-  demo.steps.map((step, i) => ({ demo: d, index: i, file: step[0], command: step[1], view: step[2], find: step[3] || "" })),
-);
-const TOUR_TOTAL = TOUR.reduce((sum, demo) => sum + demo.seconds, 0);
-let touring = -1;
-let tourStart = 0;
-let tourFind = "";
-
-// Shows a step's options in the controls, without rebuilding the command from them.
-function tourControls(text) {
-  const tokens = words(text);
-  const value = (flag) => (tokens.includes(flag) ? tokens[tokens.indexOf(flag) + 1] : "");
-  const set = (id, v) => {
-    const control = $(id);
-    if (control.tagName !== "SELECT" || [...control.options].some((o) => o.value === v)) control.value = v;
-  };
-  emit = tokens[0] === "diff" ? "diff" : value("--emit") || "run";
-  if (!EMITS.includes(emit)) emit = "run";
-  showEmit();
-  const level = tokens.find((t) => /^-O[0-3]$/.test(t));
-  if (level) set("opt", level.slice(2));
-  set("gates", value("--gates"));
-  set("coupling", value("--coupling"));
-  const calibration = value("--calibration");
-  const device = !calibration ? "" : calibration === "line5.cal" ? (tokens.includes("--noisy") ? "noisy" : "cal") : calibration === "detuned.cal" ? (tokens.includes("--dd") ? "decoupled" : "detuned") : "";
-  set("device", device);
-  set("observable", value("--observable").replace(/\*/g, " "));
-  if (value("--shots")) set("shots", value("--shots"));
-  if (value("--seed")) set("seed", value("--seed"));
-}
-
-// After a step runs, scroll the output to the line worth reading.
-function tourScroll() {
-  if (!tourFind) return;
-  const at = stdout.textContent.indexOf(tourFind);
-  tourFind = "";
-  if (at < 0) return;
-  const line = stdout.textContent.slice(0, at).split("\n").length - 1;
-  const height = parseFloat(getComputedStyle(stdout).lineHeight) || 20;
-  const box = $("view-text");
-  if (box.scrollHeight > box.clientHeight + 4) {
-    const top = stdout.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop;
-    box.scrollTop = Math.max(0, top + line * height - 12);
-  } else {
-    const top = stdout.getBoundingClientRect().top + window.scrollY + line * height;
-    window.scrollTo({ top: Math.max(0, top - $("tour").offsetHeight - 40) });
-  }
-}
-
-function clockText(seconds) {
-  const s = Math.max(0, Math.floor(seconds));
-  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
-}
-
-function tourClock() {
-  if (touring < 0) return;
-  const elapsed = (Date.now() - tourStart) / 1000;
-  const step = TOUR_STEPS[touring];
-  const budget = TOUR.slice(0, step.demo + 1).reduce((sum, demo) => sum + demo.seconds, 0);
-  $("tour-clock").textContent = clockText(elapsed) + " of " + clockText(TOUR_TOTAL);
-  $("tour-clock").classList.toggle("late", elapsed > budget + 5);
-}
-setInterval(tourClock, 500);
-
-function tourShow(at) {
-  touring = Math.max(0, Math.min(TOUR_STEPS.length - 1, at));
-  const step = TOUR_STEPS[touring];
-  const demo = TOUR[step.demo];
-  $("tour").hidden = false;
-  $("tour-count").textContent = step.demo + 1 + "/" + TOUR.length;
-  $("tour-title").textContent = demo.title;
-  $("tour-caption").textContent = demo.caption;
-  $("tour-step").textContent = "run " + (step.index + 1) + " of " + demo.steps.length;
-  $("tour-pace").innerHTML = TOUR.map(
-    (d, i) => `<span class="${i < step.demo ? "done" : i === step.demo ? "now" : ""}" style="flex:${d.seconds}"></span>`,
-  ).join("");
-  $("tour-back").disabled = touring === 0;
-  $("tour-next").textContent = touring === TOUR_STEPS.length - 1 ? "Finish" : "Next →";
-  const example = examples.find((e) => e.file === step.file);
-  if (example && example !== current) load(example);
-  tourControls(step.command);
-  command.value = step.command;
-  tourFind = step.find;
-  $("view-text").scrollTop = 0;
-  window.scrollTo({ top: 0 });
-  view = step.view;
-  showView();
-  tourClock();
-  schedule(0);
-}
-
-function tourStop() {
-  touring = -1;
-  $("tour").hidden = true;
-  if (location.hash === "#showcase") history.replaceState(null, "", location.pathname + location.search);
-}
-
-$("tour-start").addEventListener("click", () => {
-  tourStart = Date.now();
-  tourShow(0);
-});
-$("tour-next").addEventListener("click", () => (touring === TOUR_STEPS.length - 1 ? tourStop() : tourShow(touring + 1)));
-$("tour-back").addEventListener("click", () => tourShow(touring - 1));
-$("tour-exit").addEventListener("click", tourStop);
-document.addEventListener("keydown", (event) => {
-  if (touring < 0 || event.ctrlKey || event.metaKey || event.altKey) return;
-  if (event.target.closest("textarea, input, select")) return;
-  if (["ArrowRight", "PageDown", " "].includes(event.key)) tourShow(touring + 1);
-  else if (["ArrowLeft", "PageUp"].includes(event.key)) tourShow(touring - 1);
-  else if (event.key === "Escape") tourStop();
-  else if (/^[1-8]$/.test(event.key)) tourShow(TOUR_STEPS.findIndex((s) => s.demo === Number(event.key) - 1));
-  else return;
-  event.preventDefault();
-});
-
 start()
   .then(() => fetch("qirc.wasm"))
   .then((response) => {
@@ -3187,12 +2460,7 @@ start()
     bytes = buffer;
     return startWorker();
   })
-  .then(() => {
-    if (location.hash === "#showcase") {
-      tourStart = Date.now();
-      tourShow(0);
-    } else run();
-  })
+  .then(() => run())
   .catch((error) => {
     setStatus("bad", "not loaded");
     stderr.hidden = false;

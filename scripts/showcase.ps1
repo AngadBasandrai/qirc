@@ -1,12 +1,12 @@
-# A live tour of qirc in eight screens, about three and a half minutes.
+# A live tour of qirc in eight screens.
 # The programs come from the playground, web/index.html, so this and the
-# Showcase button at angadbasandrai.github.io/qirc always run the same files.
+# examples at angadbasandrai.github.io/qirc always run the same files.
 # Every run is computed before the first screen, so each one appears at once.
 #
 #   pwsh scripts/showcase.ps1            or   powershell -File scripts\showcase.ps1
 #
 # Right arrow, space or Enter moves on, left arrow goes back, 1 to 8 jump,
-# R redraws the screen, T restarts the clock, Q or Escape quits.
+# R redraws the screen, Q or Escape quits.
 # -Trust adds a ninth screen that runs the test suite, and -Print draws every
 # screen one after another without waiting, to rehearse or check the output.
 param(
@@ -364,7 +364,6 @@ $beats = @(
     @{
         Title   = "From a quantum program to results"
         Caption = "A Q# style loop and helper function: run at compile time, flattened to four gates, simulated, and written out as OpenQASM 3"
-        Seconds = 30
         Show    = "qsharp_loop.ll --shots 1000 --seed 7", "qsharp_loop.ll --emit qasm3"
         Jobs    = @{ run = "qsharp_loop.ll --shots 1000 --seed 7"; qasm = "qsharp_loop.ll --emit qasm3" }
         Body    = {
@@ -391,7 +390,6 @@ $beats = @(
     @{
         Title   = "The optimiser, and proof it changed nothing"
         Caption = "Gates and T gates before and after optimisation, each result checked against the original by qirc diff"
-        Seconds = 30
         Show    = "redundant.ll -O3 -v --emit check", "mod5_4.qasm --gates h,s,t,cx -O2 --emit cost", "diff mod5_4.qasm -O2 --gates h,s,t,cx"
         Jobs    = @{
             r0 = "redundant.ll -O0 --emit check"; r3 = "redundant.ll -O3 -v --emit check"; rd = "diff redundant.ll -O3"
@@ -432,7 +430,6 @@ $beats = @(
     @{
         Title   = "Mistakes are reported at the source"
         Caption = "A program that claims the Base Profile but branches on a measurement: a code, the exact line, and a longer explanation"
-        Seconds = 15
         Show    = "bad_profile.ll", "explain QIR0300", "qsharp_loop.ll --emit qsam3"
         Jobs    = @{ bad = "bad_profile.ll"; explain = "explain QIR0300"; typo = "qsharp_loop.ll --emit qsam3" }
         Body    = {
@@ -447,7 +444,6 @@ $beats = @(
     @{
         Title   = "Ready for real hardware"
         Caption = "Qubit 0 talks to every other qubit, but on a line of four only neighbours interact and the chip only has rz, sx and cx"
-        Seconds = 25
         Show    = "star.qasm --emit circuit $star", "star.qasm --shots 100000 $star", "diff star.qasm $star"
         Jobs    = @{
             c0 = "star.qasm --emit circuit"; c1 = "star.qasm --emit circuit $star"
@@ -484,7 +480,6 @@ $beats = @(
     @{
         Title   = "Past 30 qubits"
         Caption = "A state vector doubles with every qubit, so qirc looks at the program first and picks a simulator that fits it. 1000 shots each"
-        Seconds = 25
         Show    = "ghz1000.ll --shots 1000", "adder.qasm --shots 1000", "chain60.qasm --bond 32 --shots 1000"
         Jobs    = @{
             wide = "wide.qasm --shots 1000 --no-state"; ghz = "ghz1000.ll --shots 1000 --no-state"; adder = "adder.qasm --shots 1000 --no-state"
@@ -526,7 +521,6 @@ $beats = @(
     @{
         Title   = "Real devices are noisy"
         Caption = "A five qubit GHZ state should read 00000 or 11111. With a device's errors it often does not, and qirc has the standard fixes"
-        Seconds = 30
         Show    = "ghz5_measured.qasm --shots 4000 --calibration readout.cal --noisy --mitigate", "ghz5.qasm --calibration line5.cal --noisy --observable Z0*Z4 --zne", "idle.qasm --calibration detuned.cal --noisy --dd"
         Jobs    = @{
             ideal = "ghz5_measured.qasm --shots 4000 --no-state"; noisy = "ghz5_measured.qasm --shots 4000 --no-state --calibration line5.cal --noisy"
@@ -581,7 +575,6 @@ $beats = @(
     @{
         Title   = "Planning for error corrected machines"
         Caption = "T gates, code distance, factories, physical qubits and runtime from the compiled program, then the surface code itself, simulated and decoded"
-        Seconds = 25
         Show    = "mod5_4.qasm --emit resources -O2", "surface --error 0.001 --shots 200000"
         Jobs    = @{ o0 = "mod5_4.qasm --emit resources -O0"; o2 = "mod5_4.qasm --emit resources -O2"; surface = "surface --error 0.001 --shots 200000" }
         Body    = {
@@ -612,7 +605,6 @@ $beats = @(
     @{
         Title   = "Variational circuits"
         Caption = "OpenQASM 3 inputs become parameters: the ground energy of Z0 Z1 + 0.5 X0 + 0.5 X1, exactly and on a noisy device"
-        Seconds = 20
         Show    = "ansatz.qasm --observable `"Z0 Z1 + 0.5 X0 + 0.5 X1`" --minimize", "ansatz.qasm --observable `"...`" --minimize --noisy --calibration pair.cal"
         Jobs    = @{ exact = "ansatz.qasm --observable $observable --minimize"; noisy = "ansatz.qasm --observable $observable --minimize --noisy --calibration pair.cal --seed 5" }
         Body    = {
@@ -670,7 +662,6 @@ if ($Trust) {
     $beats += @{
         Title   = "Why you can trust it"
         Caption = "The full test suite, run now"
-        Seconds = 30
         Show    = @("cargo test --release")
         Jobs    = @{}
         Body    = {
@@ -691,16 +682,6 @@ if ($Trust) {
 
 # ------------------------------------------------------------------ presenter
 
-$total = ($beats | ForEach-Object { $_.Seconds } | Measure-Object -Sum).Sum
-$clockStart = $null
-
-function Format-Clock {
-    param([double] $Seconds)
-
-    $s = [int] [math]::Floor([math]::Max(0.0, $Seconds))
-    "{0}:{1:00}" -f [math]::Floor($s / 60), ($s % 60)
-}
-
 function Write-Header {
     param([int] $Index)
 
@@ -708,24 +689,7 @@ function Write-Header {
     $beat = $beats[$Index]
     Write-Host " qirc " -NoNewline -ForegroundColor Black -BackgroundColor Cyan
     Write-Host ("  " + ($Index + 1) + "/" + $beats.Count + "  ") -NoNewline -ForegroundColor DarkGray
-    $title = $beat.Title
-    $elapsed = ([DateTime]::Now - $script:clockStart).TotalSeconds
-    $budget = ($beats[0..$Index] | ForEach-Object { $_.Seconds } | Measure-Object -Sum).Sum
-    $clock = (Format-Clock $elapsed) + " of " + (Format-Clock $total)
-    Write-Host $title -NoNewline -ForegroundColor White
-    $gap = [math]::Max(2, (Get-Width) - 14 - $title.Length - $clock.Length)
-    Write-Host (" " * $gap) -NoNewline
-    Write-Host $clock -ForegroundColor $(if ($elapsed -gt $budget + 5) { "Yellow" } else { "DarkGray" })
-
-    $width = (Get-Width) - 2
-    Write-Host "  " -NoNewline
-    for ($i = 0; $i -lt $beats.Count; $i++) {
-        $cells = [math]::Max(1, [int] [math]::Floor($width * $beats[$i].Seconds / $total) - 1)
-        $color = if ($i -lt $Index) { "DarkCyan" } elseif ($i -eq $Index) { "Cyan" } else { "DarkGray" }
-        Write-Host ([string] [char] 0x2501 * $cells) -NoNewline -ForegroundColor $color
-        Write-Host " " -NoNewline
-    }
-    Write-Host ""
+    Write-Host $beat.Title -ForegroundColor White
     Write-Host ("  " + $beat.Caption) -ForegroundColor DarkGray
     Write-Host ""
     foreach ($command in $beat.Show) {
@@ -744,7 +708,6 @@ function Wait-Key {
     if ($key.Key -eq "LeftArrow" -or $key.Key -eq "Backspace" -or $key.Key -eq "PageUp") { return "back" }
     if ($key.Key -eq "Escape" -or $key.Key -eq "Q") { return "quit" }
     if ($key.Key -eq "R") { return "redraw" }
-    if ($key.Key -eq "T") { return "clock" }
     if ($key.KeyChar -ge "1" -and $key.KeyChar -le "9") { return "jump:" + $key.KeyChar }
     "next"
 }
@@ -771,7 +734,7 @@ Save-Programs
 $jobs = @($beats | ForEach-Object { $_.Jobs.Values })
 Clear-Host
 Write-Host " qirc " -NoNewline -ForegroundColor Black -BackgroundColor Cyan
-Write-Host "  live showcase, $($beats.Count) screens in about $(Format-Clock $total)" -ForegroundColor White
+Write-Host "  live showcase, $($beats.Count) screens" -ForegroundColor White
 Write-Host ""
 for ($i = 0; $i -lt $jobs.Count; $i++) {
     Write-Host ("`r  computing ahead: " + ($i + 1) + " of " + $jobs.Count + " runs   ") -NoNewline -ForegroundColor DarkGray
@@ -782,19 +745,16 @@ Write-Host ("`r  " + $jobs.Count + " runs computed in " + (Format-Ms $compute) +
 Write-Host ""
 for ($i = 0; $i -lt $beats.Count; $i++) {
     Write-Host ("  " + ($i + 1) + "  ") -NoNewline -ForegroundColor Cyan
-    Write-Host $beats[$i].Title.PadRight(48) -NoNewline -ForegroundColor White
-    Write-Host ("" + $beats[$i].Seconds + " s") -ForegroundColor DarkGray
+    Write-Host $beats[$i].Title -ForegroundColor White
 }
 Write-Host ""
 if ($Print) {
-    $clockStart = [DateTime]::Now
     for ($i = 0; $i -lt $beats.Count; $i++) { Show-Beat $i }
     return
 }
 Write-Host "  press any key to start" -ForegroundColor DarkGray
 [void] [Console]::ReadKey($true)
 
-$clockStart = [DateTime]::Now
 $current = 0
 while ($current -lt $beats.Count) {
     Show-Beat $current
@@ -802,7 +762,6 @@ while ($current -lt $beats.Count) {
     if ($action -eq "quit") { break }
     elseif ($action -eq "back") { $current = [math]::Max(0, $current - 1) }
     elseif ($action -eq "redraw") { }
-    elseif ($action -eq "clock") { $clockStart = [DateTime]::Now }
     elseif ($action.StartsWith("jump:")) { $current = [math]::Min($beats.Count, [int] $action.Substring(5)) - 1 }
     else { $current++ }
 }

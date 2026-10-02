@@ -372,9 +372,9 @@ The module exports `allocate`, `release`, `define` and `run`. `define` names a c
 
 ## Showcase
 
-The playground's Showcase button, or <https://angadbasandrai.github.io/qirc/#showcase>, steps through eight demos sized for about three and a half minutes of a talk: compiling a Q# style loop, the optimiser with `qirc diff` proving each result, diagnostics, routing onto a line of qubits, the simulator chosen for programs past 30 qubits, noise and its mitigation, fault tolerant resources against a simulated surface code, and a variational search. Each demo is a few runs of the playground itself, with the program in the editor and the command on the command line, and a clock shows the time against the target. The arrow keys or a presenter remote move between runs, `1` to `8` jump to a demo and Escape leaves.
+The playground's examples are the demo programs of a talk, in the order they are shown: a Q# style loop, the optimiser and T count reduction, a diagnostic, routing onto a line of qubits, the simulators for programs past 30 qubits, readout mitigation, zero noise extrapolation, echo pulses and a variational search. Picking one sets the options it is shown with.
 
-`scripts/showcase.ps1` is the same tour in a terminal, reading the same programs from `web/index.html`. It builds qirc, computes every screen up front, then steps through them on a key press:
+`scripts/showcase.ps1` shows the same demos in a terminal, reading the programs from `web/index.html`. It builds qirc, computes every screen up front, then steps through them on a key press:
 
 ```text
 pwsh scripts/showcase.ps1
