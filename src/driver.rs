@@ -11,6 +11,7 @@ use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::anneal;
 use crate::calibration::Calibration;
 use crate::codegen;
 use crate::cost;
@@ -18,10 +19,12 @@ use crate::diag::{Diagnostic, Severity, SourceFile, suggest};
 use crate::draw;
 use crate::equiv;
 use crate::gridsynth;
-use crate::ir::Program;
+use crate::ir::{GateKind, Program};
+use crate::lift;
 use crate::lower;
 use crate::observable::{self, Observable, Sampled};
 use crate::opt::{self, OptStats};
+use crate::parity;
 use crate::parse::parse_module;
 use crate::progress::{self, Progress};
 use crate::provider;
@@ -33,17 +36,24 @@ use crate::reuse::{self, Reused};
 use crate::rotations;
 use crate::route::{self, Coupling, Relabelled, RouteStats};
 use crate::sema;
+use crate::semcomm;
+use crate::semlift;
 use crate::simulator::exec::{self, ExecConfig};
 use crate::simulator::state::Rng;
 use crate::simulator::{mps, state};
 use crate::stim;
 use crate::synth::{self, Cost};
+use crate::trace;
 use crate::transpile::{self, GateSet, TranspileStats};
+use crate::trirank;
 use crate::verify;
 
 const DIFF_QUBITS: usize = 20;
-// Recursive lowering supports programs thousands of calls deep; keep the stack large enough for
-// that documented limit. The compiler thread is joined before `compile` returns.
+const REFINE_ROUNDS: usize = 8;
+const GAUGE_ROUNDS: usize = 4;
+const STAGE_ROUNDS: usize = 2;
+const TRIRANK_MARGIN: usize = 2;
+const SEMLIFT_MARGIN: usize = 5;
 const COMPILER_STACK: usize = 256 << 20;
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_DRAWN: usize = 200_000;
@@ -153,11 +163,9 @@ impl Color {
 }
 
 #[cfg(windows)]
-#[deny(clippy::undocumented_unsafe_blocks)]
 fn enable_ansi() -> bool {
     use std::os::windows::io::AsRawHandle;
 
-    // These declarations match the Win32 console API signatures.
     unsafe extern "system" {
         fn GetConsoleMode(handle: *mut std::ffi::c_void, mode: *mut u32) -> i32;
         fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
@@ -167,8 +175,6 @@ fn enable_ansi() -> bool {
     let handle = io::stderr().as_raw_handle();
     let mut mode = 0u32;
 
-    // SAFETY: `handle` is borrowed from the live stderr stream, `mode` is a valid out-pointer,
-    // and both calls leave ownership of the handle with the standard library.
     unsafe {
         GetConsoleMode(handle, &mut mode) != 0
             && SetConsoleMode(handle, mode | VIRTUAL_TERMINAL_PROCESSING) != 0
@@ -204,6 +210,91 @@ impl Output {
         self.eprint(text);
         self.stderr.push('\n');
     }
+}
+
+#[derive(Clone, Copy)]
+enum Stage {
+    Commute,
+    Gauge,
+    Distill,
+}
+
+const STAGES: [Stage; 3] = [Stage::Commute, Stage::Gauge, Stage::Distill];
+
+fn tighten(program: &mut Program, set: &GateSet, limit: usize, cost: Cost) -> usize {
+    let before = weight(program);
+    synth::resynthesize(program, set, limit, cost);
+    parity::resynthesize(program);
+    synth::resynthesize(program, set, limit, cost);
+    trace::polish(program);
+    parity::resynthesize(program);
+    synth::resynthesize(program, set, limit, cost);
+    let after = weight(program);
+    usize::from(after != before).max(before.0.saturating_sub(after.0))
+}
+
+fn polish(program: &mut Program, set: &GateSet, limit: usize, cost: Cost) {
+    opt::optimise(program, 2, false);
+    transpile::transpile(program, set);
+    tighten(program, set, limit, cost);
+}
+
+fn commute(program: &mut Program, set: &GateSet, limit: usize, cost: Cost) -> usize {
+    let mut replaced = 0;
+    loop {
+        let mut next = program.clone();
+        if semcomm::cancel(&mut next) == 0 {
+            return replaced;
+        }
+        tighten(&mut next, set, limit, cost);
+        refine(&mut next, set, limit, cost);
+        if weight(&next) >= weight(program) {
+            return replaced;
+        }
+        replaced += weight(program).0.saturating_sub(weight(&next).0).max(1);
+        *program = next;
+    }
+}
+
+fn gauge(program: &mut Program, set: &GateSet, limit: usize, cost: Cost) -> usize {
+    let mut replaced = 0;
+    for _ in 0..GAUGE_ROUNDS {
+        let found = parity::gauge::optimal(program);
+        if found == 0 {
+            break;
+        }
+        replaced += found;
+        tighten(program, set, limit, cost);
+    }
+    replaced
+}
+
+fn weight(program: &Program) -> (usize, usize) {
+    let gates = program
+        .blocks
+        .iter()
+        .flat_map(|block| &block.ops)
+        .filter_map(|op| op.as_gate());
+    gates.fold((0, 0), |(all, wide), gate| {
+        (all + 1, wide + usize::from(gate.wires().count() > 1))
+    })
+}
+
+fn refine(program: &mut Program, set: &GateSet, limit: usize, cost: Cost) -> usize {
+    let before = weight(program).0;
+    for _ in 0..REFINE_ROUNDS {
+        let mut next = program.clone();
+        opt::optimise(&mut next, 2, false);
+        transpile::transpile(&mut next, set);
+        tighten(&mut next, set, limit, cost);
+        if next.op_count() - weight(&next).0 > program.op_count() - weight(program).0
+            || weight(&next) >= weight(program)
+        {
+            break;
+        }
+        *program = next;
+    }
+    before - weight(program).0
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -244,6 +335,7 @@ pub struct Options {
     pub gates: Option<GateSet>,
     pub resynth: Option<usize>,
     pub cost: Cost,
+    pub search: Duration,
     pub relabel: bool,
     pub reuse: bool,
     pub noisy: bool,
@@ -272,6 +364,7 @@ impl Options {
             coupling: self.coupling.clone(),
             resynth: self.resynth,
             cost: self.cost,
+            search: self.search,
             relabel: self.relabel,
             reuse: self.reuse,
             calibration: self.calibration.clone(),
@@ -296,6 +389,7 @@ impl Default for Options {
             gates: None,
             resynth: None,
             cost: Cost::Gates,
+            search: Duration::ZERO,
             relabel: false,
             reuse: false,
             noisy: false,
@@ -361,6 +455,8 @@ options:
                     with --noisy or --zne it runs SPSA on sampled noisy values
   --budget <p>      total failure probability for --emit resources      (default: 0.001)
   --cost <model>    what resynthesis minimises: gates | cx | ibm       (default: gates)
+  --search <ms>     spend up to ms milliseconds per circuit on a randomised search after
+                    -O3 with the h,x,rz,cx gate set (default 0, off)
   --relabel         remove swaps at the end of the program by permuting qubits
   --reuse           reset measured qubits and reuse them to need fewer qubits
   --noisy           simulate with the error rates from --calibration
@@ -492,6 +588,15 @@ pub fn parse_args_with(
                 options.cost = Cost::parse(value).ok_or_else(|| {
                     format!("unknown cost model `{value}`, expected gates, cx or ibm")
                 })?;
+            }
+
+            "--search" => {
+                let value = value(&mut args, "--search needs a time in milliseconds")?;
+                options.search = Duration::from_millis(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid search time `{value}`"))?,
+                );
             }
 
             "--relabel" => options.relabel = true,
@@ -629,6 +734,7 @@ pub struct Target {
     pub coupling: Option<Coupling>,
     pub resynth: Option<usize>,
     pub cost: Cost,
+    pub search: Duration,
     pub relabel: bool,
     pub reuse: bool,
     pub calibration: Option<Calibration>,
@@ -673,6 +779,25 @@ pub fn compile_for(source: &str, opt_level: u8, verify_each: bool, target: &Targ
 }
 
 fn compile_now(source: &str, opt_level: u8, verify_each: bool, target: &Target) -> Compilation {
+    let (first, close) = compile_lifted(source, opt_level, verify_each, target, true);
+    if !close {
+        return first;
+    }
+    let (second, _) = compile_lifted(source, opt_level, verify_each, target, false);
+    if weight(&second.program) < weight(&first.program) {
+        second
+    } else {
+        first
+    }
+}
+
+fn compile_lifted(
+    source: &str,
+    opt_level: u8,
+    verify_each: bool,
+    target: &Target,
+    lifting: bool,
+) -> (Compilation, bool) {
     let mut diagnostics = Vec::new();
 
     let (mut program, parse_time, lower_time) = if qasm::is_qasm(source) {
@@ -702,8 +827,63 @@ fn compile_now(source: &str, opt_level: u8, verify_each: bool, target: &Target) 
         }
     }
 
-    let (mut stats, opt_time) =
-        timed(|| opt::optimise(&mut program, opt_level, verify_each && lowered_cleanly));
+    let flat = (lifting
+        && opt_level >= 3
+        && target.gates.as_ref().is_some_and(|set| {
+            !set.has(GateKind::X, 2) && !set.has(GateKind::Z, 2) && set.has(GateKind::X, 1)
+        }))
+    .then(|| program.clone());
+    if flat.is_some() {
+        semlift::raise(&mut program);
+    }
+    let flat = flat.filter(|_| lift::holds_triples(&program));
+
+    let mut close = false;
+    let (mut stats, opt_time) = timed(|| {
+        let Some(flat) = flat else {
+            return opt::optimise(&mut program, opt_level, verify_each && lowered_cleanly);
+        };
+        let mut stats = opt::optimise(&mut program, 2, verify_each && lowered_cleanly);
+        let limit = target.resynth.unwrap_or(1);
+        let grade = |candidate: &Program| {
+            let mut candidate = candidate.clone();
+            lift::lower(&mut candidate);
+            opt::optimise(&mut candidate, opt_level, false);
+            if let Some(set) = &target.gates {
+                transpile::transpile(&mut candidate, set);
+                tighten(&mut candidate, set, limit, target.cost);
+            }
+            weight(&candidate)
+        };
+        let mut candidate = program.clone();
+        if trirank::refactor(&mut candidate) > 0 {
+            let (gates, wide) = grade(&program);
+            if grade(&candidate) < (gates - gates * TRIRANK_MARGIN / 100, wide) {
+                program = candidate;
+            }
+        }
+        let mut plain = flat.clone();
+        opt::optimise(&mut plain, opt_level, false);
+        if let Some(set) = &target.gates {
+            transpile::transpile(&mut plain, set);
+            tighten(&mut plain, set, limit, target.cost);
+        }
+        let (lifted, plain) = (grade(&program), weight(&plain));
+        if plain < lifted {
+            program = flat;
+            return opt::optimise(&mut program, opt_level, verify_each && lowered_cleanly);
+        }
+        close = plain.0 * 100 <= lifted.0 * (100 + SEMLIFT_MARGIN);
+        lift::lower(&mut program);
+        let again = opt::optimise(&mut program, opt_level, verify_each && lowered_cleanly);
+        stats.applied.extend(again.applied);
+        stats.violations.extend(again.violations);
+        stats.rounds += again.rounds;
+        stats.gates_after = again.gates_after;
+        stats.depth_after = again.depth_after;
+        stats.ops_after = again.ops_after;
+        stats
+    });
 
     lowering_violations.append(&mut stats.violations);
     stats.violations = lowering_violations;
@@ -754,7 +934,48 @@ fn compile_now(source: &str, opt_level: u8, verify_each: bool, target: &Target) 
     let native = GateSet::native();
     let set = target.gates.as_ref().unwrap_or(&native);
     let limit = target.resynth.unwrap_or(usize::from(opt_level >= 2));
-    let mut replaced = synth::resynthesize(&mut program, set, limit, target.cost);
+    let nam = opt_level >= 3 && transpiled.is_some() && anneal::usable(set);
+    let mut replaced = 0;
+    if nam {
+        replaced += tighten(&mut program, set, limit, target.cost);
+        replaced += refine(&mut program, set, limit, target.cost);
+        let mut settled = [None; STAGES.len()];
+        let mut edits = 0usize;
+        for _ in 0..STAGE_ROUNDS {
+            let before = weight(&program);
+            for (slot, stage) in STAGES.iter().enumerate() {
+                if settled[slot] == Some(edits) {
+                    continue;
+                }
+                let held = program.clone();
+                let found = match stage {
+                    Stage::Commute => commute(&mut program, set, limit, target.cost),
+                    Stage::Gauge => gauge(&mut program, set, limit, target.cost),
+                    Stage::Distill => anneal::distill(&mut program, |program| {
+                        polish(program, set, limit, target.cost)
+                    }),
+                };
+                if weight(&program) > weight(&held) {
+                    program = held;
+                } else {
+                    replaced += found;
+                    if found > 0 || weight(&program) < weight(&held) {
+                        edits += 1;
+                    }
+                }
+                settled[slot] = Some(edits);
+            }
+            if weight(&program) >= before {
+                break;
+            }
+        }
+        replaced += anneal::search(&mut program, target.search, |program| {
+            polish(program, set, limit, target.cost);
+            semcomm::cancel(program);
+        });
+    } else {
+        replaced += synth::resynthesize(&mut program, set, limit, target.cost);
+    }
     if opt_level > 0 {
         replaced += opt::drop_before_measure(&mut program);
     }
@@ -811,7 +1032,7 @@ fn compile_now(source: &str, opt_level: u8, verify_each: bool, target: &Target) 
         }
     }
 
-    Compilation {
+    let compiled = Compilation {
         program,
         stats,
         transpiled,
@@ -822,7 +1043,8 @@ fn compile_now(source: &str, opt_level: u8, verify_each: bool, target: &Target) 
         parse_time,
         lower_time,
         opt_time,
-    }
+    };
+    (compiled, close)
 }
 
 fn read(path: &PathBuf, output: &mut Output) -> Option<SourceFile> {

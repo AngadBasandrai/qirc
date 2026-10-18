@@ -80,6 +80,8 @@ qirc surface [--distance 3,5,7] [--error p | --calibration f]
   --exclude <list>  leave gates out of the target set, such as h,t
   --resynth <n>     replace runs of gates by at most n gates, 1 to 6
   --cost <model>    what resynthesis minimises: gates, cx or ibm
+  --search <ms>     spend up to ms milliseconds per circuit on a randomised search after
+                    -O3 with the h,x,rz,cx gate set (default 0, off)
   --epsilon <e>     approximate gates the target set cannot express to within e
   --budget <p>      total failure probability for --emit resources (default 0.001)
   --coupling <map>  route onto line:N, ring:N, grid:RxC, full:N or 0-1,1-2,...

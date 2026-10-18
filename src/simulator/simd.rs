@@ -55,9 +55,6 @@ pub fn apply_1q(re: &mut [f64], im: &mut [f64], m: &Matrix2, target: usize, cont
     #[cfg(target_arch = "x86_64")]
     {
         if re.len() >= LANES && avx2_available() {
-            // SAFETY: The checks above establish equal, power-of-two state-vector lengths,
-            // an in-bounds target, and an in-bounds control mask. `avx2_available` proves
-            // that the AVX2 and FMA target features required by the implementation exist.
             unsafe { apply_1q_avx2(re, im, m, target, controls) };
             return;
         }
@@ -148,13 +145,6 @@ fn lane_active(lane: usize, control_mask: u64) -> f64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-/// Applies a one-qubit matrix using AVX2 lanes.
-///
-/// # Safety
-///
-/// The slices must have the same nonzero power-of-two length of at least [`LANES`].
-/// `target` and every bit in `controls` must address that state, the target bit must not
-/// be present in `controls`, and the CPU must support AVX2 and FMA.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn apply_1q_avx2(re: &mut [f64], im: &mut [f64], m: &Matrix2, target: usize, controls: u64) {
     unsafe {

@@ -12,7 +12,7 @@ struct Term {
     angle: f64,
 }
 
-fn slope(gate: &Gate) -> Option<f64> {
+pub(crate) fn slope(gate: &Gate) -> Option<f64> {
     if !gate.controls.is_empty() {
         return None;
     }
@@ -41,7 +41,7 @@ pub(crate) fn diagonal(kind: GateKind) -> bool {
     )
 }
 
-fn xor(a: &[u32], b: &[u32]) -> Vec<u32> {
+pub(crate) fn xor(a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut out = Vec::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {

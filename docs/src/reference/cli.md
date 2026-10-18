@@ -37,6 +37,7 @@ A file whose first statement is `OPENQASM 2.0;` or `OPENQASM 3.0;` is read as Op
 | `--exclude <list>` | leave gates out of the full QIR set, such as `h,t` | |
 | `--resynth <n>` | replace runs of gates by at most `n` gates, 1 to 6 | 1 from `-O2` |
 | `--cost <model>` | what resynthesis minimises: `gates`, `cx` or `ibm` | `gates` |
+| `--search <ms>` | spend up to `ms` milliseconds per circuit on a randomised search after `-O3` with the `h,x,rz,cx` gate set | 0, off |
 | `--epsilon <e>` | approximate every gate the target set cannot express to within `e`, see [Targeting hardware](../targeting.md) | |
 | `--budget <p>` | total failure probability for `--emit resources` | 0.001 |
 | `--coupling <map>` | route onto `line:N`, `ring:N`, `grid:RxC`, `full:N` or an edge list such as `0-1,1-2,2-3` | |

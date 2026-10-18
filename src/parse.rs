@@ -215,8 +215,6 @@ impl<'a> Parser<'a> {
     fn float_literal(&mut self, token: Token) -> Option<f64> {
         let literal = self.text(token);
         match lex::parse_float(literal) {
-            // LLVM hexadecimal floating-point constants are explicit IEEE bit
-            // patterns and may legitimately encode infinities or NaNs.
             Some(value)
                 if value.is_finite() || literal.starts_with("0x") || literal.starts_with("0X") =>
             {

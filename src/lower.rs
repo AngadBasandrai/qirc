@@ -1172,8 +1172,6 @@ impl<'a> Lowerer<'a> {
                 );
             }
 
-            // Fences only constrain host-memory ordering. The lowered quantum IR has no
-            // shared-memory operations to reorder, so a fence has no observable effect.
             ast::InstKind::Fence => {}
 
             ast::InstKind::Unsupported { opcode } => {

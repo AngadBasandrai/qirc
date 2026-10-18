@@ -362,7 +362,7 @@ fn is_toffoli(op: &Op) -> Option<&Gate> {
     }
 }
 
-fn relative_pairs(ops: &[Op]) -> Vec<Option<[QubitId; 2]>> {
+pub(crate) fn relative_pairs(ops: &[Op]) -> Vec<Option<[QubitId; 2]>> {
     let mut paired = vec![None; ops.len()];
     for (start, op) in ops.iter().enumerate() {
         let Some(first) = is_toffoli(op).filter(|_| paired[start].is_none()) else {

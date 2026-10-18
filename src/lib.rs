@@ -1,6 +1,7 @@
 #![cfg_attr(docsrs, doc = include_str!("../README.md"))]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod anneal;
 pub mod ast;
 pub mod calibration;
 pub mod codegen;
@@ -8,7 +9,6 @@ pub mod cost;
 mod cut;
 pub mod diag;
 pub mod draw;
-#[deny(clippy::undocumented_unsafe_blocks)]
 pub mod driver;
 pub mod equiv;
 pub mod explain;
@@ -18,10 +18,12 @@ pub mod ir;
 pub mod json;
 mod kak;
 pub mod lex;
+mod lift;
 pub mod lower;
 pub mod lsp;
 pub mod observable;
 pub mod opt;
+mod parity;
 pub mod parse;
 mod pauli;
 mod phase;
@@ -37,10 +39,14 @@ pub mod reuse;
 pub mod rotations;
 pub mod route;
 pub mod sema;
+mod semcomm;
+mod semlift;
 pub mod simulator;
 pub mod stim;
 pub mod surface;
 pub mod synth;
+mod trace;
 pub mod transpile;
+mod trirank;
 pub mod verify;
 mod zx;

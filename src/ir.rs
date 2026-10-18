@@ -4,10 +4,6 @@ use crate::diag::Span;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-/// Maximum number of addressable qubits or classical result wires in a program.
-///
-/// Keeping this bound shared by text frontends prevents hostile declarations
-/// from turning directly into multi-gigabyte allocations.
 pub const MAX_WIRES: u32 = 1 << 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1017,9 +1013,6 @@ mod tests {
         };
         assert_eq!(gate.constant_params(), [2.0]);
 
-        // LLVM integer constants are bit patterns. Signed operations must
-        // interpret narrow values using the declared type, not as positive
-        // host i64 values.
         assert_eq!(
             BinOp::SDiv.apply(Scalar::Int(8), Const::Int(255), Const::Int(2)),
             Const::Int(0)

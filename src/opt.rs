@@ -6,6 +6,7 @@ use crate::ir::*;
 use crate::phase;
 use crate::simulator::matrix::{Matrix2, matrix_for};
 use crate::synth;
+use crate::trace;
 use crate::verify;
 use crate::zx;
 
@@ -129,6 +130,7 @@ fn schedule(level: u8) -> Vec<(&'static str, Pass)> {
     }
 
     if level >= 3 {
+        schedule.push(("trace-normal-form", trace::normalise));
         schedule.push(("fuse-single-qubit", fuse_single_qubit));
     }
 

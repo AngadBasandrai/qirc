@@ -149,8 +149,6 @@ fn split(qubits: usize, pairs: &[(usize, usize)], low: usize, high: usize) -> Op
         yes.sort_by_key(|&q| (delta[q], q));
         no.sort_by_key(|&q| (delta[q], q));
 
-        // For each vertex, only the lowest-delta non-neighbour can be the best
-        // zero-correction swap. Every skipped candidate is an actual sparse edge.
         for &a in &yes {
             if let Some(&b) = no.iter().find(|&&b| !weight.contains_key(&edge(a, b))) {
                 consider(delta[a].saturating_add(delta[b]), Move::Swap(a, b));

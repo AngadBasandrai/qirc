@@ -568,6 +568,9 @@ impl Synth {
             }
         }
         consider(self.root_x(u, target, span));
+        for &kind in &self.fixed {
+            consider(self.sandwich(u, kind, target, span));
+        }
         for (outer, _) in &self.turns {
             for (inner, _) in &self.turns {
                 if outer != inner {
@@ -576,6 +579,32 @@ impl Synth {
             }
         }
         best
+    }
+
+    fn sandwich(
+        &self,
+        u: Matrix2,
+        kind: GateKind,
+        target: QubitId,
+        span: Span,
+    ) -> Option<Vec<Gate>> {
+        if !self.direct.iter().any(|&(a, _)| a == Axis::Z) {
+            return None;
+        }
+        let f = matrix_for(kind, &[]);
+        if [f.a, f.b, f.c, u.a].iter().any(|x| x.norm() < EPSILON) {
+            return None;
+        }
+        let first = ((u.b / u.a) / (f.b / f.a)).arg();
+        let last = ((u.c / u.a) / (f.c / f.a)).arg();
+        Some(
+            [
+                self.angle(Axis::Z, first, target, span)?,
+                vec![fixed(kind, target, span)],
+                self.angle(Axis::Z, last, target, span)?,
+            ]
+            .concat(),
+        )
     }
 
     fn root_x(&self, u: Matrix2, target: QubitId, span: Span) -> Option<Vec<Gate>> {
