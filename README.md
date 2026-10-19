@@ -235,7 +235,9 @@ The profile comes from the `qir_profiles` attribute on the entry point. Qubit an
 | `-O0` | none |
 | `-O1` | identity removal, inverse cancellation, rotation merging, constant folding, dead code elimination |
 | `-O2` | `-O1` plus peephole rewrites, phase folding, phase teleportation and CFG simplification, repeated until nothing changes, then window resynthesis |
-| `-O3` | `-O2` plus single qubit gate fusion |
+| `-O3` | `-O2` plus single qubit gate fusion, and with a gate set of `h`, `x`, `rz` and `cx` the passes below |
+
+With `--gates rz,h,x,cx` at `-O3`, Toffolis are found in the flattened circuit from the parity terms they leave in its phase polynomial, whatever order their gates were written in, and lowered again with the T polarity and CNOT ladder of each chosen to cancel against its neighbours. A gate is cancelled or merged with a later copy when it commutes with the whole block between them: the gate is carried through the block as a sum of Pauli strings with exact weights for multiples of a quarter turn and symbolic ones for other angles, and the pair is removed only if it comes out unchanged. Regions without Hadamards are then rebuilt from their phase polynomial, windows of up to four qubits are replaced from a table of CNOT optimal circuits, and multipliers are refactored into fewer Toffolis. `--search <ms>` adds a randomised search over three qubit windows afterwards.
 
 Cancellation, merging and fusion look past gates that commute with the pair, so `rz` on a control qubit cancels across a CNOT. Commutation is checked on the exact matrices of the gates involved.
 
@@ -475,64 +477,23 @@ Pushing a tag such as `v0.1.0` runs `.github/workflows/release.yml`, which build
 
 ## Benchmarks
 
-`bench/compare.py` compiles the same circuits with Qiskit 2.5 (`transpile` at `optimization_level=3`), tket 2.18 (`FullPeepholeOptimise`, then a rebase and squash) and qirc (`-O3 --gates rz-sx-cx --resynth 4 --relabel`, with and without `--cost cx`), all to `rz`, `sx`, `x` and `cx`. The circuits are the straight line programs in `tests/corpus` and `examples` with measurements removed, the QFT, Grover search for the all ones state, and the CDKM, VBE and Draper adders from Qiskit. Each cell is two qubit gates / total gates / depth, and the input column counts each Toffoli and SWAP as one gate. Every all to all result up to 12 qubits is checked against the input by exact operator comparison, allowing for the qubit permutation each tool reports, and all of them pass.
+The Nam benchmark suite (26 arithmetic circuits in the gate set `h`, `x`, `rz`, `cx`) is the standard comparison for circuit optimisers. qirc was run with `-O3 --gates rz,h,x,cx` on the exact input files Quarl used, which match the gate counts in the Quarl paper on every circuit. Each cell is the geometric mean reduction in gates and in CNOTs over the 26 circuits.
 
-All to all connectivity:
+| optimiser | gates | CNOTs | how |
+| --- | ---: | ---: | --- |
+| qirc | 39.6% | 36.3% | deterministic, seconds per circuit on a laptop CPU |
+| Quarl | 35.2% | 32.5% | published, reinforcement learning with hours of GPU per circuit |
+| QUESO | 31.0% | 25.4% | published |
+| tzap `-Osuper` | 29.2% | 22.3% | run locally |
+| GUOQ | 28.4% | 22.3% | run locally, one hour per circuit |
 
-| circuit | qubits | input | Qiskit | tket | qirc | qirc `--cost cx` |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| redundant | 4 | 2 / 13 / 5 | 0 / 3 / 2 | 0 / 3 / 2 | 0 / 3 / 2 | 0 / 3 / 2 |
-| small | 2 | 1 / 3 / 2 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 |
-| pyqir_real | 3 | 1 / 4 / 2 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 |
-| pyqir_simple | 3 | 2 / 12 / 7 | 6 / 27 / 18 | 6 / 36 / 22 | 6 / 24 / 14 | 6 / 24 / 14 |
-| qsharp_loop | 4 | 3 / 4 / 4 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 |
-| unrestricted_dynamic | 5 | 4 / 6 / 5 | 4 / 8 / 7 | 4 / 8 / 7 | 4 / 8 / 7 | 4 / 8 / 7 |
-| qft_4 | 4 | 14 / 36 / 24 | 12 / 33 / 23 | 12 / 33 / 23 | 12 / 34 / 23 | 12 / 34 / 23 |
-| qft_6 | 6 | 33 / 84 / 40 | 30 / 73 / 37 | 30 / 73 / 37 | 30 / 71 / 35 | 30 / 71 / 35 |
-| qft_8 | 8 | 60 / 152 / 56 | 56 / 129 / 51 | 56 / 129 / 51 | 56 / 120 / 47 | 56 / 120 / 47 |
-| qft_10 | 10 | 95 / 240 / 72 | 90 / 201 / 65 | 90 / 201 / 65 | 90 / 181 / 59 | 90 / 181 / 59 |
-| grover_3 | 3 | 4 / 39 / 21 | 24 / 85 / 53 | 20 / 140 / 86 | 24 / 89 / 55 | 23 / 154 / 95 |
-| grover_4 | 4 | 84 / 250 / 171 | 84 / 228 / 166 | 84 / 243 / 183 | 84 / 234 / 171 | 84 / 234 / 171 |
-| grover_5 | 5 | 288 / 941 / 681 | 288 / 788 / 607 | 288 / 849 / 662 | 288 / 732 / 603 | 288 / 732 / 603 |
-| adder_cdkm_4 | 9 | 24 / 24 / 21 | 64 / 151 / 114 | 47 / 130 / 88 | 44 / 107 / 84 | 44 / 107 / 84 |
-| adder_vbe_3 | 8 | 13 / 13 / 11 | 37 / 87 / 54 | 37 / 87 / 56 | 25 / 63 / 41 | 25 / 85 / 55 |
-| adder_draper_4 | 8 | 48 / 122 / 74 | 40 / 123 / 67 | 40 / 107 / 57 | 43 / 94 / 53 | 40 / 110 / 60 |
-| total |  |  | 740 / 1952 / 1278 | 719 / 2055 / 1353 | 711 / 1776 / 1208 | 707 / 1879 / 1269 |
+On 31 circuits from the GUOQ benchmark suite that were not used while developing qirc, it removes 68.1% of gates against 61.8% for tzap, 58.3% for GUOQ and 51.2% for QUESO, with fewer gates than GUOQ on 28 circuits and than QUESO on 29. Quarl still wins 5 of the 26 Nam circuits, and the Nam suite was the benchmark qirc was developed on.
 
-A line of qubits (`--coupling line:n`, Qiskit `CouplingMap.from_line`, tket `DefaultMappingPass`):
-
-| circuit | qubits | input | Qiskit | tket | qirc | qirc `--cost cx` |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| redundant | 4 | 2 / 13 / 5 | 0 / 3 / 2 | 0 / 3 / 2 | 0 / 3 / 2 | 0 / 3 / 2 |
-| small | 2 | 1 / 3 / 2 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 |
-| pyqir_real | 3 | 1 / 4 / 2 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 | 1 / 5 / 4 |
-| pyqir_simple | 3 | 2 / 12 / 7 | 7 / 37 / 24 | 9 / 39 / 25 | 7 / 25 / 15 | 7 / 26 / 16 |
-| qsharp_loop | 4 | 3 / 4 / 4 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 | 3 / 6 / 6 |
-| unrestricted_dynamic | 5 | 4 / 6 / 5 | 8 / 12 / 11 | 11 / 15 / 11 | 6 / 10 / 9 | 6 / 10 / 9 |
-| qft_4 | 4 | 14 / 36 / 24 | 19 / 49 / 33 | 24 / 45 / 35 | 19 / 41 / 29 | 19 / 41 / 29 |
-| qft_6 | 6 | 33 / 84 / 40 | 51 / 143 / 69 | 72 / 115 / 71 | 51 / 92 / 54 | 45 / 109 / 55 |
-| qft_8 | 8 | 60 / 152 / 56 | 90 / 312 / 113 | 137 / 210 / 103 | 97 / 161 / 81 | 83 / 193 / 82 |
-| qft_10 | 10 | 95 / 240 / 72 | 147 / 514 / 158 | 222 / 333 / 135 | 149 / 240 / 106 | 135 / 285 / 104 |
-| grover_3 | 3 | 4 / 39 / 21 | 37 / 128 / 91 | 35 / 155 / 98 | 47 / 110 / 88 | 35 / 194 / 110 |
-| grover_4 | 4 | 84 / 250 / 171 | 165 / 402 / 294 | 171 / 330 / 259 | 209 / 365 / 263 | 171 / 542 / 359 |
-| grover_5 | 5 | 288 / 941 / 681 | 543 / 1409 / 893 | 639 / 1200 / 840 | 681 / 1123 / 867 | 597 / 1407 / 974 |
-| adder_cdkm_4 | 9 | 24 / 24 / 21 | 93 / 251 / 184 | 86 / 169 / 134 | 78 / 141 / 123 | 66 / 163 / 127 |
-| adder_vbe_3 | 8 | 13 / 13 / 11 | 66 / 160 / 101 | 79 / 129 / 91 | 52 / 90 / 64 | 44 / 151 / 85 |
-| adder_draper_4 | 8 | 48 / 122 / 74 | 90 / 202 / 117 | 112 / 179 / 119 | 86 / 137 / 76 | 81 / 168 / 85 |
-| total |  |  | 1321 / 3638 / 2104 | 1602 / 2938 / 1937 | 1487 / 2554 / 1791 | 1294 / 3308 / 2051 |
-
-All three tools remove SWAP gates by relabelling qubits, which qirc does with `--relabel`. On all to all connectivity plain qirc needs 8 fewer CNOTs than tket and 29 fewer than Qiskit, and has the fewest gates and the lowest depth of the three by a clear margin, from phase folding and from lowering Toffolis that compute and later uncompute the same bit as relative phase Toffolis, which halves their CNOTs. Routed on a line, qirc with `--cost cx` needs 2% fewer CNOTs than Qiskit with fewer gates and lower depth, and 19% fewer than tket, and plain qirc has the fewest gates and the lowest depth.
-
-Compile time over the whole set is about 0.3 s for Qiskit, 26 s for tket and 0.9 s for qirc, or 2.9 s routed with `--cost cx`, counting a process start per circuit. To run it, install `qiskit` and `pytket` and build qirc in release mode:
-
-```text
-python bench/compare.py --qirc target/release/qirc
-python bench/compare.py --qirc target/release/qirc --line
-```
+Every qirc output above is proven equivalent to its input, up to global phase, with MQT QCEC or by comparing unitaries. The inputs, outputs, per circuit counts and a script that checks them are in [qirc-reproducability](https://github.com/AngadBasandrai/qirc-reproducability).
 
 ## Checking a compile
 
-`qirc diff a.ll` compiles `a.ll` twice, once at `-O0` and once with the given options, and compares them branch by branch. Every measurement splits the run into both outcomes, and each outcome must have the same probability, the same recorded values and the same final state up to global phase. `qirc diff a.ll b.ll` compares two different programs the same way.
+`qirc diff a.ll` compiles `a.ll` twice, once at `-O0` and once with the given options, and compares them branch by branch. Every measurement splits the run into both outcomes, and each outcome must have the same probability, the same recorded values and the same final state up to global phase. `qirc diff a.ll b.ll` compares two different programs the same way. Runs start from the all zeros state, so two circuits that differ only on other inputs are reported equivalent; use a unitary checker such as MQT QCEC to compare circuits on every input.
 
 ```text
 $ qirc diff tests/corpus/qsharp_teleport.ll -O3 --gates rz-sx-cx --resynth 4
