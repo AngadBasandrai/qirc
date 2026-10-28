@@ -487,7 +487,7 @@ The Nam benchmark suite (26 arithmetic circuits in the gate set `h`, `x`, `rz`, 
 | tzap `-Osuper` | 29.2% | 22.3% | run locally |
 | GUOQ | 28.4% | 22.3% | run locally, one hour per circuit |
 
-On 31 circuits from the GUOQ benchmark suite that were not used while developing qirc, it removes 68.1% of gates against 61.8% for tzap, 58.3% for GUOQ and 51.2% for QUESO, with fewer gates than GUOQ on 28 circuits and than QUESO on 29. Quarl still wins 5 of the 26 Nam circuits, and the Nam suite was the benchmark qirc was developed on.
+On 31 circuits from the GUOQ benchmark suite that were not used while developing qirc, it removes 68.1% of gates against 61.8% for tzap, 58.7% for GUOQ and 51.2% for QUESO, with fewer gates than GUOQ on 28 circuits and than QUESO on 29. On CNOTs it removes 35.9% there against 36.5% for GUOQ set to minimise CNOTs, which beats it on 11 circuits; on the Nam suite that GUOQ mode removes 24.2% of CNOTs. Quarl still wins 5 of the 26 Nam circuits, and the Nam suite was the benchmark qirc was developed on.
 
 Every qirc output above is proven equivalent to its input, up to global phase, with MQT QCEC or by comparing unitaries. The inputs, outputs, per circuit counts and a script that checks them are in [qirc-reproducability](https://github.com/AngadBasandrai/qirc-reproducability).
 
